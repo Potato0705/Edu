@@ -1,0 +1,36 @@
+你是一名精通 NLP 和 进化算法 (Evolutionary Algorithms) 的 AI 工程师。请根据我提供的 `project_context.md`，为我编写一套完整的 Python 实验代码（使用 `dspy` 或原生 `openai` 库风格的伪代码均可，主要展示逻辑）。
+
+**核心需求：**
+针对 ASAP Dataset Prompt 8 (Laughter Topic)，实现 WISE-AES 算法。
+
+**代码必须包含以下类和逻辑：**
+
+1.  **`InstructionInductor` 类**:
+    *   实现“指令诱导”。函数接收一批 `(text, score)` 数据，调用 LLM 生成初始的评分 Rubric。
+    
+2.  **`PromptIndividual` 类 (进化个体)**:
+    *   这是一个类，代表进化种群中的一个个体。
+    *   **属性**:
+        *   `instruction_text`: (Str) 当前的评分指令文本。
+        *   `exemplars`: (List) 当前选用的 Few-Shot 范文列表。
+    *   **方法**:
+        *   `evaluate(val_set)`: 在验证集上跑分，计算 QWK (Quadratic Weighted Kappa)。
+        *   `get_feedback(val_set, predictions)`: **关键步骤**。调用 LLM 对比预测分和真实分，生成一段自然语言的“错误分析报告”。
+
+3.  **`EvolutionOptimizer` 类**:
+    *   实现双重进化循环：
+    *   **Loop 1 (GA for Exemplars)**: 使用遗传算法（锦标赛选择、交叉、变异）来优化 `exemplars` 列表。
+    *   **Loop 2 (LLM for Text)**: 针对种群中的精英个体，调用 `get_feedback` 获取自然语言反馈，然后让 LLM 根据反馈重写 `instruction_text`。
+
+4.  **主流程 (`main`)**:
+    *   加载模拟数据。
+    *   执行初始化诱导。
+    *   运行 5 代进化。
+    *   输出每一代的最佳 QWK 分数和最终进化出的 Prompt。
+
+**特别注意：**
+*   在“文本进化”阶段，不要使用梯度的反向传播。必须显式地展示：`Feedback -> LLM Rewriter -> New Prompt` 的过程。
+*   请使用 Mock 函数 `call_llm(prompt)` 来代表 LLM 调用，不需要真实的 API Key，但要写清楚 Prompt Template 是什么样子的。
+*   评分逻辑需要处理 Prompt 8 的 0-60 分制（如果是 0-60，请让 LLM 输出该范围，或归一化到 0-10 再还原）。
+
+请生成代码。
