@@ -23,8 +23,8 @@ import numpy as np
 import yaml
 import pandas as pd
 
-# 加载环境变量
-load_dotenv()
+# 加载环境变量 (override=True 确保 .env 优先于系统环境变量)
+load_dotenv(override=True)
 
 
 # ============================================================================
