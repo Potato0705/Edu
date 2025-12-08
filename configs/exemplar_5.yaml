@@ -1,0 +1,41 @@
+# WISE-AES 实验配置文件
+
+# LLM 模型配置
+model:
+  name: "meta-llama/llama-3.3-70b-instruct"  # OpenRouter 模型名称
+  provider: "cerebras/fp16"                   # OpenRouter 提供商
+
+# 数据配置
+data:
+  asap_path: "data/raw/training_set_rel3.tsv"  # ASAP 数据集路径
+  essay_set: 8                         # Prompt 8 (Laughter topic)
+  train_ratio: 0.7                     # 训练集比例
+  val_size: 30                         # 验证集评估样本数 (设为 -1 使用全部)
+  score_min: 0                         # 最低分
+  score_max: 60                        # 最高分
+
+# 指令诱导配置
+induction:
+  n_high_samples: 5                    # 用于诱导的高分样本数
+  n_low_samples: 5                     # 用于诱导的低分样本数
+
+# 进化算法配置
+evolution:
+  population_size: 10                   # 种群大小
+  n_generations: 50                     # 进化代数
+  n_exemplars: 5                       # Few-shot 范文数量
+  elite_ratio: 0.3                     # 精英保留比例
+  mutation_rate: 0.3                   # 变异概率
+  tournament_size: 4                   # 锦标赛选择大小
+  n_elite_evolve: 2                    # 每代进行文本进化的精英数量
+  n_error_cases: 5                     # 反馈分析的错误案例数量
+
+# LLM 配置
+llm:
+  temperature_scoring: 0.1             # 评分时的温度 (低温度保证稳定)
+  temperature_generation: 0.7          # 生成/重写时的温度
+  max_exemplar_length: 500             # 范文截断长度 (节省 token)
+
+# 输出配置
+output:
+  verbose: true                        # 是否打印详细日志
