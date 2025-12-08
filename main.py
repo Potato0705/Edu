@@ -93,14 +93,19 @@ class ExperimentLogger:
         if also_print:
             print(message)
     
-    def log_config(self, config: Dict[str, Any]):
-        """记录实验配置"""
+    def log_config(self, config: Dict[str, Any], config_name: str = "config.yaml"):
+        """记录实验配置
+        
+        Args:
+            config: 配置字典
+            config_name: 配置文件名 (保存到实验目录时使用相同名称)
+        """
         self._log("=" * 60)
         self._log("EXPERIMENT CONFIGURATION")
         self._log("=" * 60)
         
-        # 保存配置文件
-        config_file = self.exp_dir / "config.yaml"
+        # 保存配置文件，使用原始配置文件名
+        config_file = self.exp_dir / config_name
         with open(config_file, 'w', encoding='utf-8') as f:
             yaml.dump(config, f, allow_unicode=True, default_flow_style=False)
         
@@ -540,15 +545,16 @@ def load_config(config_path: str = "config.yaml") -> Dict[str, Any]:
         return yaml.safe_load(f)
 
 # 全局配置
-CONFIG = load_config()
+CONFIG = load_config("configs/default.yaml")
 
 # ============================================================================
 # OpenRouter LLM 调用封装
 # ============================================================================
 
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "meta-llama/llama-3.3-70b-instruct")
-OPENROUTER_PROVIDER = os.getenv("OPENROUTER_PROVIDER", "")
+# 从配置文件读取模型设置，如果配置文件中没有则使用默认值
+OPENROUTER_MODEL = CONFIG.get('model', {}).get('name', "meta-llama/llama-3.3-70b-instruct")
+OPENROUTER_PROVIDER = CONFIG.get('model', {}).get('provider', "")
 
 
 def call_llm(prompt: str, system_prompt: str = "", temperature: float = 0.7,
@@ -1255,7 +1261,7 @@ class EvolutionOptimizer:
 # 主流程
 # ============================================================================
 
-def main(config_path: str = "config.yaml", resume_dir: str = None):
+def main(config_path: str = "configs/default.yaml", resume_dir: str = None):
     """WISE-AES 主流程
     
     Args:
@@ -1264,8 +1270,12 @@ def main(config_path: str = "config.yaml", resume_dir: str = None):
     """
     
     # 加载配置
-    global CONFIG, LOGGER
+    global CONFIG, LOGGER, OPENROUTER_MODEL, OPENROUTER_PROVIDER
     CONFIG = load_config(config_path)
+    
+    # 更新模型配置
+    OPENROUTER_MODEL = CONFIG.get('model', {}).get('name', "meta-llama/llama-3.3-70b-instruct")
+    OPENROUTER_PROVIDER = CONFIG.get('model', {}).get('provider', "")
     
     # 初始化实验日志记录器
     LOGGER = ExperimentLogger(result_dir="result", resume_dir=resume_dir)
@@ -1279,7 +1289,9 @@ def main(config_path: str = "config.yaml", resume_dir: str = None):
     
     # 记录配置 (仅新实验)
     if not resume_dir:
-        LOGGER.log_config(CONFIG)
+        # 使用原始配置文件名保存到实验目录
+        config_name = Path(config_path).name
+        LOGGER.log_config(CONFIG, config_name)
     
     print(f"\n[Config] Loaded from {config_path}")
     print(f"  - Data path: {CONFIG['data']['asap_path']}")
@@ -1400,8 +1412,8 @@ if __name__ == "__main__":
     import argparse
     
     parser = argparse.ArgumentParser(description="WISE-AES: Automated Essay Scoring with Evolution")
-    parser.add_argument("--config", "-c", type=str, default="config.yaml",
-                        help="Path to config file (default: config.yaml)")
+    parser.add_argument("--config", "-c", type=str, default="configs/default.yaml",
+                        help="Path to config file (default: configs/default.yaml)")
     parser.add_argument("--resume", "-r", type=str, default=None,
                         help="Resume from experiment directory (e.g., result/exp_20251208_101150)")
     
