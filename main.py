@@ -558,9 +558,9 @@ OPENROUTER_PROVIDER = CONFIG.get('model', {}).get('provider', "")
 
 
 def call_llm(prompt: str, system_prompt: str = "", temperature: float = 0.7,
-             call_type: str = "unknown") -> str:
+             call_type: str = "unknown", max_retries: int = 5) -> str:
     """
-    调用 OpenRouter API 进行 LLM 推理
+    调用 OpenRouter API 进行 LLM 推理，带重试机制
     """
     import time
     start_time = time.time()
@@ -592,21 +592,44 @@ def call_llm(prompt: str, system_prompt: str = "", temperature: float = 0.7,
         if len(parts) > 1:
             payload["provider"]["quantizations"] = [parts[1]]
     
-    try:
-        response = requests.post(url, headers=headers, json=payload, timeout=120)
-        response.raise_for_status()
-        result = response.json()
-        content = result["choices"][0]["message"]["content"]
-        
-        # 记录 LLM 调用
-        duration = time.time() - start_time
-        if LOGGER:
-            LOGGER.log_llm_call(call_type, prompt, content, temperature, duration)
-        
-        return content
-    except Exception as e:
-        print(f"[LLM Error] {e}")
-        return f"[ERROR] LLM call failed: {e}"
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            response = requests.post(url, headers=headers, json=payload, timeout=120)
+            response.raise_for_status()
+            result = response.json()
+            content = result["choices"][0]["message"]["content"]
+            
+            # 记录 LLM 调用
+            duration = time.time() - start_time
+            if LOGGER:
+                LOGGER.log_llm_call(call_type, prompt, content, temperature, duration)
+            
+            # 成功后短暂延迟，避免触发速率限制
+            time.sleep(0.5)
+            return content
+        except requests.exceptions.HTTPError as e:
+            last_error = e
+            if response.status_code == 429:
+                # 速率限制，指数退避
+                wait_time = (2 ** attempt) + random.uniform(0, 1)
+                print(f"[LLM] Rate limited, waiting {wait_time:.1f}s (attempt {attempt + 1}/{max_retries})")
+                time.sleep(wait_time)
+            else:
+                print(f"[LLM Error] HTTP {response.status_code}: {e}")
+                break
+        except (requests.exceptions.SSLError, requests.exceptions.ConnectionError) as e:
+            last_error = e
+            wait_time = (2 ** attempt) + random.uniform(0, 1)
+            print(f"[LLM] Connection error, retrying in {wait_time:.1f}s (attempt {attempt + 1}/{max_retries})")
+            time.sleep(wait_time)
+        except Exception as e:
+            last_error = e
+            print(f"[LLM Error] {e}")
+            break
+    
+    print(f"[LLM Error] All {max_retries} retries failed: {last_error}")
+    return f"[ERROR] LLM call failed: {last_error}"
 
 
 # ============================================================================
