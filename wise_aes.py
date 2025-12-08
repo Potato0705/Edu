@@ -34,14 +34,23 @@ load_dotenv()
 class ExperimentLogger:
     """实验过程和结果的详细记录器"""
     
-    def __init__(self, result_dir: str = "result"):
+    def __init__(self, result_dir: str = "result", resume_dir: str = None):
         self.result_dir = Path(result_dir)
         self.result_dir.mkdir(parents=True, exist_ok=True)
         
-        # 创建带时间戳的实验目录
-        self.timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.exp_dir = self.result_dir / f"exp_{self.timestamp}"
-        self.exp_dir.mkdir(parents=True, exist_ok=True)
+        if resume_dir:
+            # 从已有实验目录恢复
+            self.exp_dir = Path(resume_dir)
+            if not self.exp_dir.exists():
+                raise ValueError(f"Resume directory not found: {resume_dir}")
+            self.timestamp = self.exp_dir.name.replace("exp_", "")
+            self.is_resumed = True
+        else:
+            # 创建带时间戳的实验目录
+            self.timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            self.exp_dir = self.result_dir / f"exp_{self.timestamp}"
+            self.exp_dir.mkdir(parents=True, exist_ok=True)
+            self.is_resumed = False
         
         # 日志文件
         self.log_file = self.exp_dir / "experiment.log"
@@ -52,8 +61,24 @@ class ExperimentLogger:
         self.llm_calls = []
         self.generation_details = []
         
-        self._log(f"Experiment started at {self.timestamp}")
-        self._log(f"Result directory: {self.exp_dir}")
+        if self.is_resumed:
+            self._log(f"Experiment RESUMED at {datetime.now().strftime('%Y%m%d_%H%M%S')}")
+            self._log(f"Resuming from: {self.exp_dir}")
+            # 加载已有的 generation_details
+            self._load_existing_generations()
+        else:
+            self._log(f"Experiment started at {self.timestamp}")
+            self._log(f"Result directory: {self.exp_dir}")
+    
+    def _load_existing_generations(self):
+        """加载已有的 generation 记录"""
+        gen_files = sorted(self.exp_dir.glob("generation_*.json"))
+        for gen_file in gen_files:
+            with open(gen_file, 'r', encoding='utf-8') as f:
+                gen_data = json.load(f)
+                self.generation_details.append(gen_data)
+        if self.generation_details:
+            self._log(f"Loaded {len(self.generation_details)} existing generations")
     
     def _log(self, message: str, also_print: bool = True):
         """记录日志"""
@@ -213,6 +238,52 @@ class ExperimentLogger:
             json.dump(gen_record, f, ensure_ascii=False, indent=2)
         
         return gen_record
+    
+    def save_checkpoint(self, generation: int, population: List, 
+                        best_individual, train_data: List, val_data: List,
+                        initial_rubric: str):
+        """保存 checkpoint 用于断点续传"""
+        checkpoint = {
+            "generation": generation,
+            "best_individual": {
+                "instruction_text": best_individual.instruction_text,
+                "exemplar_ids": [ex['essay_id'] for ex in best_individual.exemplars],
+                "fitness": best_individual.fitness
+            },
+            "population": [
+                {
+                    "instruction_text": ind.instruction_text,
+                    "exemplar_ids": [ex['essay_id'] for ex in ind.exemplars],
+                    "fitness": ind.fitness
+                }
+                for ind in population
+            ],
+            "initial_rubric": initial_rubric,
+            "train_essay_ids": [d['essay_id'] for d in train_data],
+            "val_essay_ids": [d['essay_id'] for d in val_data],
+            "timestamp": datetime.now().isoformat()
+        }
+        
+        checkpoint_file = self.exp_dir / "checkpoint.json"
+        with open(checkpoint_file, 'w', encoding='utf-8') as f:
+            json.dump(checkpoint, f, ensure_ascii=False, indent=2)
+        
+        self._log(f"  [Checkpoint saved at generation {generation}]", also_print=False)
+    
+    def load_checkpoint(self) -> Optional[Dict]:
+        """加载 checkpoint"""
+        checkpoint_file = self.exp_dir / "checkpoint.json"
+        if not checkpoint_file.exists():
+            return None
+        
+        with open(checkpoint_file, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    
+    def get_last_completed_generation(self) -> int:
+        """获取最后完成的代数"""
+        if not self.generation_details:
+            return 0
+        return max(g['generation'] for g in self.generation_details)
     
     def log_feedback(self, elite_idx: int, feedback: str):
         """记录反馈"""
@@ -935,6 +1006,47 @@ class EvolutionOptimizer:
             self.population.append(individual)
             if verbose:
                 print(f"  Individual {i+1}: {len(exemplars)} exemplars selected")
+        
+        # 保存初始 rubric 用于 checkpoint
+        self.initial_rubric = base_instruction
+    
+    def restore_from_checkpoint(self, checkpoint: Dict):
+        """从 checkpoint 恢复状态"""
+        verbose = self.config.get('output', {}).get('verbose', True)
+        
+        # 创建 essay_id 到数据的映射
+        train_id_map = {d['essay_id']: d for d in self.train_data}
+        
+        # 恢复 population
+        self.population = []
+        for ind_data in checkpoint['population']:
+            exemplars = [train_id_map[eid] for eid in ind_data['exemplar_ids'] 
+                        if eid in train_id_map]
+            individual = PromptIndividual(
+                instruction_text=ind_data['instruction_text'],
+                exemplars=exemplars,
+                fitness=ind_data['fitness'],
+                config=self.config
+            )
+            self.population.append(individual)
+        
+        # 恢复 best_individual
+        best_data = checkpoint['best_individual']
+        best_exemplars = [train_id_map[eid] for eid in best_data['exemplar_ids']
+                         if eid in train_id_map]
+        self.best_individual = PromptIndividual(
+            instruction_text=best_data['instruction_text'],
+            exemplars=best_exemplars,
+            fitness=best_data['fitness'],
+            config=self.config
+        )
+        
+        # 恢复 initial_rubric
+        self.initial_rubric = checkpoint.get('initial_rubric', '')
+        
+        if verbose:
+            print(f"\n[Resume] Restored population of {len(self.population)} individuals")
+            print(f"[Resume] Best individual QWK: {self.best_individual.fitness:.4f}")
     
     def _sample_diverse_exemplars(self) -> List[Dict[str, Any]]:
         sorted_data = sorted(self.train_data, key=lambda x: x['domain1_score'])
@@ -1102,8 +1214,19 @@ class EvolutionOptimizer:
             print("\n[Step 3] LLM Evolution for Instructions...")
         
         self.evolve_elite_instructions(generation)
+        
+        # 保存 checkpoint
+        if LOGGER:
+            LOGGER.save_checkpoint(
+                generation=generation,
+                population=self.population,
+                best_individual=self.best_individual,
+                train_data=self.train_data,
+                val_data=self.val_data,
+                initial_rubric=getattr(self, 'initial_rubric', '')
+            )
     
-    def run(self, n_generations: int = None) -> PromptIndividual:
+    def run(self, n_generations: int = None, start_generation: int = 1) -> PromptIndividual:
         if n_generations is None:
             n_generations = self.config['evolution']['n_generations']
         
@@ -1111,10 +1234,13 @@ class EvolutionOptimizer:
         
         if verbose:
             print("\n" + "="*60)
-            print("WISE-AES EVOLUTION STARTED")
+            if start_generation > 1:
+                print(f"WISE-AES EVOLUTION RESUMED (from generation {start_generation})")
+            else:
+                print("WISE-AES EVOLUTION STARTED")
             print("="*60)
         
-        for gen in range(1, n_generations + 1):
+        for gen in range(start_generation, n_generations + 1):
             self.evolve_one_generation(gen)
         
         if verbose:
@@ -1129,22 +1255,31 @@ class EvolutionOptimizer:
 # 主流程
 # ============================================================================
 
-def main(config_path: str = "config.yaml"):
-    """WISE-AES 主流程"""
+def main(config_path: str = "config.yaml", resume_dir: str = None):
+    """WISE-AES 主流程
+    
+    Args:
+        config_path: 配置文件路径
+        resume_dir: 断点续传的实验目录路径 (如 result/exp_20251208_101150)
+    """
     
     # 加载配置
     global CONFIG, LOGGER
     CONFIG = load_config(config_path)
     
     # 初始化实验日志记录器
-    LOGGER = ExperimentLogger(result_dir="result")
+    LOGGER = ExperimentLogger(result_dir="result", resume_dir=resume_dir)
     
     print("="*60)
-    print("WISE-AES: Weakly-supervised Integrated Scoring Evolution")
+    if resume_dir:
+        print("WISE-AES: RESUMING EXPERIMENT")
+    else:
+        print("WISE-AES: Weakly-supervised Integrated Scoring Evolution")
     print("="*60)
     
-    # 记录配置
-    LOGGER.log_config(CONFIG)
+    # 记录配置 (仅新实验)
+    if not resume_dir:
+        LOGGER.log_config(CONFIG)
     
     print(f"\n[Config] Loaded from {config_path}")
     print(f"  - Data path: {CONFIG['data']['asap_path']}")
@@ -1161,44 +1296,78 @@ def main(config_path: str = "config.yaml"):
     
     all_data = load_asap_data(CONFIG)
     
-    # 划分训练集和验证集
-    random.shuffle(all_data)
-    split_idx = int(len(all_data) * CONFIG['data']['train_ratio'])
-    train_data = all_data[:split_idx]
-    val_data = all_data[split_idx:]
+    # 检查是否从 checkpoint 恢复
+    checkpoint = None
+    start_generation = 1
+    
+    if resume_dir:
+        checkpoint = LOGGER.load_checkpoint()
+        if checkpoint:
+            start_generation = checkpoint['generation'] + 1
+            print(f"\n[Resume] Found checkpoint at generation {checkpoint['generation']}")
+            print(f"[Resume] Will continue from generation {start_generation}")
+            
+            # 使用 checkpoint 中保存的数据划分
+            train_ids = set(checkpoint['train_essay_ids'])
+            val_ids = set(checkpoint['val_essay_ids'])
+            
+            train_data = [d for d in all_data if d['essay_id'] in train_ids]
+            val_data = [d for d in all_data if d['essay_id'] in val_ids]
+            
+            print(f"[Resume] Restored train/val split: {len(train_data)}/{len(val_data)}")
+        else:
+            print("[Resume] No checkpoint found, starting fresh")
+            resume_dir = None  # 回退到新实验模式
+    
+    if not checkpoint:
+        # 新实验：划分训练集和验证集
+        random.shuffle(all_data)
+        split_idx = int(len(all_data) * CONFIG['data']['train_ratio'])
+        train_data = all_data[:split_idx]
+        val_data = all_data[split_idx:]
     
     print(f"Training set: {len(train_data)} essays (exemplar candidate pool)")
     print(f"Validation set: {len(val_data)} essays")
     
-    # 记录数据统计
-    LOGGER.log_data_stats(train_data, val_data, all_data)
+    # 记录数据统计 (仅新实验)
+    if not checkpoint:
+        LOGGER.log_data_stats(train_data, val_data, all_data)
     
-    # ========== 2. 指令诱导 ==========
-    print("\n[Phase 2] Instruction Induction")
-    print("-" * 40)
-    
-    inductor = InstructionInductor(CONFIG)
-    initial_rubric = inductor.induce(train_data)
-    
-    # 记录初始 rubric
-    LOGGER.log_initial_rubric(initial_rubric)
-    
-    print("\n[Initial Rubric Generated]")
-    print("-" * 40)
-    print(initial_rubric[:500] + "..." if len(initial_rubric) > 500 else initial_rubric)
-    
-    # ========== 3. 进化优化 ==========
-    print("\n[Phase 3] Evolution Optimization")
-    print("-" * 40)
-    
+    # ========== 2. 指令诱导 / 恢复 ==========
     optimizer = EvolutionOptimizer(
         train_data=train_data,
         val_data=val_data,
         config=CONFIG
     )
     
-    optimizer.initialize_population(initial_rubric)
-    best_individual = optimizer.run()
+    if checkpoint:
+        # 从 checkpoint 恢复
+        print("\n[Phase 2] Restoring from Checkpoint")
+        print("-" * 40)
+        optimizer.restore_from_checkpoint(checkpoint)
+        initial_rubric = checkpoint.get('initial_rubric', '')
+    else:
+        # 新实验：指令诱导
+        print("\n[Phase 2] Instruction Induction")
+        print("-" * 40)
+        
+        inductor = InstructionInductor(CONFIG)
+        initial_rubric = inductor.induce(train_data)
+        
+        # 记录初始 rubric
+        LOGGER.log_initial_rubric(initial_rubric)
+        
+        print("\n[Initial Rubric Generated]")
+        print("-" * 40)
+        print(initial_rubric[:500] + "..." if len(initial_rubric) > 500 else initial_rubric)
+        
+        optimizer.initialize_population(initial_rubric)
+    
+    # ========== 3. 进化优化 ==========
+    print("\n[Phase 3] Evolution Optimization")
+    print("-" * 40)
+    
+    best_individual = optimizer.run(start_generation=start_generation)
     
     # ========== 4. 结果输出 ==========
     print("\n" + "="*60)
@@ -1228,6 +1397,14 @@ def main(config_path: str = "config.yaml"):
 
 
 if __name__ == "__main__":
-    import sys
-    config_path = sys.argv[1] if len(sys.argv) > 1 else "config.yaml"
-    main(config_path)
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="WISE-AES: Automated Essay Scoring with Evolution")
+    parser.add_argument("--config", "-c", type=str, default="config.yaml",
+                        help="Path to config file (default: config.yaml)")
+    parser.add_argument("--resume", "-r", type=str, default=None,
+                        help="Resume from experiment directory (e.g., result/exp_20251208_101150)")
+    
+    args = parser.parse_args()
+    
+    main(config_path=args.config, resume_dir=args.resume)
