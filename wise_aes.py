@@ -196,7 +196,7 @@ class ExperimentLogger:
             "min_qwk": min(qwks),
             "std_qwk": np.std(qwks),
             "best_overall_qwk": best_overall.fitness,
-            "best_instruction_preview": best_individual.instruction_text[:200],
+            "best_instruction": best_individual.instruction_text,  # 完整 instruction
             "exemplar_ids": [ex['essay_id'] for ex in best_individual.exemplars]
         }
         self.generation_details.append(gen_record)
@@ -239,11 +239,171 @@ class ExperimentLogger:
             f.write("=== NEW INSTRUCTION ===\n")
             f.write(new_instruction + "\n")
     
+    def plot_evolution_results(self):
+        """绘制进化结果图表"""
+        import matplotlib.pyplot as plt
+        import matplotlib
+        matplotlib.use('Agg')  # 非交互式后端
+        
+        if not self.generation_details:
+            self._log("No generation data to plot")
+            return
+        
+        generations = [g['generation'] for g in self.generation_details]
+        best_qwks = [g['best_qwk'] for g in self.generation_details]
+        avg_qwks = [g['avg_qwk'] for g in self.generation_details]
+        min_qwks = [g['min_qwk'] for g in self.generation_details]
+        std_qwks = [g['std_qwk'] for g in self.generation_details]
+        best_overall_qwks = [g['best_overall_qwk'] for g in self.generation_details]
+        exemplar_ids_list = [g['exemplar_ids'] for g in self.generation_details]
+        
+        # 图1: QWK 变化曲线
+        fig1, ax1 = plt.subplots(figsize=(10, 6))
+        
+        ax1.plot(generations, best_qwks, 'b-o', linewidth=2, markersize=8, label='Best QWK (this gen)')
+        ax1.plot(generations, avg_qwks, 'g--s', linewidth=1.5, markersize=6, label='Avg QWK')
+        ax1.plot(generations, min_qwks, 'r:^', linewidth=1.5, markersize=6, label='Min QWK')
+        ax1.plot(generations, best_overall_qwks, 'purple', linewidth=2.5, marker='*', 
+                 markersize=10, label='Best Overall QWK')
+        
+        # 添加误差带
+        avg_arr = np.array(avg_qwks)
+        std_arr = np.array(std_qwks)
+        ax1.fill_between(generations, avg_arr - std_arr, avg_arr + std_arr, 
+                         alpha=0.2, color='green', label='±1 Std Dev')
+        
+        ax1.set_xlabel('Generation', fontsize=12)
+        ax1.set_ylabel('QWK Score', fontsize=12)
+        ax1.set_title('Evolution of QWK Scores Across Generations', fontsize=14)
+        ax1.legend(loc='lower right', fontsize=10)
+        ax1.grid(True, alpha=0.3)
+        ax1.set_xticks(generations)
+        
+        # 标注最终最佳值
+        final_best = best_overall_qwks[-1]
+        ax1.annotate(f'Final Best: {final_best:.4f}', 
+                     xy=(generations[-1], final_best),
+                     xytext=(generations[-1] - 0.5, final_best + 0.02),
+                     fontsize=10, fontweight='bold',
+                     arrowprops=dict(arrowstyle='->', color='purple'))
+        
+        plt.tight_layout()
+        qwk_plot_path = self.exp_dir / "plot_qwk_evolution.png"
+        fig1.savefig(qwk_plot_path, dpi=150, bbox_inches='tight')
+        plt.close(fig1)
+        self._log(f"QWK evolution plot saved to: {qwk_plot_path}")
+        
+        # 图2: Exemplar ID 变化热力图
+        fig2, ax2 = plt.subplots(figsize=(12, 6))
+        
+        # 收集所有出现过的 exemplar IDs
+        all_ids = set()
+        for ids in exemplar_ids_list:
+            all_ids.update(ids)
+        all_ids = sorted(all_ids)
+        
+        # 创建热力图数据
+        heatmap_data = np.zeros((len(all_ids), len(generations)))
+        id_to_idx = {id_: idx for idx, id_ in enumerate(all_ids)}
+        
+        for gen_idx, ids in enumerate(exemplar_ids_list):
+            for id_ in ids:
+                heatmap_data[id_to_idx[id_], gen_idx] = 1
+        
+        im = ax2.imshow(heatmap_data, aspect='auto', cmap='Blues', interpolation='nearest')
+        
+        ax2.set_xlabel('Generation', fontsize=12)
+        ax2.set_ylabel('Exemplar Essay ID', fontsize=12)
+        ax2.set_title('Exemplar Selection Across Generations', fontsize=14)
+        ax2.set_xticks(range(len(generations)))
+        ax2.set_xticklabels(generations)
+        ax2.set_yticks(range(len(all_ids)))
+        ax2.set_yticklabels(all_ids, fontsize=8)
+        
+        # 添加颜色条
+        cbar = plt.colorbar(im, ax=ax2)
+        cbar.set_label('Selected (1) / Not Selected (0)', fontsize=10)
+        
+        plt.tight_layout()
+        exemplar_plot_path = self.exp_dir / "plot_exemplar_evolution.png"
+        fig2.savefig(exemplar_plot_path, dpi=150, bbox_inches='tight')
+        plt.close(fig2)
+        self._log(f"Exemplar evolution plot saved to: {exemplar_plot_path}")
+        
+        # 图3: 综合仪表板
+        fig3, axes = plt.subplots(2, 2, figsize=(14, 10))
+        
+        # 子图1: QWK 趋势
+        ax3_1 = axes[0, 0]
+        ax3_1.plot(generations, best_qwks, 'b-o', linewidth=2, label='Best')
+        ax3_1.plot(generations, avg_qwks, 'g--', linewidth=1.5, label='Avg')
+        ax3_1.fill_between(generations, min_qwks, best_qwks, alpha=0.3, color='blue')
+        ax3_1.set_xlabel('Generation')
+        ax3_1.set_ylabel('QWK')
+        ax3_1.set_title('QWK Trend')
+        ax3_1.legend()
+        ax3_1.grid(True, alpha=0.3)
+        
+        # 子图2: QWK 改进量
+        ax3_2 = axes[0, 1]
+        improvements = [0] + [best_overall_qwks[i] - best_overall_qwks[i-1] 
+                              for i in range(1, len(best_overall_qwks))]
+        colors = ['green' if x >= 0 else 'red' for x in improvements]
+        ax3_2.bar(generations, improvements, color=colors, alpha=0.7, edgecolor='black')
+        ax3_2.axhline(y=0, color='black', linestyle='-', linewidth=0.5)
+        ax3_2.set_xlabel('Generation')
+        ax3_2.set_ylabel('QWK Improvement')
+        ax3_2.set_title('QWK Improvement per Generation')
+        ax3_2.grid(True, alpha=0.3, axis='y')
+        
+        # 子图3: 种群多样性 (标准差)
+        ax3_3 = axes[1, 0]
+        ax3_3.bar(generations, std_qwks, color='orange', alpha=0.7, edgecolor='black')
+        ax3_3.set_xlabel('Generation')
+        ax3_3.set_ylabel('Std Dev of QWK')
+        ax3_3.set_title('Population Diversity (QWK Std Dev)')
+        ax3_3.grid(True, alpha=0.3, axis='y')
+        
+        # 子图4: Exemplar 变化追踪
+        ax3_4 = axes[1, 1]
+        # 计算每代 exemplar 的变化数量
+        changes = [0]
+        for i in range(1, len(exemplar_ids_list)):
+            prev_set = set(exemplar_ids_list[i-1])
+            curr_set = set(exemplar_ids_list[i])
+            changed = len(prev_set.symmetric_difference(curr_set))
+            changes.append(changed)
+        
+        ax3_4.bar(generations, changes, color='purple', alpha=0.7, edgecolor='black')
+        ax3_4.set_xlabel('Generation')
+        ax3_4.set_ylabel('# Exemplars Changed')
+        ax3_4.set_title('Exemplar Changes per Generation')
+        ax3_4.grid(True, alpha=0.3, axis='y')
+        
+        # 在每个柱子上标注具体的 exemplar IDs
+        for i, (gen, ids) in enumerate(zip(generations, exemplar_ids_list)):
+            id_str = '\n'.join([str(id_) for id_ in ids])
+            ax3_4.annotate(id_str, xy=(gen, changes[i] + 0.1), 
+                          ha='center', va='bottom', fontsize=7, color='gray')
+        
+        plt.suptitle('WISE-AES Evolution Dashboard', fontsize=16, fontweight='bold')
+        plt.tight_layout(rect=[0, 0, 1, 0.96])
+        dashboard_path = self.exp_dir / "plot_dashboard.png"
+        fig3.savefig(dashboard_path, dpi=150, bbox_inches='tight')
+        plt.close(fig3)
+        self._log(f"Dashboard plot saved to: {dashboard_path}")
+        
+        return [qwk_plot_path, exemplar_plot_path, dashboard_path]
+
     def save_final_results(self, best_individual, optimizer, config: Dict):
         """保存最终结果"""
         self._log("\n" + "=" * 60)
         self._log("FINAL RESULTS")
         self._log("=" * 60)
+        
+        # 先绘制图表
+        self._log("\n[Generating plots...]")
+        plot_paths = self.plot_evolution_results()
         
         # 最终结果
         final_result = {
@@ -289,13 +449,9 @@ class ExperimentLogger:
         self._log(f"  - evolution_history.json")
         self._log(f"  - experiment.log")
         self._log(f"  - llm_calls.jsonl")
-        
-        # 同时保存到根目录的 result 文件夹下的 latest
-        latest_file = self.result_dir / "latest_result.json"
-        with open(latest_file, 'w', encoding='utf-8') as f:
-            json.dump(final_result, f, ensure_ascii=False, indent=2)
-        
-        self._log(f"\nLatest result also saved to: {latest_file}")
+        self._log(f"  - plot_qwk_evolution.png")
+        self._log(f"  - plot_exemplar_evolution.png")
+        self._log(f"  - plot_dashboard.png")
         
         return final_result
 
@@ -1066,14 +1222,7 @@ def main(config_path: str = "config.yaml"):
         print(f"  {i}. Essay ID {ex['essay_id']} (Score: {ex['domain1_score']}/{CONFIG['data']['score_max']})")
     
     # 保存最终结果到 result 文件夹
-    final_result = LOGGER.save_final_results(best_individual, optimizer, CONFIG)
-    
-    # 同时保存到根目录的旧位置（兼容）
-    output_file = CONFIG['output']['result_file']
-    with open(output_file, 'w', encoding='utf-8') as f:
-        json.dump(final_result, f, ensure_ascii=False, indent=2, default=str)
-    
-    print(f"\n[Results also saved to {output_file}]")
+    LOGGER.save_final_results(best_individual, optimizer, CONFIG)
     
     return best_individual
 
