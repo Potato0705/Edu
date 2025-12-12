@@ -2,7 +2,7 @@
 
 # LLM 模型配置
 model:
-  name: "meta-llama/llama-3.3-70b-instruct"  # OpenRouter 模型名称
+  name: "meta-llama/llama-3.1-8b-instruct"  # OpenRouter 模型名称
   provider: "cerebras/fp16"                   # OpenRouter 提供商
 
 # 数据配置
@@ -23,7 +23,7 @@ induction:
 evolution:
   population_size: 10                   # 种群大小
   n_generations: 50                     # 进化代数
-  n_exemplars: 8                       # Few-shot 范文数量
+  n_exemplars: 6                       # Few-shot 范文数量
   elite_ratio: 0.3                     # 精英保留比例
   mutation_rate: 0.3                   # 变异概率
   tournament_size: 4                   # 锦标赛选择大小
