@@ -21,7 +21,7 @@ rag:
   
   # 数量控制
   n_retrieved: 10                      # 向量检索取回的候选数量 (Top-k)
-  n_selected: 3                        # 最终喂给打分模型的 RAG 范文数量
+  n_selected: 5                        # 最终喂给打分模型的 RAG 范文数量
   
   # 功能开关
   use_rerank: true                     # 是否开启 LLM 重排序 (False 则直接取 Top-n_selected)
@@ -40,7 +40,7 @@ induction:
 evolution:
   population_size: 8                   # 种群大小
   n_generations: 5                    # 进化代数
-  n_static_exemplars: 3                # [修改] 静态 ICL 范文数量 (Global Anchors)
+  n_static_exemplars: 5                # [修改] 静态 ICL 范文数量 (Global Anchors)
   elite_ratio: 0.25
   mutation_rate: 0.3
   tournament_size: 3
@@ -57,3 +57,10 @@ llm:
 # 输出配置
 output:
   verbose: true
+
+# [NEW] 调试/非正式实验模式配置
+debug:
+  enabled: true                        # 是否开启调试模式
+  n_train: 400                          # 调试模式下：训练集大小 (RAG 知识库)
+  n_val: 32                             # 调试模式下：验证集大小 (进化评估用，最耗钱的部分)
+  n_test: 100                            # 调试模式下：测试集大小 (最终评估用)

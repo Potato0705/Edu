@@ -482,7 +482,7 @@ class EvolutionOptimizer:
         return best_global
 
 # ============================================================================
-# 5. 主程序 (Main) - [FIX] Real Data & 5-Fold
+# 5. 主程序 (Main)
 # ============================================================================
 
 def main(config_path="configs/default.yaml", fold=0):
@@ -508,33 +508,63 @@ def main(config_path="configs/default.yaml", fold=0):
             "essay_text": row['essay'],
             "domain1_score": row['domain1_score']
         })
-    print(f"  Total essays: {len(all_data)}")
+    print(f"  Total essays available: {len(all_data)}")
     
-    # 2. 五折交叉验证切分 (60/20/20)
-    # 使用 Seed=42 保证每次运行切分一致
-    kf = KFold(n_splits=5, shuffle=True, random_state=42)
-    folds = list(kf.split(all_data))
+    # 打乱数据，保证 Debug 抽样具有随机性
+    random.seed(42)
+    random.shuffle(all_data)
     
-    # 获取当前 fold 的索引
-    # indices: array of indices
-    train_val_indices, test_indices = folds[fold]
+    # --------------------------------------------------------------------------
+    # [NEW] 调试模式判断逻辑
+    # --------------------------------------------------------------------------
+    if config.get('debug', {}).get('enabled', False):
+        print("\n" + "!"*40)
+        print("  WARNING: RUNNING IN DEBUG MODE")
+        print("  (Ignoring 5-Fold Split, using custom small subsets)")
+        print("!"*40 + "\n")
+        
+        d_cfg = config['debug']
+        n_train = d_cfg.get('n_train', 10)
+        n_val = d_cfg.get('n_val', 5)
+        n_test = d_cfg.get('n_test', 5)
+        
+        # 硬切分：直接切出指定数量的数据
+        # 确保不会越界
+        if n_train + n_val + n_test > len(all_data):
+            print(f"  [Error] Debug sizes exceed total data ({len(all_data)}). Truncating...")
+            
+        current_idx = 0
+        train_set = all_data[current_idx : current_idx + n_train]
+        current_idx += n_train
+        
+        val_set = all_data[current_idx : current_idx + n_val]
+        current_idx += n_val
+        
+        test_set = all_data[current_idx : current_idx + n_test]
+        
+    else:
+        # ----------------------------------------------------------------------
+        # 标准 5-Fold Cross Validation 逻辑
+        # ----------------------------------------------------------------------
+        kf = KFold(n_splits=5, shuffle=True, random_state=42)
+        folds = list(kf.split(all_data))
+        
+        # 获取当前 fold 的索引
+        train_val_indices, test_indices = folds[fold]
+        
+        # 从 train_val 中再切分出 20% (相对于总数据) 作为 val
+        split_point = int(len(train_val_indices) * 0.75)
+        train_indices = train_val_indices[:split_point]
+        val_indices = train_val_indices[split_point:]
+        
+        train_set = [all_data[i] for i in train_indices]
+        val_set = [all_data[i] for i in val_indices]
+        test_set = [all_data[i] for i in test_indices]
     
-    # 从 train_val 中再切分出 20% (相对于总数据) 作为 val
-    # 逻辑：Test=20%, Train+Val=80%. Val 是 Train+Val 的 1/4 (即总数的20%)
-    # 我们简单地把 train_val 的后 25% 划给 Val
-    split_point = int(len(train_val_indices) * 0.75)
-    train_indices = train_val_indices[:split_point]
-    val_indices = train_val_indices[split_point:]
+    print(f"  Active Split: Train={len(train_set)}, Val={len(val_set)}, Test={len(test_set)}")
     
-    train_set = [all_data[i] for i in train_indices]
-    val_set = [all_data[i] for i in val_indices]
-    test_set = [all_data[i] for i in test_indices]
-    
-    print(f"  Fold {fold} Split: Train={len(train_set)}, Val={len(val_set)}, Test={len(test_set)}")
-    
-    # 3. 诱导
-    print("[Main] Inducing Initial Rubric (Mocked)...")
-    # 实际应调用 InstructionInductor
+    # 3. 诱导 (Mocked or Real)
+    print("[Main] Inducing Initial Rubric...")
     base_rubric = "Score the essay based on coherence, organization, and grammar."
     
     # 4. 进化 (只在 Train/Val 上进行)
@@ -543,8 +573,7 @@ def main(config_path="configs/default.yaml", fold=0):
     best = optimizer.run()
     
     print(f"\n{'='*20} Final Test Evaluation {'='*20}")
-    # 5. [FIX] 最终测试集评估 (Test Set)
-    # 注意：vector_store 依然是基于 Train Set 构建的，没有任何 Test Set 数据泄露
+    # 5. 最终测试集评估
     test_qwk = best.evaluate(test_set, optimizer.vector_store)
     
     print(f"Validation Best QWK: {best.fitness:.4f}")
@@ -555,7 +584,6 @@ def main(config_path="configs/default.yaml", fold=0):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run WISE-AES Experiment")
     parser.add_argument("--config", type=str, default="configs/default.yaml", help="Path to config file")
-    # [FIX] 增加 fold 参数
     parser.add_argument("--fold", type=int, default=0, help="Fold index (0-4) for 5-fold CV")
     args = parser.parse_args()
     
