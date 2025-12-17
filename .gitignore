@@ -17,3 +17,4 @@ data/*
 !data/README.md
 result
 cache
+logs
