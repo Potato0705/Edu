@@ -16,3 +16,4 @@ wheels/
 data/*
 !data/README.md
 result
+cache
