@@ -21,21 +21,20 @@ data:
 
 # RAG (检索增强生成) 配置 [NEW]
 rag:
-  enabled: true                        # [总开关] RAG 是否开启
-  model_name: "all-MiniLM-L6-v2"
+  enabled: true                        # [总开关] 是否开启 RAG
+  model_name: "all-MiniLM-L6-v2"       #用于向量检索的 Embedding 模型
   
   # 数量控制
-  n_retrieved: 10                      # 向量检索取回数量 (候选池)
-  n_selected: 3                        # 最终使用的数量
+  n_retrieved: 10                      # 向量检索取回的候选数量 (Top-k)
+  n_selected: 3                        # 最终喂给打分模型的 RAG 范文数量
   
-  # [NEW] Rerank 阶段控制
-  # 训练/进化阶段：建议 false (为了速度和进化信号的稳定性)
-  use_rerank_train: false              
-  # 推理/测试阶段：建议 true (为了最高精度，作为 TTA)
-  use_rerank_test: true                
+  # 功能开关
+  use_rerank: true                     # 是否开启 LLM 重排序 (False 则直接取 Top-n_selected)
   
-  rubric_driven_retrieval: true
-
+  # 进化控制 (One Rubric 策略)
+  # 如果为 true: Query生成和Rerank都会读取当前进化的 Rubric，随 Rubric 变化而变化
+  # 如果为 false: 使用通用的静态指令 (Standard RAG)
+  rubric_driven_retrieval: true        # [开关] RAG 检索/筛选是否受进化 Rubric 驱动
 
 # 指令诱导配置
 induction:
@@ -59,7 +58,6 @@ llm:
   temperature_scoring: 0.0             # 打分必须 0 温
   temperature_generation: 0.7
   max_exemplar_length: 400
-  max_retries: 2
 
 # 输出配置
 output:

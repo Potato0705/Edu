@@ -1,6 +1,6 @@
 """
 WISE-AES: Weakly-supervised Integrated Scoring Evolution
-版本: v2.6 (Production Ready: Real Data, 5-Fold CV, Forced Mutation)
+版本: v3.0 (Enhanced with CoT, JSON Parsing, Real Reflection, Stratified Sampling)
 """
 
 import os
@@ -28,7 +28,8 @@ import pandas as pd
 import pickle
 from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
-from sklearn.model_selection import KFold # [NEW] 用于五折交叉验证
+from sklearn.model_selection import KFold
+from sklearn.metrics import cohen_kappa_score
 
 load_dotenv(override=True)
 
@@ -51,7 +52,6 @@ class TeeLogger(object):
 class ExperimentManager:
     def __init__(self, base_dir="logs", config_path="configs/default.yaml", fold=0):
         self.timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        # 实验目录带上 fold 编号，方便区分
         self.exp_dir = Path(base_dir) / f"exp_{self.timestamp}_fold{fold}"
         
         self.gens_dir = self.exp_dir / "generations"
@@ -97,7 +97,7 @@ class ExperimentManager:
             "instruction": best_ind.instruction_text,
             "static_exemplars": [ex['essay_id'] for ex in best_ind.static_exemplars],
             "history": history,
-            "test_results": test_results # [NEW] 包含测试集结果
+            "test_results": test_results
         }
         with open(self.exp_dir / "final_result.json", 'w', encoding='utf-8') as f:
             json.dump(res, f, ensure_ascii=False, indent=2)
@@ -123,9 +123,10 @@ class SimpleVectorStore:
 
     def add_documents(self, data: List[Dict[str, Any]]):
         self.documents = data
+        if not data: return
         doc_ids = [str(d['essay_id']) for d in data]
-        # 缓存键加入数据长度，防止不同 fold 混用缓存时出错
-        cache_file = self.cache_dir / f"embeddings_{self.model_name.replace('/', '_')}_{len(data)}_{hash(str(doc_ids[:5]))}.pkl"
+        ids_fingerprint = hashlib.md5(str(sorted(doc_ids)).encode('utf-8')).hexdigest()[:10]
+        cache_file = self.cache_dir / f"embeddings_{self.model_name.replace('/', '_')}_{len(data)}_{ids_fingerprint}.pkl"
         
         if cache_file.exists():
             print(f"[VectorStore] Loading cached embeddings from {cache_file.name}")
@@ -144,6 +145,8 @@ class SimpleVectorStore:
             
     def search(self, query: str, top_k: int = 10, exclude_ids: set = None) -> List[Dict]:
         self._load_model()
+        if self.embeddings is None or len(self.documents) == 0: return []
+        
         query_vec = self.model.encode([query], convert_to_numpy=True)
         sims = cosine_similarity(query_vec, self.embeddings)[0]
         sorted_indices = np.argsort(sims)[::-1]
@@ -203,18 +206,33 @@ CACHE = LLMCache()
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 
 def call_llm(prompt: str, temperature: float = 0.0, call_type: str = "unknown") -> str:
-    model_name = EXP_MANAGER.config['model']['name']
+    # 1. 获取配置
+    model_config = EXP_MANAGER.config.get('model', {})
+    model_name = model_config.get('name', 'deepseek/deepseek-chat')
+    provider_setting = model_config.get('provider', None) 
+    
     cached_resp = CACHE.get(prompt, model_name, temperature)
     if cached_resp: return cached_resp
 
     url = "https://openrouter.ai/api/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json", "HTTP-Referer": "https://wise-aes.local"}
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}", 
+        "Content-Type": "application/json", 
+        "HTTP-Referer": "https://wise-aes.local"
+    }
+    
     payload = {
         "model": model_name,
         "messages": [{"role": "user", "content": prompt}],
         "temperature": temperature,
-        "provider": {"order": ["cerebras", "deepinfra"]}
     }
+    
+    # [NEW] 注入 Provider 配置
+    if provider_setting:
+        payload["provider"] = {
+            "order": [provider_setting],
+            "allow_fallbacks": False
+        }
     
     start_time = time.time()
     response_content = ""
@@ -227,9 +245,13 @@ def call_llm(prompt: str, temperature: float = 0.0, call_type: str = "unknown") 
                 time.sleep(2 ** attempt)
                 continue
             resp.raise_for_status()
-            response_content = resp.json()["choices"][0]["message"]["content"]
-            CACHE.set(prompt, model_name, temperature, response_content)
-            break
+            data = resp.json()
+            if "choices" in data and len(data["choices"]) > 0:
+                response_content = data["choices"][0]["message"]["content"]
+                CACHE.set(prompt, model_name, temperature, response_content)
+                break
+            else:
+                error_msg = f"Empty response: {data}"
         except Exception as e:
             error_msg = str(e)
             time.sleep(1)
@@ -238,6 +260,7 @@ def call_llm(prompt: str, temperature: float = 0.0, call_type: str = "unknown") 
         EXP_MANAGER.log_llm_trace({
             "timestamp": datetime.now().isoformat(),
             "call_type": call_type,
+            "provider": provider_setting,
             "duration": round(time.time() - start_time, 3),
             "len": len(response_content),
             "error": error_msg,
@@ -246,7 +269,7 @@ def call_llm(prompt: str, temperature: float = 0.0, call_type: str = "unknown") 
     return response_content
 
 # ============================================================================
-# 3. PromptIndividual
+# 3. PromptIndividual (包含核心修改)
 # ============================================================================
 
 @dataclass
@@ -256,29 +279,57 @@ class PromptIndividual:
     fitness: float = 0.0
     config: Dict[str, Any] = field(default_factory=dict)
     
+    last_pred_scores: List[int] = field(default_factory=list)
+
     # Templates
-    QUERY_GEN_RUBRIC_TEMPLATE = """Based on the SCORING RUBRIC below, extract 3-5 keywords from the STUDENT ESSAY that relate to critical grading features.
-SCORING RUBRIC:\n{rubric}\nSTUDENT ESSAY:\n{essay}\nOUTPUT JSON LIST:"""
+    QUERY_GEN_RUBRIC_TEMPLATE = """Based on the SCORING RUBRIC below, extract 3-5 keywords from the STUDENT ESSAY.\nSCORING RUBRIC:\n{rubric}\nSTUDENT ESSAY:\n{essay}\nOUTPUT JSON LIST:"""
+    QUERY_GEN_GENERIC_TEMPLATE = """Extract 3-5 distinct keywords from the STUDENT ESSAY.\nSTUDENT ESSAY:\n{essay}\nOUTPUT JSON LIST:"""
+    RERANK_TEMPLATE = """Select the {k} essays from CANDIDATES that best match the Rubric criteria to serve as references for grading the Target Essay.
 
-    QUERY_GEN_GENERIC_TEMPLATE = """Extract 3-5 distinct keywords from the STUDENT ESSAY that capture its main topic and writing style.\nSTUDENT ESSAY:\n{essay}\nOUTPUT JSON LIST:"""
+RUBRIC:
+{rubric}
 
-    RERANK_RUBRIC_TEMPLATE = """Select the {k} essays from CANDIDATES that best demonstrate the specific grading criteria in the SCORING RUBRIC.\nSCORING RUBRIC:\n{rubric}\nTARGET ESSAY SUMMARY:\n{essay_summary}\nCANDIDATES:\n{candidates}\nOUTPUT JSON LIST OF IDs:"""
+TARGET ESSAY:
+{essay}
 
-    RERANK_GENERIC_TEMPLATE = """Select the {k} essays from CANDIDATES that are most semantically similar to the TARGET ESSAY.\nTARGET ESSAY SUMMARY:\n{essay_summary}\nCANDIDATES:\n{candidates}\nOUTPUT JSON LIST OF IDs:"""
+CANDIDATES:
+{candidates}
 
-    # [FIX] 修复：打分范围不再硬编码，改为动态变量
-    SCORING_TEMPLATE = """You are an expert essay grader. Score the essay on a scale of {score_min} to {score_max}.
-## SCORING RUBRIC:\n{instruction}
-## STATIC REFERENCE EXAMPLES (Global Anchors):\n{static_ex}
-## RETRIEVED SIMILAR EXAMPLES (Local Context):\n{dynamic_ex}
-## ESSAY TO SCORE:\n{essay}
-Output ONLY the numeric score.\nSCORE:"""
+Output ONLY a JSON list of essay_ids (e.g., [101, 204])."""
+
+    # CoT + JSON SCORING TEMPLATE
+    SCORING_TEMPLATE = """You are an expert essay grader. 
+Your goal is to evaluate the essay based on the SCORING RUBRIC and REFERENCE EXAMPLES.
+
+Step 1: Analyze the essay's Coherence, Organization, and Grammar based on the rubric.
+Step 2: Explicitly compare the essay to the Reference Examples provided (Anchors).
+Step 3: Assign a final integer score between {score_min} and {score_max}.
+
+## SCORING RUBRIC:
+{instruction}
+
+## REFERENCE EXAMPLES (Anchors):
+{static_ex}
+
+## RETRIEVED SIMILAR EXAMPLES (Local Context):
+{dynamic_ex}
+
+## ESSAY TO SCORE:
+{essay}
+
+Output your response in valid JSON format:
+{{
+  "reasoning": "The essay demonstrates...",
+  "comparison": "Compared to the score {score_min} example, this essay is...",
+  "final_score": <integer>
+}}
+"""
 
     def __post_init__(self):
         if not self.config: self.config = EXP_MANAGER.config
 
     def generate_query(self, essay_text: str) -> str:
-        rubric_driven = self.config['rag']['rubric_driven_retrieval']
+        rubric_driven = self.config['rag'].get('rubric_driven_retrieval', False)
         template = self.QUERY_GEN_RUBRIC_TEMPLATE if rubric_driven else self.QUERY_GEN_GENERIC_TEMPLATE
         prompt = template.format(rubric=self.instruction_text, essay=essay_text[:800])
         response = call_llm(prompt, temperature=0.7, call_type="rag_query")
@@ -288,96 +339,161 @@ Output ONLY the numeric score.\nSCORE:"""
         except: return essay_text[:200]
 
     def rerank_exemplars(self, essay_text: str, candidates: List[Dict]) -> List[Dict]:
-        if not self.config['rag']['use_rerank']: return candidates[:self.config['rag']['n_selected']]
-        
-        rubric_driven = self.config['rag']['rubric_driven_retrieval']
         k_select = self.config['rag']['n_selected']
         cand_text = "\n".join([f"ID {c['essay_id']} (Score {c['domain1_score']}): {c['essay_text'][:200]}..." for c in candidates])
         
-        if rubric_driven:
-            prompt = self.RERANK_RUBRIC_TEMPLATE.format(rubric=self.instruction_text, k=k_select, essay_summary=essay_text[:500], candidates=cand_text)
-        else:
-            prompt = self.RERANK_GENERIC_TEMPLATE.format(k=k_select, essay_summary=essay_text[:500], candidates=cand_text)
-            
+        prompt = self.RERANK_TEMPLATE.format(
+            k=k_select,
+            rubric=self.instruction_text,
+            essay=essay_text[:500], # 截取一部分以节省 Token
+            candidates=cand_text
+        )
+        
         response = call_llm(prompt, temperature=0.0, call_type="rag_rerank")
         try:
             ids = json.loads(re.search(r'\[.*\]', response, re.DOTALL).group())
-            selected = [c for c in candidates if c['essay_id'] in ids]
+            str_ids = set(str(x) for x in ids)
+            selected = [c for c in candidates if str(c['essay_id']) in str_ids]
             if len(selected) < k_select:
                 remain = [c for c in candidates if c not in selected]
                 selected.extend(remain[:k_select - len(selected)])
             return selected[:k_select]
-        except: return candidates[:k_select]
+        except: 
+            return candidates[:k_select]
 
-    def predict_score(self, essay_text: str, vector_store: SimpleVectorStore) -> int:
+    # [MODIFIED] 包含重试机制、配置读取和双向日志
+    def predict_score(self, essay_text: str, vector_store: SimpleVectorStore, enable_rerank: bool = False) -> int:
         dynamic_exemplars = []
         if self.config['rag']['enabled']:
             query = self.generate_query(essay_text)
             exclude_ids = {ex['essay_id'] for ex in self.static_exemplars}
             candidates = vector_store.search(query, top_k=self.config['rag']['n_retrieved'], exclude_ids=exclude_ids)
-            dynamic_exemplars = self.rerank_exemplars(essay_text, candidates)
             
-        prompt = self.SCORING_TEMPLATE.format(
+            if enable_rerank:
+                dynamic_exemplars = self.rerank_exemplars(essay_text, candidates)
+            else:
+                dynamic_exemplars = candidates[:self.config['rag']['n_selected']]
+            
+        base_prompt = self.SCORING_TEMPLATE.format(
             instruction=self.instruction_text,
             static_ex=self._format_list(self.static_exemplars),
             dynamic_ex=self._format_list(dynamic_exemplars) if dynamic_exemplars else "(None)",
             essay=essay_text,
-            # [FIX] 动态传入分数范围
             score_min=self.config['data']['score_min'],
             score_max=self.config['data']['score_max']
         )
-        response = call_llm(prompt, temperature=self.config['llm']['temperature_scoring'], call_type="scoring")
+        
+        # [NEW] 从 Config 读取重试次数 (默认为 1)
+        max_retries = self.config['llm'].get('max_retries', 1)
+        current_prompt = base_prompt
+        
+        for attempt in range(max_retries + 1):
+            # 重试时稍微提高温度 (0.3)，增加跳出局部错误的可能性
+            temp = self.config['llm']['temperature_scoring'] if attempt == 0 else 0.3
+            call_type = "scoring" if attempt == 0 else f"scoring_retry_{attempt}"
+            
+            response = call_llm(current_prompt, temperature=temp, call_type=call_type)
+            
+            try:
+                # 1. 优先尝试 JSON 解析
+                json_match = re.search(r'\{.*\}', response, re.DOTALL)
+                if json_match:
+                    result = json.loads(json_match.group())
+                    score = int(result.get('final_score', -1))
+                    
+                    if self.config['data']['score_min'] <= score <= self.config['data']['score_max']:
+                        return score
+                    else:
+                        raise ValueError(f"Score {score} out of range")
+                else:
+                    raise ValueError("No JSON found")
+            
+            except Exception as e:
+                # 如果这是最后一次尝试，跳出循环进入 Fallback
+                if attempt == max_retries:
+                    # [Log] 记录最终失败，将进入 Fallback
+                    # print(f"    [Warning] JSON parsing failed after {attempt+1} attempts: {e}. Falling back to Regex.")
+                    break
+                
+                # [Log] 打印重试日志 (TeeLogger 会同时输出到屏幕和文件)
+                print(f"    [Retry] Attempt {attempt+1}/{max_retries} failed ({e}). Retrying with error feedback...")
+                
+                # 构造包含错误信息的 Prompt，这会改变 Hash Key，强制绕过 Cache
+                error_feedback = f"\n\nSYSTEM ERROR: Your previous response was invalid. Error: {str(e)}.\nPlease output ONLY the valid JSON object with key 'final_score' (integer between {self.config['data']['score_min']} and {self.config['data']['score_max']})."
+                current_prompt = base_prompt + error_feedback
+
+        # --- Fallback 1: Regex (更稳健的倒序查找) ---
         try:
-            # 宽容解析：查找最后一个数字
             nums = re.findall(r'-?\d+', response)
-            if nums: 
-                score = int(nums[-1])
-                # 截断到合法范围
-                return max(self.config['data']['score_min'], min(self.config['data']['score_max'], score))
+            if nums:
+                for num_str in reversed(nums):
+                    val = int(num_str)
+                    if self.config['data']['score_min'] <= val <= self.config['data']['score_max']:
+                        # print(f"    [Fallback] Recovered score {val} via Regex.")
+                        return val
         except: pass
         
-        # Fallback: 返回中位数
+        # --- Fallback 2: Median ---
         return (self.config['data']['score_min'] + self.config['data']['score_max']) // 2
 
     def _format_list(self, exs):
-        return "\n\n".join([f"### Essay (Score: {ex['domain1_score']})\n{ex['essay_text'][:300]}..." for ex in exs])
+        return "\n\n".join([f"### Essay (Score: {ex['domain1_score']})\n{ex['essay_text'][:400]}..." for ex in exs])
 
-    def evaluate(self, val_set: List[Dict], vector_store: SimpleVectorStore) -> float:
+    def evaluate(self, val_set: List[Dict], vector_store: SimpleVectorStore, enable_rerank: bool = False) -> float:
         true_scores = [item['domain1_score'] for item in val_set]
         pred_scores = [0] * len(val_set)
         max_workers = self.config['evolution'].get('max_workers', 5)
         
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_idx = {executor.submit(self.predict_score, item['essay_text'], vector_store): i for i, item in enumerate(val_set)}
+            future_to_idx = {
+                executor.submit(self.predict_score, item['essay_text'], vector_store, enable_rerank): i 
+                for i, item in enumerate(val_set)
+            }
             for future in as_completed(future_to_idx):
                 idx = future_to_idx[future]
                 try: 
                     pred = future.result()
                     pred_scores[idx] = pred
-                    true_score = true_scores[idx]
                     essay_id = val_set[idx].get('essay_id', 'unknown')
-                    print(f"    [Eval] ID {essay_id:<4} | Truth: {true_score:<2} | Pred: {pred:<2}")
+                    mode = "Rerank" if enable_rerank else "Vector"
+                    print(f"    [Eval-{mode}] ID {essay_id:<4} | Truth: {true_scores[idx]:<2} | Pred: {pred:<2}")
                 except Exception as e: 
                     print(f"    [Error] {e}")
                     pred_scores[idx] = (self.config['data']['score_min'] + self.config['data']['score_max']) // 2
                     
-        qwk = self._calc_qwk(true_scores, pred_scores)
+        self.last_pred_scores = pred_scores
+        qwk = cohen_kappa_score(true_scores, pred_scores, weights='quadratic')
         self.fitness = qwk
         return qwk
-
-    def _calc_qwk(self, t, p):
-        from sklearn.metrics import cohen_kappa_score
-        return cohen_kappa_score(t, p, weights='quadratic')
 
     def clone(self):
         return PromptIndividual(self.instruction_text, self.static_exemplars.copy(), self.fitness, self.config)
     
-    def get_feedback(self, val_set, preds):
-        prompt = f"Analyze errors based on Rubric:\n{self.instruction_text}\n..." 
-        return call_llm(prompt, temperature=0.7, call_type="feedback")
+    def generate_real_feedback(self, val_set: List[Dict]) -> str:
+        if not self.last_pred_scores: return "Focus on improving general accuracy."
+        true_scores = [x['domain1_score'] for x in val_set]
+        errors = []
+        for i, (p, t) in enumerate(zip(self.last_pred_scores, true_scores)):
+            if abs(p - t) >= 1: 
+                errors.append((val_set[i], p, t))
+        
+        selected_errors = errors[:3]
+        if not selected_errors: return "No significant errors found."
+
+        error_desc = "\n".join([
+            f"- Essay (ID {e['essay_id']}): Predicted {p}, but Truth was {t}. \nSnippet: {e['essay_text'][:200]}..."
+            for e, p, t in selected_errors
+        ])
+        
+        prompt = f"""Review the grading errors below and suggest improvements to the SCORING RUBRIC.
+CURRENT RUBRIC:\n{self.instruction_text}
+ERRORS:\n{error_desc}
+Analyze WHY these errors occurred. Provide specific, actionable instructions to update the rubric.
+"""
+        return call_llm(prompt, temperature=0.7, call_type="reflection")
         
     def evolve_instruction(self, feedback):
-        prompt = f"Rewrite rubric based on feedback:\n{feedback}\nOld Rubric:\n{self.instruction_text}"
+        prompt = f"Rewrite and improve the rubric based on the feedback.\nFEEDBACK:\n{feedback}\n\nOLD RUBRIC:\n{self.instruction_text}\n\nOUTPUT ONLY THE NEW RUBRIC TEXT."
         return call_llm(prompt, temperature=0.7, call_type="rewrite")
     
     def to_dict(self):
@@ -405,23 +521,51 @@ class EvolutionOptimizer:
         self.population = []
         self.history = []
 
+    # [NEW] 分层采样
+    def get_stratified_exemplars(self, n=3):
+        score_min = self.config['data']['score_min']
+        score_max = self.config['data']['score_max']
+        
+        threshold_low = score_min + (score_max - score_min) * 0.33
+        threshold_high = score_min + (score_max - score_min) * 0.66
+        
+        low_pool = [x for x in self.train_data if x['domain1_score'] <= threshold_low]
+        mid_pool = [x for x in self.train_data if threshold_low < x['domain1_score'] < threshold_high]
+        high_pool = [x for x in self.train_data if x['domain1_score'] >= threshold_high]
+        
+        selection = []
+        if low_pool: selection.append(random.choice(low_pool))
+        if high_pool: selection.append(random.choice(high_pool))
+        if mid_pool and len(selection) < n: selection.append(random.choice(mid_pool))
+        
+        while len(selection) < n:
+            selection.append(random.choice(self.train_data))
+            
+        return selection
+
     def initialize_population(self, base_instruction):
         n_static = self.config['evolution']['n_static_exemplars']
-        print(f"[Init] Pop size: {self.config['evolution']['population_size']}, Static Ex: {n_static}")
+        print(f"[Init] Pop size: {self.config['evolution']['population_size']}, Stratified Sampling Enabled.")
         for _ in range(self.config['evolution']['population_size']):
-            static_ex = random.sample(self.train_data, n_static)
+            static_ex = self.get_stratified_exemplars(n_static)
             self.population.append(PromptIndividual(base_instruction, static_ex, config=self.config))
 
     def evolve_one_generation(self, gen):
         print(f"\n{'='*20} Generation {gen} {'='*20}")
         
+        # [NEW] 读取训练时的 Rerank 开关
+        use_rerank_train = self.config['rag'].get('use_rerank_train', False)
+        print(f"  [Config] Training Rerank: {'ENABLED' if use_rerank_train else 'DISABLED'}")
+
         scores = []
         pop_snapshot = [] 
         
         for i, ind in enumerate(self.population):
             ex_ids = [ex['essay_id'] for ex in ind.static_exemplars]
             print(f"  [Gen {gen}] Ind {i:02d} | Exemplars: {ex_ids}")
-            qwk = ind.evaluate(self.val_data, self.vector_store)
+            
+            # [MODIFIED] 透传 Rerank 开关
+            qwk = ind.evaluate(self.val_data, self.vector_store, enable_rerank=use_rerank_train)
             scores.append(qwk)
             print(f"  >> Ind {i:02d} Finished: QWK = {qwk:.4f}\n")
             
@@ -436,33 +580,38 @@ class EvolutionOptimizer:
         self.history.append({"gen": gen, "best_qwk": best_ind.fitness})
         if EXP_MANAGER: EXP_MANAGER.save_generation_snapshot(gen, pop_snapshot)
         
-        # 2. Evolve Rubrics (Elite Only)
+        # 2. Evolve Rubrics
         n_elite = self.config['evolution']['n_elite_evolve']
         elites = [self.population[i] for i in np.argsort(scores)[-n_elite:]]
         
-        print("  Evolving Rubrics for Elites...")
-        for elite in elites:
-            dummy_feedback = "Please make the rubric more specific about grammar."
-            new_text = elite.evolve_instruction(dummy_feedback)
-            elite.instruction_text = new_text 
-            
-        # 3. GA for Exemplars (With Forced Mutation)
-        new_pop = [e.clone() for e in elites]
+        # [FIX] 关键修复：在修改 Rubric 之前，先保留上一代最好的个体（Elite Preservation）
+        # 如果不保留，万一改坏了，种群分数会退化
+        best_old_elite = elites[-1].clone() 
+        new_pop = [best_old_elite] # 精英保留策略：直接晋级下一代
         
-        # [FIX] 记录当前指纹，防止重复
+        print("  Evolving Rubrics for Elites (Using Real Reflection)...")
+        mutated_parents = []
+        for elite in elites:
+            # 这里是修改原始 elite 对象的引用
+            real_feedback = elite.generate_real_feedback(self.val_data)
+            print(f"    [Feedback] {real_feedback[:100]}...")
+            new_text = elite.evolve_instruction(real_feedback)
+            elite.instruction_text = new_text 
+            mutated_parents.append(elite)
+            
+        # 补齐种群：从 mutated_parents 中克隆并变异 exemplars
         existing_fingerprints = {frozenset(ex['essay_id'] for ex in ind.static_exemplars) for ind in new_pop}
         
+        # 剩下的位置用变异填充
         while len(new_pop) < len(self.population):
-            parent = random.choice(elites)
+            parent = random.choice(mutated_parents) # 选新 Rubric 的个体做父母
             child = parent.clone()
             
-            # 强制变异循环：最多尝试 10 次，直到生成独特的基因组合
-            for _ in range(10):
+            for _ in range(10): 
                 idx = random.randint(0, len(child.static_exemplars)-1)
                 new_ex = random.choice(self.train_data)
                 child.static_exemplars[idx] = new_ex
                 
-                # 检查唯一性
                 fp = frozenset(ex['essay_id'] for ex in child.static_exemplars)
                 if fp not in existing_fingerprints:
                     existing_fingerprints.add(fp)
@@ -490,91 +639,72 @@ def main(config_path="configs/default.yaml", fold=0):
     EXP_MANAGER = ExperimentManager(config_path=config_path, fold=fold)
     config = EXP_MANAGER.config
     
-    # 1. 加载真实数据
+    # 1. 加载数据
     data_path = config['data']['asap_path']
     essay_set = config['data']['essay_set']
     print(f"[Main] Loading ASAP Data Set {essay_set} from {data_path}...")
     
     if not os.path.exists(data_path):
-        raise FileNotFoundError(f"Data file not found: {data_path}")
-        
-    df = pd.read_csv(data_path, sep='\t', encoding='latin-1')
-    df = df[df['essay_set'] == essay_set]
-    
-    all_data = []
-    for _, row in df.iterrows():
-        all_data.append({
-            "essay_id": row['essay_id'],
-            "essay_text": row['essay'],
-            "domain1_score": row['domain1_score']
-        })
-    print(f"  Total essays available: {len(all_data)}")
-    
-    # 打乱数据，保证 Debug 抽样具有随机性
-    random.seed(42)
-    random.shuffle(all_data)
-    
-    # --------------------------------------------------------------------------
-    # [NEW] 调试模式判断逻辑
-    # --------------------------------------------------------------------------
-    if config.get('debug', {}).get('enabled', False):
-        print("\n" + "!"*40)
-        print("  WARNING: RUNNING IN DEBUG MODE")
-        print("  (Ignoring 5-Fold Split, using custom small subsets)")
-        print("!"*40 + "\n")
-        
-        d_cfg = config['debug']
-        n_train = d_cfg.get('n_train', 10)
-        n_val = d_cfg.get('n_val', 5)
-        n_test = d_cfg.get('n_test', 5)
-        
-        # 硬切分：直接切出指定数量的数据
-        # 确保不会越界
-        if n_train + n_val + n_test > len(all_data):
-            print(f"  [Error] Debug sizes exceed total data ({len(all_data)}). Truncating...")
-            
-        current_idx = 0
-        train_set = all_data[current_idx : current_idx + n_train]
-        current_idx += n_train
-        
-        val_set = all_data[current_idx : current_idx + n_val]
-        current_idx += n_val
-        
-        test_set = all_data[current_idx : current_idx + n_test]
-        
+        print("  [Warning] Data file not found. Creating Dummy Data for testing...")
+        all_data = []
+        for i in range(50):
+            score = random.randint(config['data']['score_min'], config['data']['score_max'])
+            all_data.append({
+                "essay_id": i,
+                "essay_text": f"This is a dummy essay number {i}. It has some content related to topic. " * 10,
+                "domain1_score": score
+            })
     else:
-        # ----------------------------------------------------------------------
-        # 标准 5-Fold Cross Validation 逻辑
-        # ----------------------------------------------------------------------
+        df = pd.read_csv(data_path, sep='\t', encoding='latin-1')
+        df = df[df['essay_set'] == essay_set]
+        all_data = []
+        for _, row in df.iterrows():
+            all_data.append({
+                "essay_id": row['essay_id'],
+                "essay_text": row['essay'],
+                "domain1_score": int(row['domain1_score'])
+            })
+    
+    # 2. 数据切分
+    if config.get('debug', {}).get('enabled', False):
+        print("  [Debug Mode] Using small subset.")
+        n_train = config['debug'].get('n_train', 10)
+        n_val = config['debug'].get('n_val', 5)
+        random.shuffle(all_data)
+        train_set = all_data[:n_train]
+        val_set = all_data[n_train:n_train+n_val]
+        test_set = all_data[n_train+n_val:n_train+n_val+5]
+    else:
         kf = KFold(n_splits=5, shuffle=True, random_state=42)
         folds = list(kf.split(all_data))
+        train_val_idx, test_idx = folds[fold]
         
-        # 获取当前 fold 的索引
-        train_val_indices, test_indices = folds[fold]
+        split = int(len(train_val_idx) * 0.8)
+        train_idx = train_val_idx[:split]
+        val_idx = train_val_idx[split:]
         
-        # 从 train_val 中再切分出 20% (相对于总数据) 作为 val
-        split_point = int(len(train_val_indices) * 0.75)
-        train_indices = train_val_indices[:split_point]
-        val_indices = train_val_indices[split_point:]
-        
-        train_set = [all_data[i] for i in train_indices]
-        val_set = [all_data[i] for i in val_indices]
-        test_set = [all_data[i] for i in test_indices]
+        train_set = [all_data[i] for i in train_idx]
+        val_set = [all_data[i] for i in val_idx]
+        test_set = [all_data[i] for i in test_idx]
     
-    print(f"  Active Split: Train={len(train_set)}, Val={len(val_set)}, Test={len(test_set)}")
+    print(f"  Split: Train={len(train_set)}, Val={len(val_set)}, Test={len(test_set)}")
     
-    # 3. 诱导 (Mocked or Real)
+    # 3. 运行优化
     print("[Main] Inducing Initial Rubric...")
-    base_rubric = "Score the essay based on coherence, organization, and grammar."
+    base_rubric = "Evaluate the essay based on: 1. Content and Ideas, 2. Organization, 3. Vocabulary and Grammar."
     
-    # 4. 进化 (只在 Train/Val 上进行)
     optimizer = EvolutionOptimizer(train_set, val_set, config)
     optimizer.initialize_population(base_rubric)
     best = optimizer.run()
     
+    # 4. 最终测试
     print(f"\n{'='*20} Final Test Evaluation {'='*20}")
-    # 5. 最终测试集评估
-    test_qwk = best.evaluate(test_set, optimizer.vector_store)
+    
+    # [NEW] 读取推理时的 Rerank 开关
+    use_rerank_test = config['rag'].get('use_rerank_test', True)
+    print(f"  [Config] Inference Rerank: {'ENABLED' if use_rerank_test else 'DISABLED'}")
+    
+    test_qwk = best.evaluate(test_set, optimizer.vector_store, enable_rerank=use_rerank_test)
     
     print(f"Validation Best QWK: {best.fitness:.4f}")
     print(f"Test Set QWK:        {test_qwk:.4f}")
@@ -582,9 +712,8 @@ def main(config_path="configs/default.yaml", fold=0):
     EXP_MANAGER.save_final_results(best, optimizer.history, test_results={"test_qwk": test_qwk})
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run WISE-AES Experiment")
-    parser.add_argument("--config", type=str, default="configs/default.yaml", help="Path to config file")
-    parser.add_argument("--fold", type=int, default=0, help="Fold index (0-4) for 5-fold CV")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", type=str, default="configs/default.yaml")
+    parser.add_argument("--fold", type=int, default=0)
     args = parser.parse_args()
-    
-    main(config_path=args.config, fold=args.fold)
+    main(args.config, args.fold)
