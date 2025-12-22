@@ -670,15 +670,7 @@ def main(config_path="configs/default.yaml", fold=0):
     print(f"[Main] Loading ASAP Data Set {essay_set} from {data_path}...")
     
     if not os.path.exists(data_path):
-        print("  [Warning] Data file not found. Creating Dummy Data for testing...")
-        all_data = []
-        for i in range(50):
-            score = random.randint(config['data']['score_min'], config['data']['score_max'])
-            all_data.append({
-                "essay_id": i,
-                "essay_text": f"This is a dummy essay number {i}. It has some content related to topic. " * 10,
-                "domain1_score": score
-            })
+        raise FileNotFoundError(f"Data file not found: {data_path}")
     else:
         df = pd.read_csv(data_path, sep='\t', encoding='latin-1')
         df = df[df['essay_set'] == essay_set]
