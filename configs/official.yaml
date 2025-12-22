@@ -37,8 +37,15 @@ rag:
 
 # 指令诱导配置
 induction:
-  n_high_samples: 5
-  n_low_samples: 5
+  enabled: true
+  n_high_samples: 3
+  n_low_samples: 3
+  official_criteria: |
+    Score 0-60.
+    CRITERIA:
+    1. Content: Clarity, depth, and relevance of ideas.
+    2. Organization: Structure, flow, and coherence.
+    3. Language: Grammar, vocabulary range, and mechanics.
 
 # 进化算法配置
 evolution:
@@ -55,8 +62,6 @@ evolution:
 # LLM 配置
 llm:
   temperature_scoring: 0.0             # 打分必须 0 温
-  temperature_generation: 0.7
-  max_exemplar_length: 400
   max_retries: 2
 
 # 输出配置

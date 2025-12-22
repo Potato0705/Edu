@@ -330,6 +330,23 @@ Output your response in valid JSON format:
 }}
 """
 
+    INDUCTION_TEMPLATE = """You are an expert essay scoring system designer.
+Your task is to create a refined, operational SCORING RUBRIC (I_0) based on the OFFICIAL CRITERIA and concrete STUDENT ESSAYS.
+
+### OFFICIAL CRITERIA:
+{official_criteria}
+
+### STUDENT ESSAY SAMPLES (Grounding Data):
+{samples_text}
+
+### INSTRUCTION:
+1. Analyze the difference between High-Scoring and Low-Scoring essays.
+2. Refine the OFFICIAL CRITERIA into a detailed, step-by-step scoring guide.
+3. Highlight specific, observable discriminators (e.g., "use of transitions," "sentence variety").
+4. The output must be ready to use as a prompt for an LLM grader.
+
+Output ONLY the Rubric text. Do not output explanations."""
+
     def __post_init__(self):
         if not self.config: self.config = EXP_MANAGER.config
 
@@ -474,7 +491,8 @@ Output your response in valid JSON format:
                     pred_scores[idx] = pred
                     essay_id = val_set[idx].get('essay_id', 'unknown')
                     mode = "Rerank" if enable_rerank else "Vector"
-                    print(f"    [Eval-{mode}] ID {essay_id:<4} | Truth: {true_scores[idx]:<2} | Pred: {pred:<2}")
+                    if self.config.get('output', {}).get('verbose', False):
+                        print(f"    [Eval-{mode}] ID {essay_id:<4} | Truth: {true_scores[idx]:<2} | Pred: {pred:<2}")
                 except Exception as e: 
                     print(f"    [Error] {e}")
                     pred_scores[idx] = (self.config['data']['score_min'] + self.config['data']['score_max']) // 2
@@ -545,6 +563,42 @@ class EvolutionOptimizer:
         self.history = []
 
         self.fitness_memo = {} # [New] 全局适应度缓存
+
+    # [NEW] Rubric-Guided Induction
+    def induce_instruction(self):
+        print("[Induction] Starting Instruction Induction...")
+        conf = self.config['induction']
+        n_high = conf.get('n_high_samples', 3)
+        n_low = conf.get('n_low_samples', 3)
+        official_rubric = conf.get('official_criteria', "Evaluate based on general quality.")
+        
+        # Sort by score
+        sorted_data = sorted(self.train_data, key=lambda x: x['domain1_score'])
+        # 简单的首尾采样，如果数据太少注意处理
+        if len(sorted_data) < n_low + n_high:
+            low_samples = sorted_data[:len(sorted_data)//2]
+            high_samples = sorted_data[len(sorted_data)//2:]
+        else:
+            low_samples = sorted_data[:n_low]
+            high_samples = sorted_data[-n_high:]
+        
+        print(f"  Selected {len(low_samples)} Low and {len(high_samples)} High samples.")
+        
+        samples_text = ""
+        for i, s in enumerate(high_samples):
+            samples_text += f"\n[HIGH SCORE ({s['domain1_score']})] ID {s['essay_id']}:\n{s['essay_text'][:600]}...\n"
+        for i, s in enumerate(low_samples):
+            samples_text += f"\n[LOW SCORE ({s['domain1_score']})] ID {s['essay_id']}:\n{s['essay_text'][:600]}...\n"
+            
+        prompt = PromptIndividual.INDUCTION_TEMPLATE.format(
+            official_criteria=official_rubric,
+            samples_text=samples_text
+        )
+        
+        print("  Generating induced rubric via LLM...")
+        induced_rubric = call_llm(prompt, temperature=0.7, call_type="induction")
+        print(f"  [Induction Done] Rubric Length {len(induced_rubric)}")
+        return induced_rubric
 
     # [NEW] 分层采样
     def get_stratified_exemplars(self, n=3):
@@ -707,10 +761,16 @@ def main(config_path="configs/default.yaml", fold=0):
     print(f"  Split: Train={len(train_set)}, Val={len(val_set)}, Test={len(test_set)}")
     
     # 3. 运行优化
-    print("[Main] Inducing Initial Rubric...")
-    base_rubric = "Evaluate the essay based on: 1. Content and Ideas, 2. Organization, 3. Vocabulary and Grammar."
-    
+    print("[Main] Initializing Optimizer...")
     optimizer = EvolutionOptimizer(train_set, val_set, config)
+    
+    if config.get('induction', {}).get('enabled', False):
+        base_rubric = optimizer.induce_instruction()
+    else:
+        print("[Main] Induction DISABLED. Using Official Criteria as Base Rubric.")
+        base_rubric = config.get('induction', {}).get('official_criteria', 
+            "Evaluate the essay based on: 1. Content and Ideas, 2. Organization, 3. Vocabulary and Grammar.")
+    
     optimizer.initialize_population(base_rubric)
     best = optimizer.run()
     
