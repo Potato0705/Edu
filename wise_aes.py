@@ -120,7 +120,9 @@ class SimpleVectorStore:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.documents: List[Dict] = []
         self.embeddings: Optional[np.ndarray] = None
+        self.embeddings: Optional[np.ndarray] = None
         self.model = None 
+        self.lock = threading.Lock()
 
     def _load_model(self):
         if self.model is None:
@@ -149,11 +151,13 @@ class SimpleVectorStore:
             pickle.dump((doc_ids, self.embeddings), f)
             
     def search(self, query: str, top_k: int = 10, exclude_ids: set = None) -> List[Dict]:
-        self._load_model()
-        if self.embeddings is None or len(self.documents) == 0: return []
+        with self.lock:
+            self._load_model()
+            if self.embeddings is None or len(self.documents) == 0: return []
+            
+            query_vec = self.model.encode([query], convert_to_numpy=True)
+            sims = cosine_similarity(query_vec, self.embeddings)[0]
         
-        query_vec = self.model.encode([query], convert_to_numpy=True)
-        sims = cosine_similarity(query_vec, self.embeddings)[0]
         sorted_indices = np.argsort(sims)[::-1]
         results = []
         for idx in sorted_indices:
@@ -252,11 +256,15 @@ def call_llm(prompt: str, temperature: float = 0.0, call_type: str = "unknown") 
             resp.raise_for_status()
             data = resp.json()
             if "choices" in data and len(data["choices"]) > 0:
-                response_content = data["choices"][0]["message"]["content"]
-                CACHE.set(prompt, model_name, temperature, response_content)
-                break
+                content = data["choices"][0]["message"].get("content", "")
+                if content and content.strip(): # Ensure content is not empty or just whitespace
+                    response_content = content
+                    CACHE.set(prompt, model_name, temperature, response_content)
+                    break
+                else:
+                    error_msg = f"Empty content in response: {data}"
             else:
-                error_msg = f"Empty response: {data}"
+                error_msg = f"Empty response structure: {data}"
         except Exception as e:
             error_msg = str(e)
             time.sleep(1)
@@ -268,8 +276,10 @@ def call_llm(prompt: str, temperature: float = 0.0, call_type: str = "unknown") 
             "provider": provider_setting,
             "duration": round(time.time() - start_time, 3),
             "len": len(response_content),
+            "len": len(response_content),
             "error": error_msg,
-            "prompt_preview": prompt[:100]
+            "prompt_preview": prompt[:100],
+            "response_preview": response_content[:200]
         })
     return response_content
 
@@ -443,12 +453,14 @@ Output ONLY the Rubric text. Do not output explanations."""
                     # print(f"    [Warning] JSON parsing failed after {attempt+1} attempts: {e}. Falling back to Regex.")
                     break
                 
+
                 # [Log] 打印重试日志 (TeeLogger 会同时输出到屏幕和文件)
-                print(f"    [Retry] Attempt {attempt+1}/{max_retries} failed ({e}). Retrying with error feedback...")
+                print(f"    [Retry] Attempt {attempt+1}/{max_retries} failed ({e}). Retrying...")
+                if self.config.get('output', {}).get('verbose', False):
+                    print(f"      > Debug: Response was: {response[:100].replace(chr(10), ' ')}...")
                 
-                # 构造包含错误信息的 Prompt，这会改变 Hash Key，强制绕过 Cache
-                error_feedback = f"\n\nSYSTEM ERROR: Your previous response was invalid. Error: {str(e)}.\nPlease output ONLY the valid JSON object with key 'final_score' (integer between {self.config['data']['score_min']} and {self.config['data']['score_max']})."
-                current_prompt = base_prompt + error_feedback
+                # 简单重试 (通过添加无意义空格改变 Hash Key，避免命中缓存)
+                current_prompt = base_prompt + " " * (attempt + 1)
 
         # --- Fallback 1: Regex (更稳健的倒序查找) ---
         try:

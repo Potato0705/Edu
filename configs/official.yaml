@@ -8,7 +8,8 @@ model:
 
   name: "deepseek/deepseek-v3.2"
   # provider: "novita/fp8"
-  provider: "baseten/fp4"
+  # provider: "baseten/fp4"
+  # provider: "atlas-cloud/fp8"
 
 # 数据配置
 data:
@@ -54,7 +55,7 @@ evolution:
   n_static_exemplars: 9                # [修改] 静态 ICL 范文数量 (Global Anchors)
   n_elite_evolve: 2
   n_error_cases: 5
-  max_workers: 20                      # 并发线程数 (建议 5-20，取决于 API Rate Limit)
+  max_workers: 50                      # 并发线程数 (建议 5-20，取决于 API Rate Limit)
 
 # LLM 配置
 llm:
