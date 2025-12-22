@@ -24,7 +24,7 @@ rag:
   
   # 数量控制
   n_retrieved: 10                      # 向量检索取回数量 (候选池)
-  n_selected: 5                        # 最终使用的数量
+  n_selected: 3                        # 最终使用的数量
   
   # [NEW] Rerank 阶段控制
   # 训练/进化阶段：建议 false (为了速度和进化信号的稳定性)
@@ -38,8 +38,8 @@ rag:
 # 指令诱导配置
 induction:
   enabled: true
-  n_high_samples: 3
-  n_low_samples: 3
+  n_high_samples: 5
+  n_low_samples: 5
   official_criteria: |
     Score 0-60.
     CRITERIA:
@@ -52,9 +52,6 @@ evolution:
   population_size: 8                   # 种群大小
   n_generations: 50                    # 进化代数
   n_static_exemplars: 9                # [修改] 静态 ICL 范文数量 (Global Anchors)
-  elite_ratio: 0.25
-  mutation_rate: 0.3
-  tournament_size: 3
   n_elite_evolve: 2
   n_error_cases: 5
   max_workers: 20                      # 并发线程数 (建议 5-20，取决于 API Rate Limit)
