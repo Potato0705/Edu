@@ -52,7 +52,7 @@ evolution:
   tournament_size: 3
   n_elite_evolve: 2
   n_error_cases: 5
-  max_workers: 10                      # 并发线程数 (建议 5-20，取决于 API Rate Limit)
+  max_workers: 20                      # 并发线程数 (建议 5-20，取决于 API Rate Limit)
 
 # LLM 配置
 llm:

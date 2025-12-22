@@ -41,13 +41,16 @@ class TeeLogger(object):
     def __init__(self, filename):
         self.terminal = sys.stdout
         self.log_file = open(filename, "a", encoding='utf-8')
+        self.lock = threading.Lock()
     def write(self, message):
-        self.terminal.write(message)
-        self.log_file.write(message)
-        self.log_file.flush()
+        with self.lock:
+            self.terminal.write(message)
+            self.log_file.write(message)
+            self.log_file.flush()
     def flush(self):
-        self.terminal.flush()
-        self.log_file.flush()
+        with self.lock:
+            self.terminal.flush()
+            self.log_file.flush()
 
 class ExperimentManager:
     def __init__(self, base_dir="logs", config_path="configs/default.yaml", fold=0):
@@ -66,6 +69,7 @@ class ExperimentManager:
         
         self.llm_trace_path = self.exp_dir / "llm_trace.jsonl"
         self.config = self._load_and_save_config(config_path)
+        self.lock = threading.Lock()
         
     def _load_and_save_config(self, config_path):
         if not os.path.exists(config_path):
@@ -77,8 +81,9 @@ class ExperimentManager:
         return config
 
     def log_llm_trace(self, record: Dict):
-        with open(self.llm_trace_path, 'a', encoding='utf-8') as f:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        with self.lock:
+            with open(self.llm_trace_path, 'a', encoding='utf-8') as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
     
     def save_generation_snapshot(self, generation: int, population_data: List[Dict]):
         filename = self.gens_dir / f"gen_{generation:03d}.json"
@@ -328,6 +333,12 @@ Output your response in valid JSON format:
     def __post_init__(self):
         if not self.config: self.config = EXP_MANAGER.config
 
+    def get_signature(self):
+        # 指纹 = Rubric文本的Hash + 排序后的范文ID
+        ex_ids = sorted([str(ex['essay_id']) for ex in self.static_exemplars])
+        content = self.instruction_text + "_" + "_".join(ex_ids)
+        return hashlib.md5(content.encode('utf-8')).hexdigest()
+
     def generate_query(self, essay_text: str) -> str:
         rubric_driven = self.config['rag'].get('rubric_driven_retrieval', False)
         template = self.QUERY_GEN_RUBRIC_TEMPLATE if rubric_driven else self.QUERY_GEN_GENERIC_TEMPLATE
@@ -439,7 +450,14 @@ Output your response in valid JSON format:
     def _format_list(self, exs):
         return "\n\n".join([f"### Essay (Score: {ex['domain1_score']})\n{ex['essay_text'][:400]}..." for ex in exs])
 
-    def evaluate(self, val_set: List[Dict], vector_store: SimpleVectorStore, enable_rerank: bool = False) -> float:
+    def evaluate(self, val_set: List[Dict], vector_store: SimpleVectorStore, enable_rerank: bool = False, fitness_cache=None) -> float:
+        # [Optimization] 1. 检查缓存
+        sig = self.get_signature()
+        if fitness_cache is not None and sig in fitness_cache:
+            print(f"    [Cache Hit] Skipping evaluation for {sig[:8]}...")
+            self.fitness = fitness_cache[sig]
+            return self.fitness
+        
         true_scores = [item['domain1_score'] for item in val_set]
         pred_scores = [0] * len(val_set)
         max_workers = self.config['evolution'].get('max_workers', 5)
@@ -464,6 +482,11 @@ Output your response in valid JSON format:
         self.last_pred_scores = pred_scores
         qwk = cohen_kappa_score(true_scores, pred_scores, weights='quadratic')
         self.fitness = qwk
+        
+        # [Optimization] 2. 写入缓存
+        if fitness_cache is not None:
+            fitness_cache[sig] = qwk
+            
         return qwk
 
     def clone(self):
@@ -521,6 +544,8 @@ class EvolutionOptimizer:
         self.population = []
         self.history = []
 
+        self.fitness_memo = {} # [New] 全局适应度缓存
+
     # [NEW] 分层采样
     def get_stratified_exemplars(self, n=3):
         score_min = self.config['data']['score_min']
@@ -565,7 +590,7 @@ class EvolutionOptimizer:
             print(f"  [Gen {gen}] Ind {i:02d} | Exemplars: {ex_ids}")
             
             # [MODIFIED] 透传 Rerank 开关
-            qwk = ind.evaluate(self.val_data, self.vector_store, enable_rerank=use_rerank_train)
+            qwk = ind.evaluate(self.val_data, self.vector_store, enable_rerank=use_rerank_train, fitness_cache=self.fitness_memo)
             scores.append(qwk)
             print(f"  >> Ind {i:02d} Finished: QWK = {qwk:.4f}\n")
             
