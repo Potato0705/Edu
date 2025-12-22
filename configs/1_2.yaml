@@ -1,0 +1,67 @@
+# WISE-AES 实验配置文件
+
+# LLM 模型配置
+model:
+  # name: "meta-llama/llama-3.3-70b-instruct"
+  name: "meta-llama/llama-3.1-8b-instruct"
+  provider: "cerebras/fp16"
+
+# 数据配置
+data:
+  asap_path: "data/raw/training_set_rel3.tsv"
+  essay_set: 8
+  train_ratio: 0.7
+  val_size: 20                         # 验证集大小 (RAG 比较慢，建议设小一点调试)
+  score_min: 0
+  score_max: 60
+
+# RAG (检索增强生成) 配置 [NEW]
+rag:
+  enabled: true                        # [总开关] 是否开启 RAG
+  model_name: "all-MiniLM-L6-v2"       #用于向量检索的 Embedding 模型
+  
+  # 数量控制
+  n_retrieved: 10                      # 向量检索取回的候选数量 (Top-k)
+  n_selected: 2                        # 最终喂给打分模型的 RAG 范文数量
+  
+  # 功能开关
+  use_rerank: true                     # 是否开启 LLM 重排序 (False 则直接取 Top-n_selected)
+  
+  # 进化控制 (One Rubric 策略)
+  # 如果为 true: Query生成和Rerank都会读取当前进化的 Rubric，随 Rubric 变化而变化
+  # 如果为 false: 使用通用的静态指令 (Standard RAG)
+  rubric_driven_retrieval: true        # [开关] RAG 检索/筛选是否受进化 Rubric 驱动
+
+# 指令诱导配置
+induction:
+  n_high_samples: 5
+  n_low_samples: 5
+
+# 进化算法配置
+evolution:
+  population_size: 8                   # 种群大小
+  n_generations: 50                    # 进化代数
+  n_static_exemplars: 1                # [修改] 静态 ICL 范文数量 (Global Anchors)
+  elite_ratio: 0.25
+  mutation_rate: 0.3
+  tournament_size: 3
+  n_elite_evolve: 2
+  n_error_cases: 5
+  max_workers: 10                      # 并发线程数 (建议 5-20，取决于 API Rate Limit)
+
+# LLM 配置
+llm:
+  temperature_scoring: 0.0             # 打分必须 0 温
+  temperature_generation: 0.7
+  max_exemplar_length: 400
+
+# 输出配置
+output:
+  verbose: true
+
+# [NEW] 调试/非正式实验模式配置
+debug:
+  enabled: true                        # 是否开启调试模式
+  n_train: 400                          # 调试模式下：训练集大小 (RAG 知识库)
+  n_val: 32                             # 调试模式下：验证集大小 (进化评估用，最耗钱的部分)
+  n_test: 100                            # 调试模式下：测试集大小 (最终评估用)

@@ -12,8 +12,17 @@ CONFIG_FILES = [
     # "configs/ablation_no_rag.yaml",
     # "configs/ablation_static_5.yaml",
     # "configs/ablation_no_evolution.yaml",
-    "configs/batch_test_1.yaml",
-    "configs/batch_test_2.yaml",
+    # "configs/batch_test_1.yaml",
+    # "configs/batch_test_2.yaml",
+    "configs/1_1.yaml",
+    "configs/1_2.yaml",
+    "configs/1_3.yaml",
+    "configs/2_1.yaml",
+    "configs/2_2.yaml",
+    "configs/2_3.yaml",
+    "configs/3_1.yaml",
+    "configs/3_2.yaml",
+    "configs/3_3.yaml",
 ]
 # ==============================================================================
 
