@@ -370,7 +370,8 @@ Output ONLY the Rubric text. Do not output explanations."""
         rubric_driven = self.config['rag'].get('rubric_driven_retrieval', False)
         template = self.QUERY_GEN_RUBRIC_TEMPLATE if rubric_driven else self.QUERY_GEN_GENERIC_TEMPLATE
         prompt = template.format(rubric=self.instruction_text, essay=essay_text[:800])
-        response = call_llm(prompt, temperature=0.7, call_type="rag_query")
+        temp = self.config['llm'].get('temperature_query', 0.7)
+        response = call_llm(prompt, temperature=temp, call_type="rag_query")
         try:
             keywords = json.loads(re.search(r'\[.*\]', response, re.DOTALL).group())
             return " ".join(keywords)
@@ -387,7 +388,8 @@ Output ONLY the Rubric text. Do not output explanations."""
             candidates=cand_text
         )
         
-        response = call_llm(prompt, temperature=0.0, call_type="rag_rerank")
+        temp = self.config['llm'].get('temperature_rerank', 0.0)
+        response = call_llm(prompt, temperature=temp, call_type="rag_rerank")
         try:
             ids = json.loads(re.search(r'\[.*\]', response, re.DOTALL).group())
             str_ids = set(str(x) for x in ids)
@@ -543,11 +545,13 @@ CURRENT RUBRIC:\n{self.instruction_text}
 ERRORS:\n{error_desc}
 Analyze WHY these errors occurred. Provide specific, actionable instructions to update the rubric.
 """
-        return call_llm(prompt, temperature=0.7, call_type="reflection")
+        temp = self.config['llm'].get('temperature_induce', 0.8)
+        return call_llm(prompt, temperature=temp, call_type="reflection")
         
     def evolve_instruction(self, feedback):
         prompt = f"Rewrite and improve the rubric based on the feedback.\nFEEDBACK:\n{feedback}\n\nOLD RUBRIC:\n{self.instruction_text}\n\nOUTPUT ONLY THE NEW RUBRIC TEXT."
-        return call_llm(prompt, temperature=0.7, call_type="rewrite")
+        temp = self.config['llm'].get('temperature_induce', 0.8)
+        return call_llm(prompt, temperature=temp, call_type="rewrite")
     
     def to_dict(self):
         return {
@@ -608,7 +612,8 @@ class EvolutionOptimizer:
         )
         
         print("  Generating induced rubric via LLM...")
-        induced_rubric = call_llm(prompt, temperature=0.7, call_type="induction")
+        temp = self.config['llm'].get('temperature_induce', 0.8)
+        induced_rubric = call_llm(prompt, temperature=temp, call_type="induction")
         print(f"  [Induction Done] Rubric Length {len(induced_rubric)}")
         return induced_rubric
 

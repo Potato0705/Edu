@@ -59,7 +59,10 @@ evolution:
 
 # LLM 配置
 llm:
-  temperature_scoring: 0.0             # 打分必须 0 温
+  temperature_scoring: 0.0             # 打分必须 0 温 (Deterministic)
+  temperature_rerank: 0.0              # Rerank 必须 0 温 (Deterministic)
+  temperature_query: 0.7               # Query 生成可以有一定创造性 (Creative)
+  temperature_induce: 0.8              # 诱导/反思/重写建议高一点 (Evolutionary Exploration)
   max_retries: 2
 
 # 输出配置
