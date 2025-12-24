@@ -53,21 +53,32 @@ class TeeLogger(object):
             self.log_file.flush()
 
 class ExperimentManager:
-    def __init__(self, base_dir="logs", config_path="configs/default.yaml", fold=0):
-        self.timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.exp_dir = Path(base_dir) / f"exp_{self.timestamp}_fold{fold}"
+    def __init__(self, base_dir="logs", config_path="configs/default.yaml", fold=0, resume_path=None):
+        if resume_path:
+            # Resume 模式：复用旧的实验目录
+            gen_file = Path(resume_path)
+            # 假设结构是 logs/exp_xxx/generations/gen_xxx.json
+            self.exp_dir = gen_file.parent.parent
+            self.timestamp = self.exp_dir.name.split('_')[1] # 尝试提取，仅用于显示
+            print(f"=== Experiment Resumed from {resume_path} ===")
+        else:
+            # 新实验模式
+            self.timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            self.exp_dir = Path(base_dir) / f"exp_{self.timestamp}_fold{fold}"
+            print(f"=== Experiment Started: {self.timestamp} (Fold {fold}) ===")
         
         self.gens_dir = self.exp_dir / "generations"
         self.gens_dir.mkdir(parents=True, exist_ok=True)
         
+        # 追加模式打开日志
         self.console_log_path = self.exp_dir / f"console.log"
         sys.stdout = TeeLogger(self.console_log_path)
         
-        print(f"=== Experiment Started: {self.timestamp} (Fold {fold}) ===")
         print(f"Config File: {config_path}")
         print(f"Result Directory: {self.exp_dir}")
         
         self.llm_trace_path = self.exp_dir / "llm_trace.jsonl"
+        # 如果是 Resume，尽量复用原配置，但这里允许用新 Config 覆盖参数（为了灵活性）
         self.config = self._load_and_save_config(config_path)
         self.lock = threading.Lock()
         
@@ -718,9 +729,54 @@ class EvolutionOptimizer:
         self.population = new_pop
         return best_ind
 
-    def run(self):
+    # [NEW] 断点续传加载
+    def load_population(self, gen_file_path):
+        with open(gen_file_path, 'r', encoding='utf-8') as f:
+            snapshot = json.load(f)
+            
+        start_gen = snapshot['generation'] + 1
+        pop_data = snapshot['population']
+        
+        print(f"[Resume] Loading population from Generation {snapshot['generation']} (Next: {start_gen})")
+        
+        # 构建 essay_id -> essay_content 的映射，用于恢复 Exemplar
+        id_to_doc = {d['essay_id']: d for d in self.train_data}
+        
+        self.population = []
+        for p in pop_data:
+            rubric = p['full_instruction']
+            fitness = p.get('fitness', 0.0)
+            
+            # 恢复 Exemplars
+            exemplars = []
+            static_ids = p['static_exemplar_ids']
+            for eid in static_ids:
+                if eid in id_to_doc:
+                    exemplars.append(id_to_doc[eid])
+                else:
+                    print(f"  [Warning] Exemplar ID {eid} not found in Train Set! Using random replacement.")
+                    exemplars.append(random.choice(self.train_data))
+            
+            ind = PromptIndividual(rubric, exemplars, fitness, self.config)
+            # 恢复 last_pred_scores (如果在 json 里没存，那第一代 reflection 可能会受影响，但这是可接受的损失)
+            # 目前 gen.json 确实没存 last_pred_scores，所以第一代变异可能效果打折，但之后会恢复正常。
+            self.population.append(ind)
+            
+        # 恢复 History (简单起见，只恢复 best_qwk 记录，或者你可以去读之前的 gen files)
+        # 这里我们暂且留空，或者只记录当前加载的这一代
+        self.history = [{"gen": snapshot['generation'], "best_qwk": snapshot['best_qwk']}]
+        
+        return start_gen
+
+    def run(self, start_gen=1):
         best_global = None
-        for g in range(1, self.config['evolution']['n_generations']+1):
+        
+        # 如果是从中间开始，先评估一下当前的 best_global
+        if self.population:
+             curr_best = max(self.population, key=lambda x: x.fitness)
+             best_global = curr_best.clone()
+
+        for g in range(start_gen, self.config['evolution']['n_generations']+1):
             best = self.evolve_one_generation(g)
             if not best_global or best.fitness > best_global.fitness:
                 best_global = best.clone()
@@ -730,9 +786,9 @@ class EvolutionOptimizer:
 # 5. 主程序 (Main)
 # ============================================================================
 
-def main(config_path="configs/default.yaml", fold=0):
+def main(config_path="configs/default.yaml", fold=0, resume_path=None):
     global EXP_MANAGER
-    EXP_MANAGER = ExperimentManager(config_path=config_path, fold=fold)
+    EXP_MANAGER = ExperimentManager(config_path=config_path, fold=fold, resume_path=resume_path)
     config = EXP_MANAGER.config
     
     # 1. 加载数据
@@ -781,15 +837,22 @@ def main(config_path="configs/default.yaml", fold=0):
     print("[Main] Initializing Optimizer...")
     optimizer = EvolutionOptimizer(train_set, val_set, config)
     
-    if config.get('induction', {}).get('enabled', False):
-        base_rubric = optimizer.induce_instruction()
+    start_gen = 1
+    if resume_path:
+        # Resume 模式：跳过 Induction/Init，直接加载种群
+        start_gen = optimizer.load_population(resume_path)
     else:
-        print("[Main] Induction DISABLED. Using Official Criteria as Base Rubric.")
-        base_rubric = config.get('induction', {}).get('official_criteria', 
-            "Evaluate the essay based on: 1. Content and Ideas, 2. Organization, 3. Vocabulary and Grammar.")
+        # 正常模式：执行 Init
+        if config.get('induction', {}).get('enabled', False):
+            base_rubric = optimizer.induce_instruction()
+        else:
+            print("[Main] Induction DISABLED. Using Official Criteria as Base Rubric.")
+            base_rubric = config.get('induction', {}).get('official_criteria', 
+                "Evaluate the essay based on: 1. Content and Ideas, 2. Organization, 3. Vocabulary and Grammar.")
+        
+        optimizer.initialize_population(base_rubric)
     
-    optimizer.initialize_population(base_rubric)
-    best = optimizer.run()
+    best = optimizer.run(start_gen=start_gen)
     
     # 4. 最终测试
     print(f"\n{'='*20} Final Test Evaluation {'='*20}")
@@ -809,5 +872,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default="configs/default.yaml")
     parser.add_argument("--fold", type=int, default=0)
+    parser.add_argument("--resume", type=str, default=None, help="Path to generation json file (e.g., logs/exp.../generations/gen_010.json) to resume from.")
     args = parser.parse_args()
-    main(args.config, args.fold)
+    main(args.config, args.fold, args.resume)
