@@ -22,7 +22,7 @@ data:
 
 # RAG (检索增强生成) 配置 [NEW]
 rag:
-  enabled: true                        # [总开关] RAG 是否开启
+  enabled: false                        # [总开关] RAG 是否开启
   model_name: "all-MiniLM-L6-v2"
   
   # 数量控制
@@ -287,11 +287,11 @@ induction:
 # 进化算法配置
 evolution:
   population_size: 8                   # 种群大小
-  n_generations: 50                    # 进化代数
-  n_static_exemplars: 9                # [修改] 静态 ICL 范文数量 (Global Anchors)
+  n_generations: 25                    # 进化代数
+  n_static_exemplars: 0                # [修改] 静态 ICL 范文数量 (Global Anchors)
   n_elite_evolve: 2
   n_error_cases: 5
-  max_workers: 50                      # 并发线程数 (建议 5-20，取决于 API Rate Limit)
+  max_workers: 100                      # 并发线程数 (建议 5-20，取决于 API Rate Limit)
 
 # LLM 配置
 llm:
