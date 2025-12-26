@@ -30,6 +30,7 @@ from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.model_selection import KFold
 from sklearn.metrics import cohen_kappa_score
+from transformers import AutoTokenizer # [NEW] For precise token counting
 
 load_dotenv(override=True)
 
@@ -82,6 +83,34 @@ class ExperimentManager:
         self.config = self._load_and_save_config(config_path)
         self.lock = threading.Lock()
         
+        # [NEW] Performance Metrics Tracking
+        self.exp_start_time = time.time()
+        self.total_prompt_tokens = 0
+        self.total_completion_tokens = 0
+        self.total_tokens = 0
+        self.gen_metrics = {}
+        
+        # [NEW] Initialize Tokenizer
+        model_name_conf = self.config.get('model', {}).get('name', 'gpt2')
+        print(f"[Tokenizer] Initializing tokenizer for: {model_name_conf}...")
+        try:
+            # 尝试处理 OpenRouter 格式 (vendor/model)
+            if "/" in model_name_conf:
+                # 尝试直接加载 (有些是 huggingface ID)
+                try:
+                    self.tokenizer = AutoTokenizer.from_pretrained(model_name_conf, trust_remote_code=True)
+                except:
+                    # 尝试去掉 vendor 前缀
+                    clean_name = model_name_conf.split("/", 1)[1]
+                    print(f"[Tokenizer] Retry with: {clean_name}")
+                    self.tokenizer = AutoTokenizer.from_pretrained(clean_name, trust_remote_code=True)
+            else:
+                self.tokenizer = AutoTokenizer.from_pretrained(model_name_conf, trust_remote_code=True)
+        except Exception as e:
+            print(f"[Tokenizer] Warning: Failed to load specific tokenizer ({e}). Fallback to 'gpt2'.")
+            self.tokenizer = AutoTokenizer.from_pretrained("gpt2")
+        print(f"[Tokenizer] Loaded: {self.tokenizer.name_or_path}")
+
     def _load_and_save_config(self, config_path):
         if not os.path.exists(config_path):
             raise FileNotFoundError(f"Config file not found: {config_path}")
@@ -96,11 +125,28 @@ class ExperimentManager:
             with open(self.llm_trace_path, 'a', encoding='utf-8') as f:
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")
     
-    def save_generation_snapshot(self, generation: int, population_data: List[Dict]):
+    def track_usage(self, prompt_tokens, completion_tokens):
+        with self.lock:
+            self.total_prompt_tokens += prompt_tokens
+            self.total_completion_tokens += completion_tokens
+            self.total_tokens += (prompt_tokens + completion_tokens)
+
+    def count_tokens(self, text: str) -> int:
+        # Tokenizer encode might not be thread-safe depending on backend? 
+        # Usually it is, but to be safe we can lock if needed, though it slows down.
+        # Transformers fast tokenizers are generally safe.
+        try:
+            return len(self.tokenizer.encode(text, add_special_tokens=False))
+        except:
+            return len(text) // 4 # Fallback
+
+    def save_generation_snapshot(self, generation: int, population_data: List[Dict], metrics: Dict = None):
         filename = self.gens_dir / f"gen_{generation:03d}.json"
+        
         snapshot = {
             "generation": generation,
             "timestamp": datetime.now().isoformat(),
+            "metrics": metrics or {},
             "best_qwk": max(p['fitness'] for p in population_data),
             "population": population_data
         }
@@ -280,6 +326,13 @@ def call_llm(prompt: str, temperature: float = 0.0, call_type: str = "unknown") 
             error_msg = str(e)
             time.sleep(1)
     
+    
+    # [NEW] Track Metrics
+    if EXP_MANAGER:
+        p_tokens = EXP_MANAGER.count_tokens(prompt)
+        r_tokens = EXP_MANAGER.count_tokens(response_content)
+        EXP_MANAGER.track_usage(p_tokens, r_tokens)
+
     if EXP_MANAGER:
         EXP_MANAGER.log_llm_trace({
             "timestamp": datetime.now().isoformat(),
@@ -658,7 +711,16 @@ class EvolutionOptimizer:
             self.population.append(PromptIndividual(base_instruction, static_ex, config=self.config))
 
     def evolve_one_generation(self, gen):
+        gen_start_time = time.time()
+        # Snapshot current totals
+        start_stats = {
+            "total": EXP_MANAGER.total_tokens if EXP_MANAGER else 0,
+            "prompt": EXP_MANAGER.total_prompt_tokens if EXP_MANAGER else 0,
+            "completion": EXP_MANAGER.total_completion_tokens if EXP_MANAGER else 0
+        }
+        
         print(f"\n{'='*20} Generation {gen} {'='*20}")
+        print(f"  [Start Time] {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         
         # [NEW] 读取训练时的 Rerank 开关
         use_rerank_train = self.config['rag'].get('use_rerank_train', False)
@@ -685,7 +747,33 @@ class EvolutionOptimizer:
         print(f"  >> Gen {gen} Best QWK: {best_ind.fitness:.4f}")
         
         self.history.append({"gen": gen, "best_qwk": best_ind.fitness})
-        if EXP_MANAGER: EXP_MANAGER.save_generation_snapshot(gen, pop_snapshot)
+        
+        # [NEW] Calculate Metrics
+        gen_end_time = time.time()
+        duration_sec = gen_end_time - gen_start_time
+        
+        curr_total = EXP_MANAGER.total_tokens if EXP_MANAGER else 0
+        curr_prompt = EXP_MANAGER.total_prompt_tokens if EXP_MANAGER else 0
+        curr_compl = EXP_MANAGER.total_completion_tokens if EXP_MANAGER else 0
+        
+        diff_total = curr_total - start_stats['total']
+        diff_prompt = curr_prompt - start_stats['prompt']
+        diff_compl = curr_compl - start_stats['completion']
+        
+        metrics = {
+            "duration_sec": round(duration_sec, 2),
+            "tokens_total": diff_total,
+            "tokens_prompt": diff_prompt,
+            "tokens_completion": diff_compl,
+            "start_time": datetime.fromtimestamp(gen_start_time).isoformat(),
+            "end_time": datetime.fromtimestamp(gen_end_time).isoformat()
+        }
+        
+        print(f"  [Gen {gen} Stats] Duration: {duration_sec:.1f}s")
+        print(f"    Tokens: Total {diff_total} (Prompt {diff_prompt} + Compl {diff_compl})")
+        
+        if EXP_MANAGER: 
+            EXP_MANAGER.save_generation_snapshot(gen, pop_snapshot, metrics=metrics)
         
         # 2. Evolve Rubrics
         n_elite = self.config['evolution']['n_elite_evolve']
@@ -866,7 +954,21 @@ def main(config_path="configs/default.yaml", fold=0, resume_path=None):
     print(f"Validation Best QWK: {best.fitness:.4f}")
     print(f"Test Set QWK:        {test_qwk:.4f}")
     
-    EXP_MANAGER.save_final_results(best, optimizer.history, test_results={"test_qwk": test_qwk})
+    # [NEW] Final Global Stats
+    total_duration = time.time() - EXP_MANAGER.exp_start_time
+    print(f"\n{'='*20} Experiment Summary {'='*20}")
+    print(f"Total Duration:      {total_duration / 60:.1f} minutes")
+    print(f"Total Tokens:        {EXP_MANAGER.total_tokens}")
+    print(f"  - Prompt:          {EXP_MANAGER.total_prompt_tokens}")
+    print(f"  - Completion:      {EXP_MANAGER.total_completion_tokens}")
+    
+    EXP_MANAGER.save_final_results(best, optimizer.history, test_results={
+        "test_qwk": test_qwk,
+        "total_duration_sec": total_duration,
+        "total_tokens": EXP_MANAGER.total_tokens,
+        "total_prompt_tokens": EXP_MANAGER.total_prompt_tokens,
+        "total_completion_tokens": EXP_MANAGER.total_completion_tokens
+    })
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
