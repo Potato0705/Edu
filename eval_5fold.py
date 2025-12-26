@@ -124,9 +124,13 @@ def evaluate_fold_standard_cv(exp_dir, generation, fold_idx, output_csv_writer=N
 
 def main():
     parser = argparse.ArgumentParser(description="Calc Standard 5-Fold CV: Select Val-Best, Eval on Test.")
+    import datetime
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    default_output = f"logs/5fold_eval_results_{timestamp}.md"
+    
     parser.add_argument("--gen", type=int, required=True, help="Generation to evaluate (e.g., 25)")
     parser.add_argument("--dirs", nargs='+', required=True, help="List of 5 experiment directories (e.g. logs/exp_fold0 logs/exp_fold1 ...)")
-    parser.add_argument("--output", type=str, default="5fold_standard_results.csv", help="Output CSV file path")
+    parser.add_argument("--output", type=str, default=default_output, help="Output file path (Markdown)")
     
     args = parser.parse_args()
     
@@ -152,6 +156,7 @@ def main():
             fold_qwks.append(qwk)
             
     # Final Stats
+    avg_qwk = 0.0
     if fold_qwks:
         avg_qwk = np.mean(fold_qwks)
         print("\n" + "="*40)
@@ -163,9 +168,31 @@ def main():
         print(f"Standard CV Test QWK: {avg_qwk:.4f}")
         print("="*40)
         
-    # Save CSV
-    pd.DataFrame(all_records).to_csv(args.output, index=False)
-    print(f"Detailed logs saved to {args.output}")
+    # Save Results to Markdown
+    output_path = Path(args.output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    with open(output_path, 'w', encoding='utf-8') as f:
+        f.write(f"# 5-Fold Evaluation Results\n\n")
+        f.write(f"- **Date**: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"- **Generation**: {args.gen}\n")
+        f.write(f"- **Average Test QWK**: **{avg_qwk:.4f}**\n\n")
+        
+        f.write("## Summary\n\n")
+        f.write("| Fold | Experiment Dir | Val QWK (Best Ind) | Test QWK |\n")
+        f.write("|---|---|---|---|\n")
+        for rec in all_records:
+            f.write(f"| {rec['fold']} | `{rec['exp_dir']}` | {rec['val_fitness']:.4f} | **{rec['test_qwk']:.4f}** |\n")
+            
+        f.write("\n## Details\n\n")
+        for rec in all_records:
+            f.write(f"### Fold {rec['fold']}\n")
+            f.write(f"- **Champion ID**: {rec['champion_id']}\n")
+            f.write(f"- **Val Fitness**: {rec['val_fitness']:.4f}\n")
+            f.write(f"- **Test QWK**: {rec['test_qwk']:.4f}\n")
+            f.write(f"- **Path**: `{rec['exp_dir']}`\n\n")
+
+    print(f"Detailed results saved to {args.output}")
 
 if __name__ == "__main__":
     main()
