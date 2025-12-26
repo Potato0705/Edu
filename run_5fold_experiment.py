@@ -4,7 +4,11 @@ import argparse
 import re
 import os
 import yaml
+import json
+import datetime
 from pathlib import Path
+
+STATUS_FILE = "5fold_status.json"
 
 def run_command(cmd, cwd=None):
     """Runs a shell command and returns stdout, stderr."""
@@ -16,45 +20,85 @@ def run_command(cmd, cwd=None):
         return None
     return result.stdout
 
-def run_fold(config_path, fold):
-    """Runs wise_aes.py for a specific fold and returns the exp directory."""
+def save_status(status_data):
+    with open(STATUS_FILE, 'w', encoding='utf-8') as f:
+        json.dump(status_data, f, indent=2)
+
+def load_status():
+    if os.path.exists(STATUS_FILE):
+        with open(STATUS_FILE, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    return None
+
+def find_latest_checkpoint(exp_dir):
+    """Scan exp_dir/generations to find the latest gen_xxx.json to resume from."""
+    if not exp_dir: return None
+    gen_dir = Path(exp_dir) / "generations"
+    if not gen_dir.exists(): return None
+    
+    files = sorted(gen_dir.glob("gen_*.json"))
+    if files:
+        # Return path to the last one
+        return str(files[-1])
+    return None
+
+def run_fold(config_path, fold, resume_exp_dir=None):
+    """Runs wise_aes.py for a specific fold. Can resume if resume_exp_dir is provided."""
     print(f"\n{'='*20} Running Fold {fold} {'='*20}")
     
     cmd = ["uv", "run", "wise_aes.py", "--config", config_path, "--fold", str(fold)]
     
-    # We need to capture stdout to find the exp directory logging
-    # But we also want to stream output to console so user sees progress.
-    # To do both, we can use Popen.
+    # Check if we can resume this specific fold
+    if resume_exp_dir:
+        latest_ckpt = find_latest_checkpoint(resume_exp_dir)
+        if latest_ckpt:
+            print(f"[Resume] Resuming Fold {fold} from checkpoint: {latest_ckpt}")
+            cmd.extend(["--resume", latest_ckpt])
+        else:
+            print(f"[Resume] Fold {fold} marked as started but no checkpoint found. Restarting.")
     
     process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     
-    exp_dir = None
-    output_lines = []
+    final_exp_dir = resume_exp_dir # Default to what we had if resuming
     
     while True:
         line = process.stdout.readline()
         if not line and process.poll() is not None:
             break
         if line:
-            print(line.rstrip()) # print to console
-            output_lines.append(line)
-            # Try to grab exp dir: "Result Directory: logs/exp_..."
+            print(line.rstrip()) 
+            # Try to grab exp dir if it's a new run
             if "Result Directory:" in line:
                 match = re.search(r"Result Directory: (.+)", line)
                 if match:
-                    exp_dir = match.group(1).strip()
+                    final_exp_dir = match.group(1).strip()
     
-    return exp_dir
+    if process.returncode != 0:
+        print(f"[Error] Fold {fold} failed.")
+        return None
+        
+    return final_exp_dir
 
 def main():
-    parser = argparse.ArgumentParser(description="Run full 5-fold experiment and evaluation.")
+    parser = argparse.ArgumentParser(description="Run full 5-fold experiment with Resume capability.")
     parser.add_argument("--config", type=str, required=True, help="Path to config yaml")
+    parser.add_argument("--resume", action="store_true", help="Resume from 5fold_status.json if exists")
     args = parser.parse_args()
     
     if not os.path.exists(args.config):
         print(f"Config file not found: {args.config}")
         sys.exit(1)
-        
+
+    # Load Status or Init New
+    status = {"folds": {}} # { "0": {"status": "done", "exp_dir": "..."} }
+    if args.resume:
+        loaded = load_status()
+        if loaded:
+            print(f"[Init] Loaded status from {STATUS_FILE}")
+            status = loaded
+        else:
+            print(f"[Init] No status file found, starting fresh.")
+            
     # 1. Read Config to get n_generations
     with open(args.config, 'r', encoding='utf-8') as f:
         config_data = yaml.safe_load(f)
@@ -62,19 +106,48 @@ def main():
     
     print(f"Target Generations: {n_gens}")
     
-    exp_dirs = []
-    
     # 2. Run 5 Folds
+    exp_dirs_map = {}
+    
     for fold in range(5):
-        exp_dir = run_fold(args.config, fold)
-        if not exp_dir:
-            print(f"[Fatal] Fold {fold} failed to return an experiment directory.")
-            sys.exit(1)
-        exp_dirs.append(exp_dir)
+        s_fold = str(fold)
+        fold_info = status["folds"].get(s_fold, {"status": "pending"})
         
+        current_status = fold_info.get("status")
+        exp_dir = fold_info.get("exp_dir")
+        
+        if current_status == "done":
+            print(f"[Skip] Fold {fold} already done. Exp: {exp_dir}")
+            exp_dirs_map[fold] = exp_dir
+            continue
+            
+        # Run or Resume Fold
+        if current_status == "running" and exp_dir:
+            # Try to resume interrupted fold
+            new_exp_dir = run_fold(args.config, fold, resume_exp_dir=exp_dir)
+        else:
+            # Start fresh
+            new_exp_dir = run_fold(args.config, fold)
+            
+        if not new_exp_dir:
+            print(f"[Fatal] Fold {fold} failed.")
+            sys.exit(1)
+            
+        # Update Status
+        status["folds"][s_fold] = {
+            "status": "done",
+            "exp_dir": new_exp_dir,
+            "timestamp": datetime.datetime.now().isoformat()
+        }
+        save_status(status)
+        exp_dirs_map[fold] = new_exp_dir
+        
+    # Collect ordered dirs
+    final_exp_dirs = [exp_dirs_map[i] for i in range(5)]
+    
     print("\n" + "="*40)
     print("5 Folds Completed. Directories:")
-    for d in exp_dirs:
+    for d in final_exp_dirs:
         print(f" - {d}")
     print("="*40)
     
@@ -84,7 +157,7 @@ def main():
         "uv", "run", "eval_5fold.py",
         "--gen", str(n_gens),
         "--dirs"
-    ] + exp_dirs
+    ] + final_exp_dirs
     
     run_command(eval_cmd)
     
