@@ -1,0 +1,112 @@
+# WISE-AES 实验配置文件
+
+# LLM 模型配置
+model:
+  # name: "meta-llama/llama-3.3-70b-instruct"
+  # name: "meta-llama/llama-3.1-8b-instruct"
+  # provider: "cerebras/fp16"
+
+  # name: "deepseek/deepseek-v3.2"
+  # provider: "novita/fp8"
+  # provider: "baseten/fp4"
+  # provider: "atlas-cloud/fp8"
+
+  name: "meta-llama/llama-3.1-8b-instruct"
+
+# 数据配置
+data:
+  asap_path: "data/raw/training_set_rel3.tsv"
+  essay_set: 7
+  score_min: 0
+  score_max: 30
+
+# RAG (检索增强生成) 配置 [NEW]
+rag:
+  enabled: false                        # [总开关] RAG 是否开启
+  model_name: "all-MiniLM-L6-v2"
+  
+  # 数量控制
+  n_retrieved: 10                      # 向量检索取回数量 (候选池)
+  n_selected: 3                        # 最终使用的数量
+  
+  # [NEW] Rerank 阶段控制
+  # 训练/进化阶段：建议 false (为了速度和进化信号的稳定性)
+  use_rerank_train: false              
+  # 推理/测试阶段：建议 true (为了最高精度，作为 TTA)
+  use_rerank_test: true                
+  
+  rubric_driven_retrieval: true
+
+
+# 指令诱导配置
+induction:
+  enabled: true
+  n_high_samples: 5
+  n_low_samples: 5
+  official_criteria: |
+    Essay Set #7
+    Type of essay:	Persuasive/ Narrative/Expository
+    Grade level:	7
+    Training set size:	1,730 essays
+    Final evaluation set size:	576 essays
+    Average length of essays:	250 words
+    Scoring:	Rater_1, Rater_2, Resolved_Score
+    Rubric range:	0-15
+    Resolved score range:	0-30
+    Prompt
+    Write about patience. Being patient means that you are understanding and tolerant. A patient person experience difficulties without complaining.
+    Do only one of the following: write a story about a time when you were patient OR write a story about a time when someone you know was patient OR write a story in your own way about patience.
+    Rubric Guidelines
+    A rating of 0-3 on the following four traits:
+    Ideas (points doubled)
+    Score 3: Tells a story with ideas that are clearly focused on the topic and are thoroughly developed with specific, relevant details.
+    Score 2: Tells a story with ideas that are somewhat focused on the topic and are developed with a mix of specific and/or general details.
+    Score 1: Tells a story with ideas that are minimally focused on the topic and developed with limited and/or general details.
+    Score 0: Ideas are not focused on the task and/or are undeveloped.
+    Organization
+    Score 3: Organization and connections between ideas and/or events are clear and logically sequenced. 
+    Score 2: Organization and connections between ideas and/or events are logically sequenced.
+    Score 1: Organization and connections between ideas and/or events are weak.
+    Score 0: No organization evident.
+    Style
+    Score 3: Command of language, including effective and compelling word choice and varied sentence structure, clearly supports the writer's purpose and audience.
+    Score 2: Adequate command of language, including effective word choice and clear sentences, supports the writer's purpose and audience.
+    Score 1: Limited use of language, including lack of variety in word choice and sentences, may hinder support for the writer's purpose and audience.
+    Score 0: Ineffective use of language for the writer's purpose and audience.
+    Conventions
+    Score 3: Consistent, appropriate use of conventions of Standard English for grammar, usage, spelling, capitalization, and punctuation for the grade level.
+    Score 2: Adequate use of conventions of Standard English for grammar, usage, spelling, capitalization, and punctuation for the grade level.
+    Score 1: Limited use of conventions of Standard English for grammar, usage, spelling, capitalization, and punctuation for the grade level.
+    Score 0: Ineffective use of conventions of Standard English for grammar, usage, spelling, capitalization, and punctuation.
+    Adjudication Rules
+    •	Scores summed independently for Rater_1 and Rater_2.
+    •	Resolved Score = Rater_1 + Rater_2.
+
+
+# 进化算法配置
+evolution:
+  population_size: 8                   # 种群大小
+  n_generations: 25                    # 进化代数
+  n_static_exemplars: 0                # [修改] 静态 ICL 范文数量 (Global Anchors)
+  n_elite_evolve: 2
+  n_error_cases: 5
+  max_workers: 100                      # 并发线程数 (建议 5-20，取决于 API Rate Limit)
+
+# LLM 配置
+llm:
+  temperature_scoring: 0.0             # 打分必须 0 温 (Deterministic)
+  temperature_rerank: 0.0              # Rerank 必须 0 温 (Deterministic)
+  temperature_query: 0.7               # Query 生成可以有一定创造性 (Creative)
+  temperature_induce: 0.8              # 诱导/反思/重写建议高一点 (Evolutionary Exploration)
+  max_retries: 2
+
+# 输出配置
+output:
+  verbose: true
+
+# [NEW] 调试/非正式实验模式配置
+debug:
+  enabled: false                        # 是否开启调试模式
+  n_train: 400                          # 调试模式下：训练集大小 (RAG 知识库)
+  n_val: 32                             # 调试模式下：验证集大小 (进化评估用，最耗钱的部分)
+  n_test: 100                            # 调试模式下：测试集大小 (最终评估用)
