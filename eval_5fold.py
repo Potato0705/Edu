@@ -36,6 +36,8 @@ def evaluate_fold_standard_cv(exp_dir, generation, fold_idx, output_csv_writer=N
     class MockExpManager:
         def __init__(self, cfg): self.config = cfg
         def log_llm_trace(self, x): pass
+        def track_usage(self, p, c): pass
+        def count_tokens(self, text): return len(text) // 4
     wise_aes.EXP_MANAGER = MockExpManager(config)
     
     # 2. Reconstruct Test Set for this Fold
