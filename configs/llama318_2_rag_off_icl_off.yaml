@@ -12,6 +12,7 @@ model:
   # provider: "atlas-cloud/fp8"
 
   name: "meta-llama/llama-3.1-8b-instruct"
+  # provider: "cerebras/fp16"
 
 # 数据配置
 data:
