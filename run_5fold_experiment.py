@@ -83,6 +83,7 @@ def main():
     parser = argparse.ArgumentParser(description="Run full 5-fold experiment with Resume capability.")
     parser.add_argument("--config", type=str, required=True, help="Path to config yaml")
     parser.add_argument("--resume", action="store_true", help="Resume from 5fold_status.json if exists")
+    parser.add_argument("--fold_dirs", nargs="*", help="List of existing fold directories to use/resume (ordered Fold 0, 1...). Bypasses status file.")
     args = parser.parse_args()
     
     if not os.path.exists(args.config):
@@ -91,7 +92,29 @@ def main():
 
     # Load Status or Init New
     status = {"folds": {}} # { "0": {"status": "done", "exp_dir": "..."} }
-    if args.resume:
+    
+    # Mode 1: Manual Fold Dirs (Highest Priority)
+    if args.fold_dirs:
+        print(f"[Init] Using provided fold directories ({len(args.fold_dirs)} provided). Ignoring {STATUS_FILE}.")
+        for i, d in enumerate(args.fold_dirs):
+            if i >= 5: 
+                print(f"[Warn] More than 5 directories provided. Ignoring extras: {d}")
+                break
+            
+            d_path = Path(d)
+            if not d_path.exists():
+                print(f"[Warn] Provided directory does not exist: {d}. Treating as new run (pending).")
+                continue
+                
+            # Check if done
+            is_done = (d_path / "final_result.json").exists()
+            status["folds"][str(i)] = {
+                "status": "done" if is_done else "running",
+                "exp_dir": str(d_path)
+            }
+            
+    # Mode 2: Resume from Status File
+    elif args.resume:
         loaded = load_status()
         if loaded:
             print(f"[Init] Loaded status from {STATUS_FILE}")
@@ -139,7 +162,11 @@ def main():
             "exp_dir": new_exp_dir,
             "timestamp": datetime.datetime.now().isoformat()
         }
-        save_status(status)
+        
+        # Only save status file if NOT using manual fold_dirs (to avoid conflicts)
+        if not args.fold_dirs:
+            save_status(status)
+            
         exp_dirs_map[fold] = new_exp_dir
         
     # Collect ordered dirs
