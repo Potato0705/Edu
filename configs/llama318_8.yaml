@@ -12,6 +12,7 @@ model:
   # provider: "atlas-cloud/fp8"
 
   name: "meta-llama/llama-3.1-8b-instruct"
+  # provider: "cerebras/fp16"
 
 # 数据配置
 data:
@@ -287,11 +288,11 @@ induction:
 # 进化算法配置
 evolution:
   population_size: 8                   # 种群大小
-  n_generations: 50                    # 进化代数
-  n_static_exemplars: 9                # [修改] 静态 ICL 范文数量 (Global Anchors)
+  n_generations: 25                    # 进化代数
+  n_static_exemplars: 6                # [修改] 静态 ICL 范文数量 (Global Anchors)
   n_elite_evolve: 2
   n_error_cases: 5
-  max_workers: 50                      # 并发线程数 (建议 5-20，取决于 API Rate Limit)
+  max_workers: 30                      # 并发线程数 (建议 5-20，取决于 API Rate Limit)
 
 # LLM 配置
 llm:
