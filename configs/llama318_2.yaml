@@ -225,7 +225,7 @@ evolution:
   n_static_exemplars: 6                # [修改] 静态 ICL 范文数量 (Global Anchors)
   n_elite_evolve: 2
   n_error_cases: 5
-  max_workers: 30                      # 并发线程数 (建议 5-20，取决于 API Rate Limit)
+  max_workers: 100                      # 并发线程数 (建议 5-20，取决于 API Rate Limit)
 
 # LLM 配置
 llm:
