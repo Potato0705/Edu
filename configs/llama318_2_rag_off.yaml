@@ -23,7 +23,7 @@ data:
 
 # RAG (检索增强生成) 配置 [NEW]
 rag:
-  enabled: true                        # [总开关] RAG 是否开启
+  enabled: false                        # [总开关] RAG 是否开启
   model_name: "all-MiniLM-L6-v2"
   
   # 数量控制
