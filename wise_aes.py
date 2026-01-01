@@ -786,31 +786,44 @@ class EvolutionOptimizer:
         
         print("  Evolving Rubrics for Elites (Using Real Reflection)...")
         mutated_parents = []
+        
+        # [NEW] Check config for instruction evolution
+        evolve_instr = self.config['evolution'].get('evolve_instruction', True)
+        if not evolve_instr:
+             print("  [Config] Instruction evolution DISABLED. Skipping reflection/rewrite.")
+
         for elite in elites:
             # 这里是修改原始 elite 对象的引用
-            real_feedback = elite.generate_real_feedback(self.val_data)
-            print(f"    [Feedback] {real_feedback[:100]}...")
-            new_text = elite.evolve_instruction(real_feedback)
-            elite.instruction_text = new_text 
+            if evolve_instr:
+                real_feedback = elite.generate_real_feedback(self.val_data)
+                print(f"    [Feedback] {real_feedback[:100]}...")
+                new_text = elite.evolve_instruction(real_feedback)
+                elite.instruction_text = new_text 
             mutated_parents.append(elite)
             
         # 补齐种群：从 mutated_parents 中克隆并变异 exemplars
         existing_fingerprints = {frozenset(ex['essay_id'] for ex in ind.static_exemplars) for ind in new_pop}
         
+        # [NEW] Check config for exemplar evolution
+        evolve_exemplars = self.config['evolution'].get('evolve_static_exemplars', True)
+        if not evolve_exemplars:
+             print("  [Config] Static Exemplar evolution DISABLED. Skipping mutation.")
+
         # 剩下的位置用变异填充
         while len(new_pop) < len(self.population):
             parent = random.choice(mutated_parents) # 选新 Rubric 的个体做父母
             child = parent.clone()
             
-            for _ in range(10): 
-                idx = random.randint(0, len(child.static_exemplars)-1)
-                new_ex = random.choice(self.train_data)
-                child.static_exemplars[idx] = new_ex
-                
-                fp = frozenset(ex['essay_id'] for ex in child.static_exemplars)
-                if fp not in existing_fingerprints:
-                    existing_fingerprints.add(fp)
-                    break 
+            if evolve_exemplars:
+                for _ in range(10): 
+                    idx = random.randint(0, len(child.static_exemplars)-1)
+                    new_ex = random.choice(self.train_data)
+                    child.static_exemplars[idx] = new_ex
+                    
+                    fp = frozenset(ex['essay_id'] for ex in child.static_exemplars)
+                    if fp not in existing_fingerprints:
+                        existing_fingerprints.add(fp)
+                        break 
             
             new_pop.append(child)
             

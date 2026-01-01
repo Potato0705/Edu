@@ -292,6 +292,8 @@ evolution:
   n_elite_evolve: 2
   n_error_cases: 5
   max_workers: 50                      # 并发线程数 (建议 5-20，取决于 API Rate Limit)
+  evolve_static_exemplars: true
+  evolve_instruction: true
 
 # LLM 配置
 llm:
