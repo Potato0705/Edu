@@ -36,6 +36,7 @@ rag:
   use_rerank_test: true                
   
   rubric_driven_retrieval: true
+  use_raw_query: false                 # [NEW] 是否跳过关键词生成，直接用原文检索
 
 
 # 指令诱导配置

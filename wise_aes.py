@@ -431,6 +431,11 @@ Output ONLY the Rubric text. Do not output explanations."""
         return hashlib.md5(content.encode('utf-8')).hexdigest()
 
     def generate_query(self, essay_text: str) -> str:
+        # [NEW] 原文检索模式 (Raw Query Mode)
+        if self.config['rag'].get('use_raw_query', False):
+            # 直接返回前 512 个字符 (通常足够 SentenceTransformer 填满上下文)
+            return essay_text[:512]
+
         rubric_driven = self.config['rag'].get('rubric_driven_retrieval', False)
         template = self.QUERY_GEN_RUBRIC_TEMPLATE if rubric_driven else self.QUERY_GEN_GENERIC_TEMPLATE
         prompt = template.format(rubric=self.instruction_text, essay=essay_text[:800])
