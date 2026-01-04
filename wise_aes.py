@@ -699,8 +699,8 @@ class EvolutionOptimizer:
         high_pool = [x for x in self.train_data if x['domain1_score'] >= threshold_high]
         
         selection = []
-        if low_pool: selection.append(random.choice(low_pool))
-        if high_pool: selection.append(random.choice(high_pool))
+        if n > 0 and low_pool: selection.append(random.choice(low_pool))
+        if len(selection) < n and high_pool: selection.append(random.choice(high_pool))
         if mid_pool and len(selection) < n: selection.append(random.choice(mid_pool))
         
         while len(selection) < n:
