@@ -18,6 +18,7 @@ data/*
 result
 cache
 logs
+result_final
 
 # .DS_Store
 .DS_Store
