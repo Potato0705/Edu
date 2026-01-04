@@ -470,6 +470,33 @@ Output ONLY the Rubric text. Do not output explanations."""
         except: 
             return candidates[:k_select]
 
+    # [NEW] Robust JSON Extraction Helper
+    def _extract_json_safe(self, text: str) -> Optional[Dict]:
+        try:
+            # 1. Try passing the whole text first
+            return json.loads(text)
+        except:
+            pass
+            
+        # 2. Backward search for the last valid JSON block
+        # Anchor to the last '}' and scan backwards for '{'
+        last_brace = text.rfind('}')
+        if last_brace == -1: return None
+        
+        # Iterate backwards to find the matching opening brace
+        # We limit the search to avoid infinite loops in worst cases, though length check is naturally finite
+        for i in range(last_brace, -1, -1):
+            if text[i] == '{':
+                candidate = text[i : last_brace+1]
+                try:
+                    obj = json.loads(candidate)
+                    # Weak check: it should look like our expected output
+                    if isinstance(obj, dict) and "final_score" in obj:
+                        return obj
+                except:
+                    continue
+        return None
+
     # [MODIFIED] 包含重试机制、配置读取和双向日志
     def predict_score(self, essay_text: str, vector_store: SimpleVectorStore, enable_rerank: bool = False) -> int:
         dynamic_exemplars = []
@@ -504,10 +531,10 @@ Output ONLY the Rubric text. Do not output explanations."""
             response = call_llm(current_prompt, temperature=temp, call_type=call_type)
             
             try:
-                # 1. 优先尝试 JSON 解析
-                json_match = re.search(r'\{.*\}', response, re.DOTALL)
-                if json_match:
-                    result = json.loads(json_match.group())
+                # [MODIFIED] Use robust extraction instead of regex
+                result = self._extract_json_safe(response)
+                
+                if result:
                     score = int(result.get('final_score', -1))
                     
                     if self.config['data']['score_min'] <= score <= self.config['data']['score_max']:
@@ -515,7 +542,7 @@ Output ONLY the Rubric text. Do not output explanations."""
                     else:
                         raise ValueError(f"Score {score} out of range")
                 else:
-                    raise ValueError("No JSON found")
+                    raise ValueError("No valid JSON found")
             
             except Exception as e:
                 # 如果这是最后一次尝试，跳出循环进入 Fallback
