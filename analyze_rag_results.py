@@ -33,4 +33,4 @@ def analyze_results(csv_path):
     print(f"\nFinal Macro Average QWK (across {len(prompt_stats)} prompts): {overall_average:.4f}")
 
 if __name__ == "__main__":
-    analyze_results("rag_substitution_results_filtered.csv")
+    analyze_results("rag_substitution_results.csv")
