@@ -1,0 +1,39 @@
+selector:
+  enable: false
+  mode: rule_gated_inner_val
+  recipe_library: v1
+  use_prompt_metadata: true
+  use_localwise_diagnostics: true
+  use_remb_overlap: true
+  thresholds:
+    score_span_fine: 5.0
+    score_span_large: 20.0
+    # Wide-range recipes are allowed only when score_span >= score_span_large.
+    # Severe local errors alone should not route non-wide prompts to blend recipes.
+    off_by1_high: 0.25
+    off_by2plus_high: 0.12
+    mean_band_distance_high: 0.40
+    adjacent_overlap_high: 1.0
+    min_adjacent_pair_count: 4
+    raw_mode_share_high: 0.60
+    raw_std_frac_low: 0.18
+  tie_break:
+    use_mae: true
+    use_acc: true
+    prefer_simpler_recipe: true
+    qwk_tolerance: 0.005
+  mmd:
+    enable_default: false
+    feature_space: remb
+    scope: prompt_wise
+    band_mode: adjacent_only
+    sample_mode: boundary_only
+    kernel: rbf
+    sigma_mode: median_heuristic
+    sigma: 1.0
+    margin: 1.0
+    lambda_sep: 0.05
+    min_samples_per_band: 4
+    boundary_mode: raw_boundary
+    uncertainty_threshold: 0.15
+    raw_boundary_epsilon: 1.0

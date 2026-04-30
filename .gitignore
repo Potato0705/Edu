@@ -1,27 +1,51 @@
-# Python-generated files
+# Python bytecode and build outputs
 __pycache__/
-*.py[oc]
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 build/
 dist/
 wheels/
-*.egg-info
+*.egg-info/
 
-# Virtual environments
-.venv
+# Virtual environments and local tooling
+.venv/
+venv/
+env/
+.python-version
+.vscode/
+.idea/
 
-# dotenv
+# Secrets and local environment
 .env
+.env.*
+!.env.example
 
-# experiment data
+# Large datasets, models, caches, and experiment outputs
 data/*
 !data/README.md
-result
-cache
-logs
-result_final
+models/
+cache/
+logs/
+results/
+result/
+result_final/
+full_logs/
+full_logs_classified/
 
-# .DS_Store
+# Generated reports and temporary artifacts
+reports/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.log
+tmp_*.ps1
+
+# OS files
 .DS_Store
-
-full_logs
-full_logs_classified
+Thumbs.db

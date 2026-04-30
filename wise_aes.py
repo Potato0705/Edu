@@ -303,10 +303,14 @@ def call_llm(prompt: str, temperature: float = 0.0, call_type: str = "unknown") 
     start_time = time.time()
     response_content = ""
     error_msg = ""
+    last_status = None
+    last_body_preview = ""
     
     for attempt in range(3):
         try:
             resp = requests.post(url, headers=headers, json=payload, timeout=60)
+            last_status = resp.status_code
+            last_body_preview = resp.text[:500]
             if resp.status_code == 429:
                 time.sleep(2 ** attempt)
                 continue
@@ -314,7 +318,12 @@ def call_llm(prompt: str, temperature: float = 0.0, call_type: str = "unknown") 
             data = resp.json()
             if "choices" in data and len(data["choices"]) > 0:
                 content = data["choices"][0]["message"].get("content", "")
-                if content and content.strip(): # Ensure content is not empty or just whitespace
+                if isinstance(content, list):
+                    content = "".join(
+                        part.get("text", "") if isinstance(part, dict) else str(part)
+                        for part in content
+                    )
+                if isinstance(content, str) and content.strip(): # Ensure content is not empty or just whitespace
                     response_content = content
                     CACHE.set(prompt, model_name, temperature, response_content)
                     break
@@ -323,7 +332,11 @@ def call_llm(prompt: str, temperature: float = 0.0, call_type: str = "unknown") 
             else:
                 error_msg = f"Empty response structure: {data}"
         except Exception as e:
-            error_msg = str(e)
+            error_msg = (
+                f"{type(e).__name__}: {e}"
+                f" | status={last_status}"
+                f" | body={last_body_preview}"
+            )
             time.sleep(1)
     
     
@@ -345,6 +358,11 @@ def call_llm(prompt: str, temperature: float = 0.0, call_type: str = "unknown") 
             "prompt_preview": prompt[:100],
             "response_preview": response_content[:200]
         })
+    if not response_content.strip():
+        raise RuntimeError(
+            f"LLM call failed for {call_type} after 3 attempts. "
+            f"model={model_name} provider={provider_setting} error={error_msg}"
+        )
     return response_content
 
 # ============================================================================
@@ -668,8 +686,12 @@ class EvolutionOptimizer:
         self.val_data = val_data
         
         self.vector_store = SimpleVectorStore(model_name=config['rag']['model_name'])
-        print("[Optimizer] Building Vector Store (Train Set Only)...")
-        self.vector_store.add_documents(self.train_data)
+        if config['rag'].get('enabled', False):
+            print("[Optimizer] Building Vector Store (Train Set Only)...")
+            self.vector_store.add_documents(self.train_data)
+        else:
+            self.vector_store.documents = self.train_data
+            print("[Optimizer] RAG disabled. Skipping Vector Store build.")
         
         self.population = []
         self.history = []
