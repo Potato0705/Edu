@@ -1,4 +1,4 @@
-# Fast smoke test for Phase 4 evidence-aware mutation.
+# Control: same raw-first protocol quality, but anchor slot mutation is random.
 
 model:
   name: "models/Meta-Llama-3.1-8B-Instruct"
@@ -25,17 +25,18 @@ induction:
   official_criteria: "Evaluate the essay based on content, organization, and language use."
 
 evolution:
-  population_size: 2
-  n_generations: 1
+  population_size: 4
+  n_generations: 3
   n_static_exemplars: 4
   anchor_profile: "boundary"
   anchor_stratum_strategy: "score_band"
   anchor_mutation_strategy: "evidence_representative"
-  anchor_mutation_candidate_pool: 8
-  anchor_mutation_hidden_rerank: true
-  anchor_mutation_hidden_top_m: 3
-  use_evidence_feedback: true
-  use_evidence_anchor_slot: true
+  anchor_mutation_candidate_pool: 12
+  anchor_mutation_hidden_rerank: false
+  anchor_mutation_hidden_top_m: 4
+  use_evidence_feedback: false
+  use_evidence_anchor_slot: false
+  evidence_anchor_slot_prob: 0.0
   n_elite_evolve: 1
   n_error_cases: 3
   max_workers: 1
@@ -60,16 +61,16 @@ debug:
   enabled: true
   stratified: true
   seed: 42
-  n_train: 120
-  n_val: 16
-  n_test: 16
+  n_train: 240
+  n_val: 128
+  n_test: 128
 
 pace:
   enabled: true
   model_path: "models/Meta-Llama-3.1-8B-Instruct"
   load_in_4bit: false
   dtype: "bfloat16"
-  top_k_pace: 1
+  top_k_pace: 2
   include_raw_elite_buffer: 1
   raw_guard_enabled: true
   raw_guard_margin: 0.03
@@ -85,7 +86,7 @@ pace:
   beta: 0.25
   gamma: 0.10
   hidden_dim: 64
-  epochs: 5
+  epochs: 10
   lr: 0.001
   batch_size: 16
   lambda_qwk: 0.25
@@ -93,12 +94,12 @@ pace:
   use_enhanced_evidence: true
   evidence_include_raw_score: true
   anchor_softmax_temperature: 0.10
-  early_reject_enabled: true
-  early_reject_mini_set_size: 4
+  early_reject_enabled: false
+  early_reject_mini_set_size: 8
   score_collapse_threshold: 0.75
   anchor_sep_threshold: 0.02
   early_qwk_threshold: -0.05
-  cost_penalty_lambda: 0.02
+  cost_penalty_lambda: 0.0
   overfit_guard_enabled: true
   overfit_gap_threshold: 0.15
   overfit_penalty_weight: 0.20
@@ -108,4 +109,4 @@ pace:
   collapse_penalty_weight: 0.15
   max_score_overprediction_threshold: 3.0
   max_score_penalty_weight: 0.03
-  evidence_diagnostics_top_n: 5
+  evidence_diagnostics_top_n: 8

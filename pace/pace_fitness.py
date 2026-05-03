@@ -70,6 +70,7 @@ class PaceFitnessConfig:
     cost_penalty_lambda: float = 0.0
     evidence_diagnostics_top_n: int = 5
     use_enhanced_evidence: bool = True
+    evidence_include_raw_score: bool = True
     anchor_softmax_temperature: float = 0.10
     overfit_guard_enabled: bool = True
     overfit_gap_threshold: float = 0.15
@@ -104,6 +105,7 @@ class PaceFitnessConfig:
             cost_penalty_lambda=p.get("cost_penalty_lambda", 0.0),
             evidence_diagnostics_top_n=p.get("evidence_diagnostics_top_n", 5),
             use_enhanced_evidence=p.get("use_enhanced_evidence", True),
+            evidence_include_raw_score=p.get("evidence_include_raw_score", True),
             anchor_softmax_temperature=p.get("anchor_softmax_temperature", 0.10),
             overfit_guard_enabled=p.get("overfit_guard_enabled", True),
             overfit_gap_threshold=p.get("overfit_gap_threshold", 0.15),
@@ -192,11 +194,11 @@ class PaceFitnessEvaluator:
             "uncertainty_raw_norm",
         ]
         raw = [
-            "y_raw_norm",
-            "y_raw_centered",
-            "y_raw_band_low",
-            "y_raw_band_mid",
-            "y_raw_band_high",
+            "y_raw_norm" if self.config.evidence_include_raw_score else "y_raw_norm_disabled_zero",
+            "y_raw_centered" if self.config.evidence_include_raw_score else "y_raw_centered_disabled_zero",
+            "y_raw_band_low" if self.config.evidence_include_raw_score else "y_raw_band_low_disabled_zero",
+            "y_raw_band_mid" if self.config.evidence_include_raw_score else "y_raw_band_mid_disabled_zero",
+            "y_raw_band_high" if self.config.evidence_include_raw_score else "y_raw_band_high_disabled_zero",
         ]
         if not self.config.use_enhanced_evidence:
             anchor = (
@@ -761,7 +763,15 @@ class PaceFitnessEvaluator:
 
         score_span = max(1, self.score_max - self.score_min)
         y_norm_value = float(np.clip((result.y_raw - self.score_min) / score_span, 0.0, 1.0))
-        y_norm = torch.tensor([y_norm_value], dtype=torch.float32)
+        if not self.config.evidence_include_raw_score:
+            y_norm_feature_value = 0.0
+            y_centered_feature_value = 0.0
+            raw_band_enabled = False
+        else:
+            y_norm_feature_value = y_norm_value
+            y_centered_feature_value = 2.0 * y_norm_value - 1.0
+            raw_band_enabled = True
+        y_norm = torch.tensor([y_norm_feature_value], dtype=torch.float32)
 
         cos_sims = F.cosine_similarity(h.unsqueeze(0), anchors, dim=1).cpu()
         l2_raw = (h.unsqueeze(0) - anchors).norm(p=2, dim=1).cpu()
@@ -774,10 +784,11 @@ class PaceFitnessEvaluator:
             z = torch.cat([y_norm, cos_sims, l2_raw, r_s, f_o, u], dim=0).float()
             return self._validate_evidence_vector(z, n_anchors)
 
-        y_centered = torch.tensor([2.0 * y_norm_value - 1.0], dtype=torch.float32)
+        y_centered = torch.tensor([y_centered_feature_value], dtype=torch.float32)
         band = self._score_band_index(result.y_raw)
         band_one_hot = torch.zeros(3, dtype=torch.float32)
-        band_one_hot[min(2, max(0, band))] = 1.0
+        if raw_band_enabled:
+            band_one_hot[min(2, max(0, band))] = 1.0
 
         cos_dists = ((1.0 - cos_sims) / 2.0).clamp(0.0, 1.0)
         hidden_scale = max(1.0, math.sqrt(float(h.numel())))
@@ -803,10 +814,10 @@ class PaceFitnessEvaluator:
             expected_idx_norm = float(torch.dot(anchor_probs, anchor_idx) / (n_anchors - 1))
         else:
             expected_idx_norm = 0.0
-        raw_expected_gap = y_norm_value - expected_idx_norm
+        raw_expected_gap = y_norm_value - expected_idx_norm if self.config.evidence_include_raw_score else 0.0
         nearest_idx_norm = float(closest_idx / max(1, n_anchors - 1)) if n_anchors else 0.0
         if anchor_scores and 0 <= closest_idx < len(anchor_scores):
-            raw_nearest_gap = float((result.y_raw - int(anchor_scores[closest_idx])) / score_span)
+            raw_nearest_gap = float((result.y_raw - int(anchor_scores[closest_idx])) / score_span) if self.config.evidence_include_raw_score else 0.0
         else:
             raw_nearest_gap = 0.0
         if n_anchors >= 4:
@@ -817,7 +828,9 @@ class PaceFitnessEvaluator:
             boundary_pair_prob_mass = float(anchor_probs[1]) if n_anchors >= 3 else 0.0
             boundary_cos_margin = 0.0
             nearest_band = min(2, max(0, closest_idx))
-        hidden_raw_band_agreement = 1.0 if int(band) == int(nearest_band) else 0.0
+        hidden_raw_band_agreement = (
+            1.0 if self.config.evidence_include_raw_score and int(band) == int(nearest_band) else 0.0
+        )
 
         anchor_scalars = torch.tensor(
             [

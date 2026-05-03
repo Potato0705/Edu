@@ -93,6 +93,8 @@ pace:
   raw_guard_margin: 0.03
   raw_adjusted_guard_margin: 0.04
   selection_max_distribution_penalty: 0.15
+  max_anchor_geometry_bonus: 0.02
+  max_protocol_quality_lift: 0.02
   pace_guidance_weight: 0.00           # deprecated: PACE QWK is diagnostic only, not a selection reward
   anchor_guidance_weight: 0.05
   final_pace_calibrated: true
@@ -123,4 +125,5 @@ pace:
   lambda_qwk: 0.25                     # calibrator_loss 中 soft-QWK 项权重
   use_compact_evidence: true           # true=35维 compact z；false=完整 16k 维 z（需大 calib 集）
   use_enhanced_evidence: true          # true=52-dim schema-backed compact z
+  evidence_include_raw_score: true     # set false for hidden-only evidence ablation
   anchor_softmax_temperature: 0.10     # soft anchor probabilities from hidden cosine similarities

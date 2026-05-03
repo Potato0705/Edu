@@ -1652,20 +1652,28 @@ class EvolutionOptimizer:
         cfg = self.pace_evaluator.config
         raw_val_qwk = float(raw_val_qwk)
         anchor_guidance_weight = float(pace_cfg.get("anchor_guidance_weight", cfg.gamma))
-        anchor_bonus = anchor_guidance_weight * float(pace_result.get("anchor_geometry_score", 0.0))
+        max_anchor_bonus = float(pace_cfg.get("max_anchor_geometry_bonus", 0.02))
+        anchor_bonus_raw = anchor_guidance_weight * float(pace_result.get("anchor_geometry_score", 0.0))
+        anchor_bonus = max(-max_anchor_bonus, min(max_anchor_bonus, anchor_bonus_raw))
         cost_penalty = float(pace_result.get("cost_penalty", 0.0))
         overfit_penalty = float(pace_result.get("overfit_penalty", 0.0))
         distribution_penalty = float(pace_result.get("distribution_penalty", 0.0))
-        guided = (
+        uncapped_guided = (
             raw_val_qwk
             + anchor_bonus
             - cost_penalty
             - overfit_penalty
             - distribution_penalty
         )
+        max_lift = float(pace_cfg.get("max_protocol_quality_lift", 0.02))
+        guided = min(uncapped_guided, raw_val_qwk + max_lift)
         pace_result["selection_objective"] = "raw_val_qwk + anchor_geometry_bonus - cost/overfit/distribution penalties"
         pace_result["pace_qwk_used_for_selection"] = False
+        pace_result["selection_anchor_bonus_raw"] = anchor_bonus_raw
         pace_result["selection_anchor_bonus"] = anchor_bonus
+        pace_result["selection_max_anchor_bonus"] = max_anchor_bonus
+        pace_result["selection_uncapped_protocol_quality"] = uncapped_guided
+        pace_result["selection_max_protocol_quality_lift"] = max_lift
         pace_result["selection_cost_penalty"] = cost_penalty
         pace_result["selection_overfit_penalty"] = overfit_penalty
         pace_result["selection_distribution_penalty"] = distribution_penalty
@@ -2036,7 +2044,11 @@ class EvolutionOptimizer:
                     'pace_distribution_metrics',
                     'selection_objective',
                     'pace_qwk_used_for_selection',
+                    'selection_anchor_bonus_raw',
                     'selection_anchor_bonus',
+                    'selection_max_anchor_bonus',
+                    'selection_uncapped_protocol_quality',
+                    'selection_max_protocol_quality_lift',
                     'selection_cost_penalty',
                     'selection_overfit_penalty',
                     'selection_distribution_penalty',
