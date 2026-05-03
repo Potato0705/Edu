@@ -41,12 +41,27 @@ evolution:
   population_size: 8                   # 种群大小
   n_generations: 20                    # 进化代数
   n_static_exemplars: 3                # [修改] 静态 ICL 范文数量 (Global Anchors)
+  anchor_profile: "stratum"
+  anchor_stratum_strategy: "score_band"
+  anchor_mutation_strategy: "evidence_representative"
+  anchor_mutation_candidate_pool: 12
+  anchor_mutation_hidden_rerank: false
+  anchor_mutation_hidden_top_m: 4
+  use_evidence_feedback: true
+  use_evidence_anchor_slot: true
+  evidence_anchor_slot_prob: 1.0
   elite_ratio: 0.25
   mutation_rate: 0.3
   tournament_size: 3
   n_elite_evolve: 2
   n_error_cases: 5
   max_workers: 10                      # 并发线程数 (建议 5-20，取决于 API Rate Limit)
+  raw_distribution_guard_enabled: true
+  raw_distribution_tv_threshold: 0.35
+  raw_distribution_penalty_weight: 0.15
+  raw_bias_threshold: 1.5
+  raw_bias_penalty_weight: 0.05
+  raw_collapse_penalty_weight: 0.10
 
 # LLM 配置
 llm:
@@ -61,6 +76,51 @@ output:
 # [NEW] 调试/非正式实验模式配置
 debug:
   enabled: true                        # 是否开启调试模式
+  stratified: true                     # keep score distribution stable across train/val/test
   n_train: 400                          # 调试模式下：训练集大小 (RAG 知识库)
-  n_val: 32                             # 调试模式下：验证集大小 (进化评估用，最耗钱的部分)
-  n_test: 100                            # 调试模式下：测试集大小 (最终评估用)
+  n_val: 128                            # 调试模式下：验证集大小 (进化评估用，最耗钱的部分)
+  n_test: 128                           # 调试模式下：测试集大小 (最终评估用)
+
+# WISE-PACE 配置 (保持 enabled: false 则行为与原始 WISE-AES 完全一致)
+pace:
+  enabled: false
+  model_path: "models/Meta-Llama-3.1-8B-Instruct"  # 本地模型路径
+  load_in_4bit: false                  # 4-bit NF4 量化 (推荐在单卡 24GB 及以下开启)
+  dtype: "bfloat16"
+  top_k_pace: 3                        # 每代仅对 top-K 个体运行 PACE fitness
+  include_raw_elite_buffer: 0          # extra raw-ranked candidates to reduce evidence-free elites
+  raw_guard_enabled: true
+  raw_guard_margin: 0.03
+  raw_adjusted_guard_margin: 0.04
+  selection_max_distribution_penalty: 0.15
+  pace_guidance_weight: 0.00           # deprecated: PACE QWK is diagnostic only, not a selection reward
+  anchor_guidance_weight: 0.05
+  final_pace_calibrated: true
+  calib_split_ratio: 0.5               # val 切分：前 50% 训练 PACE calibrator，后 50% 评估 fitness
+  alpha: 0.70                          # PACE QWK 权重
+  beta: 0.30                           # Raw QWK 权重
+  gamma: 0.00                          # Anchor geometry 权重 (Phase 2 启用)
+  hidden_dim: 64                       # CoralOrdinalCalibrator MLP 宽度
+  epochs: 20                           # 轻量 calibrator 训练轮数
+  lr: 0.001
+  batch_size: 16
+  early_reject_enabled: false
+  early_reject_mini_set_size: 16
+  score_collapse_threshold: 0.70
+  anchor_sep_threshold: 0.05
+  early_qwk_threshold: 0.10
+  cost_penalty_lambda: 0.0
+  overfit_guard_enabled: true
+  overfit_gap_threshold: 0.15
+  overfit_penalty_weight: 0.20
+  distribution_guard_enabled: true
+  distribution_tv_threshold: 0.25
+  distribution_penalty_weight: 0.20
+  collapse_penalty_weight: 0.15
+  max_score_overprediction_threshold: 3.0
+  max_score_penalty_weight: 0.03
+  evidence_diagnostics_top_n: 5
+  lambda_qwk: 0.25                     # calibrator_loss 中 soft-QWK 项权重
+  use_compact_evidence: true           # true=35维 compact z；false=完整 16k 维 z（需大 calib 集）
+  use_enhanced_evidence: true          # true=52-dim schema-backed compact z
+  anchor_softmax_temperature: 0.10     # soft anchor probabilities from hidden cosine similarities

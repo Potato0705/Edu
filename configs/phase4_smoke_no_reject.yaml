@@ -1,0 +1,97 @@
+# Fast smoke test for full Phase 4 evidence diagnostics without early rejection.
+
+model:
+  name: "models/Meta-Llama-3.1-8B-Instruct"
+
+data:
+  asap_path: "data/raw/training_set_rel3.tsv"
+  essay_set: 1
+  score_min: 2
+  score_max: 12
+
+rag:
+  enabled: false
+  model_name: "all-MiniLM-L6-v2"
+  n_retrieved: 10
+  n_selected: 3
+  use_rerank_train: false
+  use_rerank_test: false
+  rubric_driven_retrieval: false
+
+induction:
+  enabled: true
+  n_high_samples: 3
+  n_low_samples: 3
+  official_criteria: "Evaluate the essay based on content, organization, and language use."
+
+evolution:
+  population_size: 2
+  n_generations: 1
+  n_static_exemplars: 3
+  anchor_stratum_strategy: "score_band"
+  anchor_mutation_strategy: "evidence_representative"
+  anchor_mutation_candidate_pool: 8
+  anchor_mutation_hidden_rerank: true
+  anchor_mutation_hidden_top_m: 3
+  use_evidence_feedback: true
+  use_evidence_anchor_slot: true
+  n_elite_evolve: 1
+  n_error_cases: 3
+  max_workers: 1
+  evolve_instruction: true
+  evolve_static_exemplars: true
+
+llm:
+  temperature_scoring: 0.0
+  temperature_induce: 0.8
+  max_exemplar_length: 400
+
+output:
+  verbose: true
+
+debug:
+  enabled: true
+  stratified: true
+  seed: 42
+  n_train: 120
+  n_val: 16
+  n_test: 16
+
+pace:
+  enabled: true
+  model_path: "models/Meta-Llama-3.1-8B-Instruct"
+  load_in_4bit: false
+  dtype: "bfloat16"
+  top_k_pace: 1
+  include_raw_elite_buffer: 1
+  raw_guard_enabled: true
+  raw_guard_margin: 0.03
+  final_pace_calibrated: true
+  calib_split_ratio: 0.5
+  alpha: 0.60
+  beta: 0.25
+  gamma: 0.10
+  hidden_dim: 64
+  epochs: 5
+  lr: 0.001
+  batch_size: 16
+  lambda_qwk: 0.25
+  use_compact_evidence: true
+  use_enhanced_evidence: true
+  anchor_softmax_temperature: 0.10
+  early_reject_enabled: false
+  early_reject_mini_set_size: 4
+  score_collapse_threshold: 0.75
+  anchor_sep_threshold: 0.02
+  early_qwk_threshold: -0.05
+  cost_penalty_lambda: 0.02
+  overfit_guard_enabled: true
+  overfit_gap_threshold: 0.15
+  overfit_penalty_weight: 0.20
+  distribution_guard_enabled: true
+  distribution_tv_threshold: 0.25
+  distribution_penalty_weight: 0.20
+  collapse_penalty_weight: 0.15
+  max_score_overprediction_threshold: 3.0
+  max_score_penalty_weight: 0.03
+  evidence_diagnostics_top_n: 5

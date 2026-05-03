@@ -1,0 +1,67 @@
+# Test B: 1-generation smoke test for WISE-PACE
+# Validates that gen_000.json contains pace_fitness + combined_fitness fields
+
+model:
+  name: "models/Meta-Llama-3.1-8B-Instruct"
+
+data:
+  asap_path: "data/raw/training_set_rel3.tsv"
+  essay_set: 1
+  score_min: 2
+  score_max: 12
+
+rag:
+  enabled: false
+  model_name: "all-MiniLM-L6-v2"
+  n_retrieved: 10
+  n_selected: 3
+  use_rerank_train: false
+  use_rerank_test: false
+  rubric_driven_retrieval: false
+
+induction:
+  enabled: true
+  n_high_samples: 3
+  n_low_samples: 3
+  official_criteria: "Evaluate the essay based on content, organization, and language use."
+
+evolution:
+  population_size: 2
+  n_generations: 1
+  n_static_exemplars: 3
+  anchor_stratum_strategy: "percentile"
+  n_elite_evolve: 1
+  n_error_cases: 3
+  max_workers: 1
+
+llm:
+  temperature_scoring: 0.0
+  temperature_induce: 0.8
+  max_exemplar_length: 400
+
+output:
+  verbose: true
+
+debug:
+  enabled: true
+  seed: 42
+  n_train: 100
+  n_val: 16       # calib=8 (score essays), fitness=8 (evaluate PACE)
+  n_test: 20
+
+pace:
+  enabled: true
+  model_path: "models/Meta-Llama-3.1-8B-Instruct"
+  load_in_4bit: false
+  dtype: "bfloat16"
+  top_k_pace: 1           # Only run PACE on the single best individual
+  calib_split_ratio: 0.5  # 8 calib + 8 fitness essays
+  alpha: 0.70
+  beta: 0.30
+  gamma: 0.10
+  hidden_dim: 64
+  epochs: 5
+  lr: 0.001
+  batch_size: 16
+  lambda_qwk: 0.25
+  use_compact_evidence: true

@@ -61,14 +61,24 @@ if str(_REPO_ROOT) not in sys.path:
 # ---------------------------------------------------------------------------
 
 
+def anchor_role_name(idx: int, n_anchors: int) -> str:
+    if n_anchors <= 3:
+        roles = ["Low anchor", "Middle anchor", "High anchor"]
+    else:
+        roles = ["Low anchor", "Lower boundary anchor", "Upper boundary anchor", "High anchor"]
+    return roles[idx] if idx < len(roles) else f"Additional anchor {idx + 1}"
+
+
 def format_exemplars(exs: Sequence[Dict]) -> str:
     """Mirror :meth:`wise_aes.PromptIndividual._format_list` exactly."""
     if not exs:
         return "(None)"
     return "\n\n".join(
         [
-            f"### Essay (Score: {ex['domain1_score']})\n{ex['essay_text'][:400]}..."
-            for ex in exs
+            f"### {anchor_role_name(idx, len(exs))} (Known Score: {ex['domain1_score']})\n"
+            f"Use this as a global scoring-scale reference, not as a retrieved neighbor.\n"
+            f"Essay: {ex['essay_text'][:400]}..."
+            for idx, ex in enumerate(exs)
         ]
     )
 
@@ -97,6 +107,47 @@ def build_scoring_prompt(
         essay=essay_text,
         score_min=score_min,
         score_max=score_max,
+    )
+
+
+def build_representation_prompt(
+    *,
+    instruction: str,
+    static_exemplars: Sequence[Dict],
+    essay_text: str,
+    score_min: int,
+    score_max: int,
+    known_score: Optional[int] = None,
+    representation_target: Optional[str] = None,
+) -> str:
+    """Build the shared scoring-context prompt used to encode essays.
+
+    Target essays and anchor essays are encoded in the same instruction,
+    score-range, and reference-anchor context. Downstream code mean-pools the
+    last-layer states over the ``essay_text`` span after ``Essay to Represent``.
+    """
+    anchor_blocks = []
+    for idx, ex in enumerate(static_exemplars):
+        anchor_blocks.append(
+            f"Role: {anchor_role_name(idx, len(static_exemplars))}\n"
+            f"Score: {ex['domain1_score']}\n"
+            f"Essay: {ex['essay_text'][:400]}"
+        )
+    anchors_text = "\n\n".join(anchor_blocks) if anchor_blocks else "(None)"
+    known_score_block = f"\n\nKnown Score:\n{known_score}" if known_score is not None else ""
+    target_text = representation_target or "Encode the essay to be scored."
+    return (
+        "Scoring Instruction:\n"
+        f"{instruction}\n\n"
+        "Score Range:\n"
+        f"{score_min}-{score_max}\n\n"
+        "Reference Anchors:\n"
+        f"{anchors_text}\n\n"
+        "Essay to Represent:\n"
+        f"{essay_text}"
+        f"{known_score_block}\n\n"
+        "Representation Target:\n"
+        f"{target_text}"
     )
 
 
@@ -290,6 +341,15 @@ class LocalLlamaBackend:
             f"model_max_len={self.tokenizer.model_max_length}"
         )
         self._lock = threading.Lock()
+        self._usage_lock = threading.Lock()
+        self._usage = {
+            "scoring_calls": 0,
+            "generation_calls": 0,
+            "representation_calls": 0,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "representation_tokens": 0,
+        }
 
     # ---- public API -----------------------------------------------------
 
@@ -314,10 +374,17 @@ class LocalLlamaBackend:
             dynamic_ex=req.dynamic_ex,
         )
         chat_prompt = self._apply_chat_template(prompt_text)
+        prompt_tokens = self._count_tokens(chat_prompt)
         t0 = time.time()
         with self._lock:
             response_text, final_hidden = self._generate(chat_prompt)
         wall = time.time() - t0
+        completion_tokens = self._count_tokens(response_text)
+        self._record_usage(
+            scoring_calls=1,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+        )
 
         ind = PromptIndividual.__new__(PromptIndividual)
         ind.config = self.config
@@ -335,7 +402,70 @@ class LocalLlamaBackend:
                 "model_path": self.model_path,
                 "dtype": self.dtype_str,
                 "pool": self.pool,
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
             },
+        )
+
+    def encode_scoring_context(
+        self,
+        *,
+        instruction: str,
+        static_exemplars: Sequence[Dict],
+        essay_text: str,
+        score_min: int,
+        score_max: int,
+        known_score: Optional[int] = None,
+        representation_target: Optional[str] = None,
+    ) -> "torch.Tensor":
+        """Return mean-pooled last-layer states over the essay span.
+
+        This is the hidden representation used by WISE-PACE evidence. It keeps
+        target and anchor essays comparable by encoding both inside the same
+        scoring-context template, then pooling only tokens from the essay placed
+        after ``Essay to Represent``.
+        """
+        prompt_text = build_representation_prompt(
+            instruction=instruction,
+            static_exemplars=static_exemplars,
+            essay_text=essay_text,
+            score_min=score_min,
+            score_max=score_max,
+            known_score=known_score,
+            representation_target=representation_target,
+        )
+        chat_prompt = self._apply_chat_template(prompt_text)
+        representation_tokens = self._count_tokens(chat_prompt)
+        marker = "Essay to Represent:\n"
+        marker_pos = chat_prompt.rfind(marker)
+        if marker_pos < 0:
+            raise RuntimeError("Representation prompt marker not found.")
+        essay_start = chat_prompt.find(essay_text, marker_pos + len(marker))
+        if essay_start < 0:
+            raise RuntimeError("Essay span not found in representation prompt.")
+        essay_end = essay_start + len(essay_text)
+
+        with self._lock:
+            hidden = self._encode_span_mean(chat_prompt, essay_start, essay_end)
+        self._record_usage(
+            representation_calls=1,
+            representation_tokens=representation_tokens,
+        )
+        return hidden.to("cpu").float()
+
+    def usage_snapshot(self) -> Dict[str, int]:
+        with self._usage_lock:
+            return dict(self._usage)
+
+    def usage_delta(self, before: Dict[str, int]) -> Dict[str, int]:
+        now = self.usage_snapshot()
+        return {k: int(now.get(k, 0) - before.get(k, 0)) for k in now}
+
+    def record_generation_usage(self, prompt_text: str, response_text: str) -> None:
+        self._record_usage(
+            generation_calls=1,
+            prompt_tokens=self._count_tokens(prompt_text),
+            completion_tokens=self._count_tokens(response_text),
         )
 
     # ---- internals ------------------------------------------------------
@@ -346,6 +476,17 @@ class LocalLlamaBackend:
         return self.tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True
         )
+
+    def _count_tokens(self, text: str) -> int:
+        try:
+            return len(self.tokenizer(text, add_special_tokens=False)["input_ids"])
+        except Exception:
+            return max(1, len(text) // 4)
+
+    def _record_usage(self, **kwargs: int) -> None:
+        with self._usage_lock:
+            for key, value in kwargs.items():
+                self._usage[key] = self._usage.get(key, 0) + int(value)
 
     def _generate(self, chat_prompt: str) -> Tuple[str, "torch.Tensor"]:
         inputs = self.tokenizer(chat_prompt, return_tensors="pt").to(self.device)
@@ -375,6 +516,32 @@ class LocalLlamaBackend:
         # Shape (batch=1, seq=1 for last step, hidden)
         final_hidden = last_layer_hidden[0, -1, :].detach()
         return response_text, final_hidden
+
+    def _encode_span_mean(
+        self,
+        chat_prompt: str,
+        char_start: int,
+        char_end: int,
+    ) -> "torch.Tensor":
+        encoded = self.tokenizer(
+            chat_prompt,
+            return_tensors="pt",
+            return_offsets_mapping=True,
+            add_special_tokens=False,
+        )
+        offsets = encoded.pop("offset_mapping")[0]
+        inputs = encoded.to(self.device)
+        with torch.no_grad():
+            out = self.model(**inputs, output_hidden_states=True, return_dict=True)
+        last_hidden = out.hidden_states[-1][0]
+
+        mask = []
+        for start, end in offsets.tolist():
+            mask.append(end > char_start and start < char_end)
+        mask_t = torch.tensor(mask, device=last_hidden.device, dtype=torch.bool)
+        if not bool(mask_t.any()):
+            raise RuntimeError("No tokens overlapped requested essay span.")
+        return last_hidden[mask_t].mean(dim=0).detach()
 
 
 # ---------------------------------------------------------------------------
@@ -642,6 +809,7 @@ __all__ = [
     "AnchorCacheEntry",
     "AnchorHiddenCache",
     "build_scoring_prompt",
+    "build_representation_prompt",
     "format_exemplars",
     "load_layer1_champion",
 ]
