@@ -43,6 +43,13 @@ evolution:
   n_static_exemplars: 3                # [修改] 静态 ICL 范文数量 (Global Anchors)
   anchor_profile: "stratum"
   anchor_stratum_strategy: "score_band"
+  anchor_boundary_mode: "mid_and_high"
+  anchor_high_exact_top: true
+  anchor_high_min_count: 5
+  anchor_high_top_preference_prob: 0.75
+  anchor_high_top_bonus: 0.25
+  anchor_high_preserve_top_prob: 0.85
+  anchor_low_exact_floor: false
   anchor_mutation_strategy: "evidence_representative"
   anchor_mutation_candidate_pool: 12
   anchor_mutation_hidden_rerank: false
@@ -54,6 +61,7 @@ evolution:
   mutation_rate: 0.3
   tournament_size: 3
   n_elite_evolve: 2
+  elite_diversity_max_score_gap: 0.20
   n_error_cases: 5
   max_workers: 10                      # 并发线程数 (建议 5-20，取决于 API Rate Limit)
   raw_distribution_guard_enabled: true
@@ -62,6 +70,13 @@ evolution:
   raw_bias_threshold: 1.5
   raw_bias_penalty_weight: 0.05
   raw_collapse_penalty_weight: 0.10
+  raw_high_score_quantile: 0.75
+  raw_high_recall_floor: 0.30
+  raw_high_recall_penalty_weight: 0.12
+  raw_high_bias_floor: -1.0
+  raw_high_bias_penalty_weight: 0.04
+  raw_require_max_score_when_present: true
+  raw_max_score_recall_penalty_weight: 0.03
 
 # LLM 配置
 llm:
@@ -97,7 +112,7 @@ pace:
   max_protocol_quality_lift: 0.02
   pace_guidance_weight: 0.00           # deprecated: PACE QWK is diagnostic only, not a selection reward
   anchor_guidance_weight: 0.05
-  final_pace_calibrated: true
+  final_pace_calibrated: false
   calib_split_ratio: 0.5               # val 切分：前 50% 训练 PACE calibrator，后 50% 评估 fitness
   alpha: 0.70                          # PACE QWK 权重
   beta: 0.30                           # Raw QWK 权重

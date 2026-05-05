@@ -569,6 +569,40 @@ def _prepend_score_range_contract(text: str, config: Dict[str, Any]) -> str:
     return f"{contract}\n\n{text.strip()}"
 
 
+def _normalize_score_rubric(text: str, config: Dict[str, Any]) -> str:
+    """Keep evolved rubrics on the dataset score scale instead of a point-sum scale."""
+    score_min = int(config['data']['score_min'])
+    score_max = int(config['data']['score_max'])
+    text = str(text or "").strip().strip("`")
+
+    # Generated rubrics often drift into local subcriterion point totals, which
+    # makes the scorer reluctant to use the dataset's holistic score range.
+    text = re.sub(r"\(\s*\d+\s*points?\s*\)", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\b\d+\s*points?\b", "qualitative evidence", text, flags=re.IGNORECASE)
+    text = re.sub(r"\(\s*Score\s*:\s*[01]\s*\)", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bScore\s*:\s*[01]\b", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+
+    span = max(1, score_max - score_min)
+    low_max = math.floor(score_min + span / 3.0)
+    high_min = math.ceil(score_min + 0.75 * span)
+    mid_min = min(score_max, low_max + 1)
+    mid_max = max(mid_min, high_min - 1)
+    calibration = f"""
+
+Operational Score Calibration:
+- final_score is a holistic ordinal judgment on the {score_min}-{score_max} dataset scale; never sum subcriteria.
+- {score_min}-{low_max}: weak control, thin development, serious organization/language problems.
+- {mid_min}-{mid_max}: partially successful writing with adequate but uneven development and control.
+- {high_min}-{score_max}: strong writing with clear development, organization, and language control.
+- {score_max}: reserve for essays that are consistently strong across content, organization, and language; do not require perfection.
+- When evidence is between adjacent scores, choose the score whose reference anchor is closer in overall quality.
+"""
+    if "operational score calibration" not in text.lower():
+        text = text.rstrip() + calibration
+    return _prepend_score_range_contract(text, config)
+
+
 def _sum_generation_metric(gens_dir: Path, key: str) -> int:
     total = 0
     for path in sorted(gens_dir.glob("gen_*.json")):
@@ -611,6 +645,40 @@ def _score_band_distribution(items: List[Dict], score_min: int, score_max: int) 
     for label in _score_band_labels(items, score_min, score_max):
         counts[label] += 1
     return counts
+
+
+def _high_score_threshold(config: Dict[str, Any]) -> int:
+    evo_cfg = config.get('evolution', {})
+    score_min = int(config['data']['score_min'])
+    score_max = int(config['data']['score_max'])
+    explicit = evo_cfg.get("raw_high_score_threshold")
+    if explicit is not None:
+        return int(explicit)
+    default_threshold = math.ceil(score_min + 0.75 * max(1, score_max - score_min))
+    return int(max(score_min, min(score_max, default_threshold)))
+
+
+def _adaptive_high_score_threshold(
+    config: Dict[str, Any],
+    observed_scores: Optional[List[int]] = None,
+) -> int:
+    evo_cfg = config.get('evolution', {})
+    explicit = evo_cfg.get("raw_high_score_threshold")
+    if explicit is not None:
+        return int(explicit)
+    if not observed_scores:
+        return _high_score_threshold(config)
+    scores = sorted(int(x) for x in observed_scores)
+    q = float(evo_cfg.get("raw_high_score_quantile", 0.75))
+    q = max(0.0, min(1.0, q))
+    threshold = int(math.ceil(float(np.quantile(scores, q))))
+    available = sorted({int(x) for x in scores})
+    feasible = [s for s in available if s >= threshold]
+    if not feasible:
+        threshold = available[-1]
+    else:
+        threshold = feasible[0]
+    return threshold
 
 
 def _stratified_debug_split(
@@ -683,6 +751,9 @@ Step 3: Assign a final integer score between {score_min} and {score_max}.
 - The only valid final_score values are integers from {score_min} to {score_max}, inclusive.
 - If the rubric text mentions an incompatible point scale, ignore that scale and map the evidence onto {score_min}-{score_max}.
 - Do not output percentages, 60-point scores, 100-point scores, letter grades, or decimal scores.
+- Treat all subcriteria as qualitative evidence for one holistic final_score; never add subcriterion points.
+- Use the full score range when evidence warrants it. Do not default to a middle score.
+- High-score essays should receive high final_score values when content, organization, and language are all strong.
 
 ## SCORING RUBRIC:
 {instruction}
@@ -711,6 +782,7 @@ Your task is to create a refined, operational SCORING RUBRIC (I_0) based on the 
 The scoring system must output exactly one integer final_score in [{score_min}, {score_max}].
 Every rule must be expressed for this {score_min}-{score_max} scale.
 Do not invent or preserve incompatible point totals such as 60 points, 100 points, percentages, letter grades, or decimal scores.
+Do not create additive subcriterion point totals. Subcriteria may describe evidence, but final_score is one holistic ordinal score.
 
 ### OFFICIAL CRITERIA:
 {official_criteria}
@@ -723,7 +795,8 @@ Do not invent or preserve incompatible point totals such as 60 points, 100 point
 2. Refine the OFFICIAL CRITERIA into a detailed, step-by-step scoring guide.
 3. Highlight specific, observable discriminators (e.g., "use of transitions," "sentence variety").
 4. Add boundary rules for adjacent score bands so the grader can distinguish near-miss essays.
-5. The output must be ready to use as a prompt for an LLM grader.
+5. Add explicit high-score recognition rules so strong essays can receive the top part of the valid range.
+6. The output must be ready to use as a prompt for an LLM grader.
 
 Output ONLY the Rubric text. Do not output explanations."""
 
@@ -1016,6 +1089,20 @@ Output ONLY the Rubric text. Do not output explanations."""
         mae = float(np.mean([abs(x) for x in score_errors])) if score_errors else 0.0
         pred_dist = score_dist(self.last_pred_scores)
         true_dist = score_dist(true_scores)
+        high_threshold = _adaptive_high_score_threshold(self.config, true_scores)
+        high_pairs = [
+            (int(t), int(p))
+            for t, p in zip(true_scores, self.last_pred_scores)
+            if int(t) >= high_threshold
+        ]
+        high_recall = (
+            sum(1 for _, p in high_pairs if p >= high_threshold) / len(high_pairs)
+            if high_pairs else 1.0
+        )
+        high_pred_bias = (
+            float(np.mean([p - t for t, p in high_pairs]))
+            if high_pairs else 0.0
+        )
         collapse_ratio = (
             max(pred_dist.values()) / max(1, len(self.last_pred_scores))
             if pred_dist else 0.0
@@ -1026,6 +1113,9 @@ Output ONLY the Rubric text. Do not output explanations."""
             "pred_distribution": pred_dist,
             "true_distribution": true_dist,
             "prediction_collapse_ratio": round(collapse_ratio, 4),
+            "high_score_threshold": high_threshold,
+            "high_score_recall": round(high_recall, 4),
+            "high_score_pred_minus_true": round(high_pred_bias, 4),
         }
         errors = []
         for i, (p, t) in enumerate(zip(self.last_pred_scores, true_scores)):
@@ -1070,6 +1160,7 @@ Analyze WHY these errors occurred. Use the evidence diagnostics when present:
 - If anchor confusion or boundary ambiguity is dominant, sharpen adjacent-score boundary rules.
 - If reasoning-score contradiction appears, require the final score to match the stated strengths and weaknesses.
 - If mean_pred_minus_true is strongly negative, add explicit recognition rules for high-quality essays and reduce overly harsh deductions.
+- If high_score_recall is low or high_score_pred_minus_true is negative, strengthen rules that assign 10-{score_max} to genuinely strong essays.
 - If predictions collapse into one or two scores, add score-band diversity and boundary calibration rules.
 - If pace_teacher_guidance is present, convert it into direct-scoring rubric edits; do not rely on a calibrator to fix raw scores.
 
@@ -1096,7 +1187,9 @@ OLD RUBRIC:
 Rewrite requirements:
 - Preserve the exact valid score range.
 - Remove or rewrite any incompatible point totals, percentages, letter grades, or decimal scoring language.
+- Do not use additive subcriterion points. Criteria are qualitative evidence for one holistic final_score.
 - Add concrete boundary rules for adjacent score levels when the feedback mentions boundary ambiguity.
+- Add high-score recognition rules when feedback shows underprediction of strong essays.
 - Add hidden-evidence-aware corrections when the feedback mentions over-score, under-score, anchor confusion, or reasoning-score contradiction.
 - Translate PACE teacher guidance into concrete score-band and boundary rules, but optimize direct raw final_score quality rather than post-hoc calibration.
 - Keep the rubric concise enough to fit in an LLM grading prompt.
@@ -1107,7 +1200,7 @@ OUTPUT ONLY THE NEW RUBRIC TEXT."""
             new_text = _call_local_generate(prompt, call_type="rewrite")
         else:
             new_text = call_llm(prompt, temperature=temp, call_type="rewrite")
-        return _prepend_score_range_contract(new_text, self.config)
+        return _normalize_score_rubric(new_text, self.config)
     
     def to_dict(self):
         return {
@@ -1272,27 +1365,46 @@ class EvolutionOptimizer:
             ]
         else:
             available_scores = sorted({int(x['domain1_score']) for x in self.train_data})
+            count_by_score = {
+                s: sum(1 for x in self.train_data if int(x['domain1_score']) == s)
+                for s in available_scores
+            }
             if len(available_scores) >= 2:
-                count_by_score = {
-                    s: sum(1 for x in self.train_data if int(x['domain1_score']) == s)
-                    for s in available_scores
-                }
                 adjacent_pairs = [
                     (a, b)
                     for a, b in zip(available_scores[:-1], available_scores[1:])
                     if b > a
                 ]
+                boundary_mode = evo_cfg.get("anchor_boundary_mode", "mid_and_high")
                 mid = (s_min + s_max) / 2.0
-                ranked_pairs = sorted(
-                    adjacent_pairs,
-                    key=lambda p: (
-                        min(count_by_score.get(p[0], 0), count_by_score.get(p[1], 0)),
-                        -abs(((p[0] + p[1]) / 2.0) - mid),
-                        -abs(p[1] - p[0]),
-                    ),
-                    reverse=True,
-                )
-                boundary_pairs = ranked_pairs[:2]
+
+                def rank_pairs(pairs, target_mid):
+                    return sorted(
+                        pairs,
+                        key=lambda p: (
+                            min(count_by_score.get(p[0], 0), count_by_score.get(p[1], 0)),
+                            -abs(((p[0] + p[1]) / 2.0) - target_mid),
+                            -abs(p[1] - p[0]),
+                        ),
+                        reverse=True,
+                    )
+
+                if boundary_mode == "mid_and_high":
+                    high_boundary_floor = int(evo_cfg.get("anchor_upper_boundary_min", max(s_min, s_max - 2)))
+                    high_boundary_ceiling = int(evo_cfg.get("anchor_upper_boundary_max", max(s_min, s_max - 1)))
+                    high_pairs = [
+                        p for p in adjacent_pairs
+                        if p[0] >= high_boundary_floor and p[1] <= high_boundary_ceiling
+                    ] or [
+                        p for p in adjacent_pairs
+                        if p[0] >= high_boundary_floor
+                    ] or adjacent_pairs[-1:]
+                    upper_pair = rank_pairs(high_pairs, high_boundary_floor + 0.5)[0]
+                    lower_pairs = [p for p in adjacent_pairs if p != upper_pair and p[1] <= upper_pair[0]]
+                    lower_pair = (rank_pairs(lower_pairs, mid) or [upper_pair])[0]
+                    boundary_pairs = [lower_pair, upper_pair]
+                else:
+                    boundary_pairs = rank_pairs(adjacent_pairs, mid)[:2]
             else:
                 boundary_pairs = []
             span = max(1, s_max - s_min)
@@ -1300,8 +1412,69 @@ class EvolutionOptimizer:
                 b1 = int(round(s_min + 0.45 * span))
                 b2 = int(round(s_min + 0.60 * span))
                 boundary_pairs.extend([(b1, min(s_max, b1 + 1)), (b2, min(s_max, b2 + 1))])
+            low_exact_floor = bool(evo_cfg.get("anchor_low_exact_floor", False))
+            high_exact_top = bool(evo_cfg.get("anchor_high_exact_top", True))
+            high_min_count = max(1, int(evo_cfg.get("anchor_high_min_count", 5)))
             low_cut = max(s_min, int(math.floor(np.quantile(available_scores, 0.20))) if available_scores else s_min)
+            if low_exact_floor and s_min in available_scores:
+                low_cut = s_min
             high_cut = min(s_max, int(math.ceil(np.quantile(available_scores, 0.80))) if available_scores else s_max)
+            if high_exact_top:
+                if s_max in available_scores:
+                    high_cut = s_max
+                elif available_scores:
+                    high_cut = max(available_scores)
+                top_count = sum(
+                    count_by_score.get(s, 0)
+                    for s in available_scores
+                    if s >= high_cut
+                )
+                if top_count < high_min_count and available_scores:
+                    cumulative = 0
+                    for score in sorted(available_scores, reverse=True):
+                        cumulative += count_by_score.get(score, 0)
+                        high_cut = score
+                        if cumulative >= high_min_count:
+                            break
+            if len(boundary_pairs) >= 2 and available_scores:
+                adjacent_pairs_for_adjust = [
+                    (a, b)
+                    for a, b in zip(available_scores[:-1], available_scores[1:])
+                    if b > a
+                ]
+                below_high_pairs = [
+                    p for p in adjacent_pairs_for_adjust
+                    if p[1] < high_cut
+                ]
+                if boundary_pairs[1][1] >= high_cut and below_high_pairs:
+                    target = high_cut - 0.5
+                    adjusted_upper = sorted(
+                        below_high_pairs,
+                        key=lambda p: (
+                            -abs(((p[0] + p[1]) / 2.0) - target),
+                            min(count_by_score.get(p[0], 0), count_by_score.get(p[1], 0)),
+                            p[1],
+                        ),
+                        reverse=True,
+                    )[0]
+                    lower_candidates = [
+                        p for p in adjacent_pairs_for_adjust
+                        if p != adjusted_upper and p[1] <= adjusted_upper[0]
+                    ]
+                    if lower_candidates:
+                        lower_target = (s_min + high_cut) / 2.0
+                        adjusted_lower = sorted(
+                            lower_candidates,
+                            key=lambda p: (
+                                -abs(((p[0] + p[1]) / 2.0) - lower_target),
+                                min(count_by_score.get(p[0], 0), count_by_score.get(p[1], 0)),
+                                p[1],
+                            ),
+                            reverse=True,
+                        )[0]
+                    else:
+                        adjusted_lower = boundary_pairs[0]
+                    boundary_pairs = [adjusted_lower, adjusted_upper]
             specs = [
                 {"name": "low", "min": s_min, "max": low_cut},
                 {
@@ -1349,6 +1522,43 @@ class EvolutionOptimizer:
             return specs[int(slot)].get("name")
         return None
 
+    def _is_high_anchor_stratum(self, stratum: Optional[str]) -> bool:
+        return str(stratum or "").lower() == "high"
+
+    def _top_score_in_pool(self, pool: List[Dict[str, Any]]) -> Optional[int]:
+        if not pool:
+            return None
+        return int(max(int(x['domain1_score']) for x in pool))
+
+    def _top_score_items(self, pool: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        top_score = self._top_score_in_pool(pool)
+        if top_score is None:
+            return []
+        return [x for x in pool if int(x['domain1_score']) == top_score]
+
+    def _choose_from_pool_with_high_preference(
+        self,
+        pool: List[Dict[str, Any]],
+        stratum: str,
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        evo_cfg = self.config.get('evolution', {})
+        if self._is_high_anchor_stratum(stratum):
+            top_items = self._top_score_items(pool)
+            prob = float(evo_cfg.get("anchor_high_top_preference_prob", 0.75))
+            if top_items and random.random() < max(0.0, min(1.0, prob)):
+                chosen = random.choice(top_items)
+                return chosen, {
+                    "high_top_preferred": True,
+                    "high_top_score": int(chosen['domain1_score']),
+                    "high_top_candidate_count": len(top_items),
+                }
+        chosen = random.choice(pool)
+        return chosen, {
+            "high_top_preferred": False,
+            "high_top_score": self._top_score_in_pool(pool),
+            "high_top_candidate_count": len(self._top_score_items(pool)),
+        }
+
     def _sample_stratum(self, stratum: str, exclude_id=None) -> dict:
         pools = {
             'low': self.low_pool,
@@ -1361,7 +1571,8 @@ class EvolutionOptimizer:
             filtered = [x for x in pool if x['essay_id'] != exclude_id]
             if filtered:
                 pool = filtered
-        return random.choice(pool)
+        chosen, _ = self._choose_from_pool_with_high_preference(list(pool), stratum)
+        return chosen
 
     def _select_anchor_replacement(
         self,
@@ -1387,16 +1598,42 @@ class EvolutionOptimizer:
         hidden_rerank = bool(evo_cfg.get('anchor_mutation_hidden_rerank', False))
         hidden_top_m = int(evo_cfg.get('anchor_mutation_hidden_top_m', 4))
         if strategy == 'random' or not pool:
-            chosen = random.choice(pool or self.train_data)
+            chosen_pool = pool or self.train_data
+            chosen, high_meta = self._choose_from_pool_with_high_preference(list(chosen_pool), stratum)
             return chosen, {
                 "anchor_mutation_strategy": "random",
                 "candidate_pool_size": len(pool),
                 "replacement_rank_score": None,
                 "hidden_rerank": False,
+                **high_meta,
             }
 
         sample_n = min(max(1, candidate_pool_size), len(pool))
         candidates = random.sample(pool, sample_n) if len(pool) > sample_n else list(pool)
+        if self._is_high_anchor_stratum(stratum):
+            # Ensure scarce top-score anchors are considered even when the high
+            # pool has been expanded for robustness.
+            top_items = self._top_score_items(pool)
+            candidate_ids = {x['essay_id'] for x in candidates}
+            for item in top_items:
+                if item['essay_id'] not in candidate_ids:
+                    candidates.append(item)
+                    candidate_ids.add(item['essay_id'])
+            top_pref_prob = float(evo_cfg.get("anchor_high_top_preference_prob", 0.75))
+            if top_items and random.random() < max(0.0, min(1.0, top_pref_prob)):
+                chosen = random.choice(top_items)
+                return chosen, {
+                    "anchor_mutation_strategy": strategy,
+                    "candidate_pool_size": len(candidates),
+                    "replacement_rank_score": None,
+                    "hidden_rerank": False,
+                    "hidden_rerank_candidates": 0,
+                    "hidden_anchor_separation_raw": None,
+                    "hidden_rerank_usage": {},
+                    "high_top_score": int(chosen['domain1_score']),
+                    "high_top_preferred": True,
+                    "high_top_candidate_count": len(top_items),
+                }
         scores = np.array([float(x['domain1_score']) for x in pool], dtype=float)
         lengths = np.array([max(1, len(str(x.get('essay_text', '')).split())) for x in pool], dtype=float)
         median_score = float(np.median(scores)) if scores.size else 0.0
@@ -1432,11 +1669,20 @@ class EvolutionOptimizer:
             boundary_hardness = 0.0
             if boundary_priority_enabled and str(stratum).startswith("boundary_"):
                 boundary_hardness = 1.0 - min(1.0, abs(cand_score - slot_midpoint) / max(1.0, score_span))
+            high_top_bonus = 0.0
+            top_score = self._top_score_in_pool(pool)
+            if self._is_high_anchor_stratum(stratum) and top_score is not None:
+                high_top_bonus = (
+                    float(evo_cfg.get("anchor_high_top_bonus", 0.25))
+                    if int(cand_score) == int(top_score)
+                    else 0.0
+                )
             rank_score = (
                 0.48 * score_centrality
                 + 0.22 * length_centrality
                 + 0.20 * diversity
                 + 0.10 * boundary_hardness
+                + high_top_bonus
             )
             ranked.append((rank_score, cand))
 
@@ -1481,12 +1727,24 @@ class EvolutionOptimizer:
                         round(float(hidden_sep), 6) if hidden_sep is not None else None
                     ),
                     "hidden_rerank_usage": usage_delta,
+                    "high_top_score": self._top_score_in_pool(pool),
+                    "high_top_preferred": (
+                        self._is_high_anchor_stratum(stratum)
+                        and int(chosen['domain1_score']) == int(self._top_score_in_pool(pool) or chosen['domain1_score'])
+                    ),
+                    "high_top_candidate_count": len(self._top_score_items(pool)),
                 }
         chosen_score, chosen = ranked[0]
         return chosen, {
             "anchor_mutation_strategy": strategy,
             "candidate_pool_size": len(candidates),
             "replacement_rank_score": round(float(chosen_score), 6),
+            "high_top_score": self._top_score_in_pool(pool),
+            "high_top_preferred": (
+                self._is_high_anchor_stratum(stratum)
+                and int(chosen['domain1_score']) == int(self._top_score_in_pool(pool) or chosen['domain1_score'])
+            ),
+            "high_top_candidate_count": len(self._top_score_items(pool)),
             **hidden_meta,
         }
 
@@ -1682,6 +1940,7 @@ class EvolutionOptimizer:
     def _score_prediction_metrics(self, y_true: List[int], y_pred: List[int]) -> Dict[str, Any]:
         score_min = int(self.config['data']['score_min'])
         score_max = int(self.config['data']['score_max'])
+        high_threshold = _adaptive_high_score_threshold(self.config, y_true)
         scores = list(range(score_min, score_max + 1))
         n = max(1, len(y_true))
         true_counts = {str(s): 0 for s in scores}
@@ -1699,6 +1958,25 @@ class EvolutionOptimizer:
         errors = [int(p) - int(t) for t, p in zip(y_true, y_pred)]
         true_mean = float(np.mean(y_true)) if y_true else 0.0
         pred_mean = float(np.mean(y_pred)) if y_pred else 0.0
+        high_pairs = [(int(t), int(p)) for t, p in zip(y_true, y_pred) if int(t) >= high_threshold]
+        pred_high_count = sum(1 for p in y_pred if int(p) >= high_threshold)
+        true_high_count = len(high_pairs)
+        high_recall = (
+            sum(1 for _, p in high_pairs if p >= high_threshold) / true_high_count
+            if true_high_count else 1.0
+        )
+        high_mean_pred = float(np.mean([p for _, p in high_pairs])) if high_pairs else 0.0
+        high_pred_bias = (
+            high_mean_pred - float(np.mean([t for t, _ in high_pairs]))
+            if high_pairs else 0.0
+        )
+        max_true_count = sum(1 for t in y_true if int(t) == score_max)
+        max_pred_count = sum(1 for p in y_pred if int(p) == score_max)
+        max_score_recall = (
+            sum(1 for t, p in zip(y_true, y_pred) if int(t) == score_max and int(p) == score_max)
+            / max_true_count
+            if max_true_count else 1.0
+        )
         return {
             "true_counts": true_counts,
             "pred_counts": pred_counts,
@@ -1709,6 +1987,15 @@ class EvolutionOptimizer:
             "pred_bias": pred_mean - true_mean,
             "mae": float(np.mean([abs(x) for x in errors])) if errors else 0.0,
             "pred_span": int(max(y_pred) - min(y_pred)) if y_pred else 0,
+            "high_score_threshold": high_threshold,
+            "true_high_count": int(true_high_count),
+            "pred_high_count": int(pred_high_count),
+            "high_recall": float(high_recall),
+            "high_mean_pred": float(high_mean_pred),
+            "high_pred_bias": float(high_pred_bias),
+            "max_score_true_count": int(max_true_count),
+            "max_score_pred_count": int(max_pred_count),
+            "max_score_recall": float(max_score_recall),
         }
 
     def _raw_distribution_penalty(self, metrics: Dict[str, Any]) -> float:
@@ -1735,10 +2022,21 @@ class EvolutionOptimizer:
             0.0,
             float(metrics.get("pred_collapse_ratio", 0.0)) - collapse_threshold,
         )
+        high_recall_floor = float(evo_cfg.get("raw_high_recall_floor", 0.30))
+        high_recall_gap = max(0.0, high_recall_floor - float(metrics.get("high_recall", 0.0)))
+        high_bias_floor = float(evo_cfg.get("raw_high_bias_floor", -1.0))
+        high_bias_gap = max(0.0, high_bias_floor - float(metrics.get("high_pred_bias", 0.0)))
+        max_score_required = bool(evo_cfg.get("raw_require_max_score_when_present", True))
+        max_score_gap = 0.0
+        if max_score_required and int(metrics.get("max_score_true_count", 0) or 0) > 0:
+            max_score_gap = max(0.0, 1.0 - float(metrics.get("max_score_recall", 0.0)))
         return (
             float(evo_cfg.get("raw_distribution_penalty_weight", 0.15)) * tv_excess
             + float(evo_cfg.get("raw_bias_penalty_weight", 0.05)) * bias_excess
             + float(evo_cfg.get("raw_collapse_penalty_weight", 0.10)) * collapse_excess
+            + float(evo_cfg.get("raw_high_recall_penalty_weight", 0.12)) * high_recall_gap
+            + float(evo_cfg.get("raw_high_bias_penalty_weight", 0.04)) * high_bias_gap
+            + float(evo_cfg.get("raw_max_score_recall_penalty_weight", 0.03)) * max_score_gap
         )
 
     def _apply_raw_guard(
@@ -1777,6 +2075,13 @@ class EvolutionOptimizer:
                 reasons.append("raw_adjusted_below_best_margin")
             if dist_penalty > max_dist_penalty:
                 reasons.append("pace_distribution_penalty_high")
+            raw_metrics = pop_snapshot[idx].get("raw_prediction_metrics", {})
+            high_recall_floor = float(self.config.get('evolution', {}).get("raw_high_recall_floor", 0.30))
+            high_bias_floor = float(self.config.get('evolution', {}).get("raw_high_bias_floor", -1.0))
+            if float(raw_metrics.get("high_recall", 1.0) or 0.0) < high_recall_floor:
+                reasons.append("raw_high_recall_low")
+            if float(raw_metrics.get("high_pred_bias", 0.0) or 0.0) < high_bias_floor:
+                reasons.append("raw_high_underprediction")
             feasible = len(reasons) == 0
             if feasible:
                 feasible_indices.append(idx)
@@ -1798,6 +2103,41 @@ class EvolutionOptimizer:
                 )
             pop_snapshot[idx]['protocol_quality'] = selection_scores[idx]
         return selection_scores, triggered, feasible_indices
+
+    def _select_elite_indices(self, selection_scores: List[float], n_elite: int) -> List[int]:
+        n_elite = max(1, min(int(n_elite), len(self.population)))
+        ranked = sorted(range(len(selection_scores)), key=lambda i: float(selection_scores[i]), reverse=True)
+        selected: List[int] = []
+        seen_anchor_fps = set()
+        seen_instruction_fps = set()
+        min_score_gap = float(self.config.get('evolution', {}).get("elite_diversity_max_score_gap", 0.20))
+        best_score = float(selection_scores[ranked[0]]) if ranked else 0.0
+
+        for idx in ranked:
+            ind = self.population[idx]
+            anchor_fp = tuple(ex['essay_id'] for ex in ind.static_exemplars)
+            instruction_fp = hashlib.md5(ind.instruction_text.encode("utf-8")).hexdigest()
+            if not selected:
+                selected.append(idx)
+                seen_anchor_fps.add(anchor_fp)
+                seen_instruction_fps.add(instruction_fp)
+                continue
+            if float(selection_scores[idx]) < best_score - min_score_gap:
+                continue
+            if anchor_fp in seen_anchor_fps and instruction_fp in seen_instruction_fps:
+                continue
+            selected.append(idx)
+            seen_anchor_fps.add(anchor_fp)
+            seen_instruction_fps.add(instruction_fp)
+            if len(selected) >= n_elite:
+                break
+
+        for idx in ranked:
+            if len(selected) >= n_elite:
+                break
+            if idx not in selected:
+                selected.append(idx)
+        return selected[:n_elite]
 
     def _track_candidate(
         self,
@@ -1860,7 +2200,7 @@ class EvolutionOptimizer:
         else:
             induced_rubric = call_llm(prompt, temperature=temp, call_type="induction")
         print(f"  [Induction Done] Rubric Length {len(induced_rubric)}")
-        return _prepend_score_range_contract(induced_rubric, self.config)
+        return _normalize_score_rubric(induced_rubric, self.config)
 
     # [NEW] 分层采样
     def get_stratified_exemplars(self, n=3):
@@ -1941,7 +2281,8 @@ class EvolutionOptimizer:
                 f"  >> Ind {i:02d} Finished: Raw QWK = {qwk:.4f} "
                 f"| raw_adj={raw_adjusted:.4f} "
                 f"| tv={raw_metrics['tv_distance']:.3f} "
-                f"| bias={raw_metrics['pred_bias']:.3f}\n"
+                f"| bias={raw_metrics['pred_bias']:.3f} "
+                f"| high_recall={raw_metrics['high_recall']:.3f}\n"
             )
 
             ind_data = ind.to_dict()
@@ -1953,6 +2294,11 @@ class EvolutionOptimizer:
             ind_data['raw_pred_collapse_ratio'] = raw_metrics.get("pred_collapse_ratio")
             ind_data['raw_pred_bias'] = raw_metrics.get("pred_bias")
             ind_data['raw_mae'] = raw_metrics.get("mae")
+            ind_data['raw_high_score_threshold'] = raw_metrics.get("high_score_threshold")
+            ind_data['raw_high_recall'] = raw_metrics.get("high_recall")
+            ind_data['raw_high_pred_bias'] = raw_metrics.get("high_pred_bias")
+            ind_data['raw_pred_high_count'] = raw_metrics.get("pred_high_count")
+            ind_data['raw_max_score_recall'] = raw_metrics.get("max_score_recall")
             ind_data['raw_prediction_metrics'] = raw_metrics
             ind_data['pace_fitness'] = None
             ind_data['pace_raw_fitness'] = None
@@ -2190,10 +2536,11 @@ class EvolutionOptimizer:
 
         # 2. Evolve Rubrics（基于 raw-guarded selection_scores 选 elite）
         n_elite = self.config['evolution']['n_elite_evolve']
-        elites = [self.population[i] for i in np.argsort(selection_scores)[-n_elite:]]
+        elite_indices = self._select_elite_indices(selection_scores, n_elite)
+        elites = [self.population[i] for i in elite_indices]
 
         # 精英保留策略：保留 protocol_quality 最高的个体直接晋级
-        best_old_elite = elites[-1].clone()
+        best_old_elite = elites[0].clone()
         new_pop = [best_old_elite] # 精英保留策略：直接晋级下一代
         
         print("  Evolving Rubrics for Elites (Using Real Reflection)...")
@@ -2254,6 +2601,28 @@ class EvolutionOptimizer:
                         slot_selection_source = "random"
                     old_ex = child.static_exemplars[idx]
                     old_stratum = self._anchor_slot_name(idx) or self._get_stratum(old_ex)
+                    preserve_top_high = False
+                    if self._is_high_anchor_stratum(old_stratum) and len(child.static_exemplars) > 1:
+                        high_pool = list(getattr(self, 'anchor_slot_pools', {}).get(old_stratum, []))
+                        top_score = self._top_score_in_pool(high_pool)
+                        preserve_prob = float(
+                            self.config.get('evolution', {}).get("anchor_high_preserve_top_prob", 0.85)
+                        )
+                        if (
+                            top_score is not None
+                            and int(old_ex['domain1_score']) == int(top_score)
+                            and random.random() < max(0.0, min(1.0, preserve_prob))
+                        ):
+                            alternate_slots = [
+                                j for j in range(len(child.static_exemplars))
+                                if j != idx and not self._is_high_anchor_stratum(self._anchor_slot_name(j))
+                            ] or [j for j in range(len(child.static_exemplars)) if j != idx]
+                            if alternate_slots:
+                                idx = random.choice(alternate_slots)
+                                old_ex = child.static_exemplars[idx]
+                                old_stratum = self._anchor_slot_name(idx) or self._get_stratum(old_ex)
+                                slot_selection_source = f"{slot_selection_source}_preserve_high_top"
+                                preserve_top_high = True
                     exclude_ids = {ex['essay_id'] for ex in child.static_exemplars}
                     new_ex, replacement_meta = self._select_anchor_replacement(
                         child,
@@ -2273,6 +2642,7 @@ class EvolutionOptimizer:
                         "mutation_source": slot_selection_source,
                         "slot_selection_source": slot_selection_source,
                         "anchor_slot_name": old_stratum,
+                        "preserved_top_high_anchor": preserve_top_high,
                         "parent_trace": dict(parent_trace),
                     }
                     event.update(replacement_meta)
@@ -2324,6 +2694,7 @@ class EvolutionOptimizer:
             "pareto_best_idx": pareto_best_idx,
             "pareto_feasible_indices": pareto_feasible_indices,
             "raw_guard_triggered_indices": raw_guard_triggered,
+            "elite_indices": elite_indices,
         }
         self.history.append(curve_row)
         print(f"  [Gen {gen} Stats] Duration: {metrics['duration_sec']:.1f}s")
@@ -2616,7 +2987,7 @@ def main(config_path="configs/default.yaml", fold=0, resume_path=None):
     candidate_results = {}
     seen_signatures = {}
     final_pace_tokens = 0
-    final_pace_enabled = bool(pace_enabled and pace_evaluator is not None and pace_cfg.get('final_pace_calibrated', True))
+    final_pace_enabled = bool(pace_enabled and pace_evaluator is not None and pace_cfg.get('final_pace_calibrated', False))
 
     for label, candidate in candidates.items():
         if candidate is None:

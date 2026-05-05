@@ -30,6 +30,13 @@ evolution:
   n_static_exemplars: 4
   anchor_profile: "boundary"
   anchor_stratum_strategy: "score_band"
+  anchor_boundary_mode: "mid_and_high"
+  anchor_high_exact_top: true
+  anchor_high_min_count: 5
+  anchor_high_top_preference_prob: 0.75
+  anchor_high_top_bonus: 0.25
+  anchor_high_preserve_top_prob: 0.85
+  anchor_low_exact_floor: false
   anchor_mutation_strategy: "evidence_representative"
   anchor_mutation_candidate_pool: 8
   anchor_mutation_hidden_rerank: true
@@ -37,6 +44,7 @@ evolution:
   use_evidence_feedback: true
   use_evidence_anchor_slot: true
   n_elite_evolve: 1
+  elite_diversity_max_score_gap: 0.20
   n_error_cases: 3
   max_workers: 1
   evolve_instruction: true
@@ -47,6 +55,13 @@ evolution:
   raw_bias_threshold: 1.5
   raw_bias_penalty_weight: 0.05
   raw_collapse_penalty_weight: 0.10
+  raw_high_score_quantile: 0.75
+  raw_high_recall_floor: 0.30
+  raw_high_recall_penalty_weight: 0.12
+  raw_high_bias_floor: -1.0
+  raw_high_bias_penalty_weight: 0.04
+  raw_require_max_score_when_present: true
+  raw_max_score_recall_penalty_weight: 0.03
 
 llm:
   temperature_scoring: 0.0
@@ -79,7 +94,7 @@ pace:
   max_protocol_quality_lift: 0.02
   pace_guidance_weight: 0.00
   anchor_guidance_weight: 0.05
-  final_pace_calibrated: true
+  final_pace_calibrated: false
   calib_split_ratio: 0.5
   alpha: 0.60
   beta: 0.25

@@ -1,4 +1,4 @@
-# Ablation: PACE evidence vector zeros raw-score-derived features.
+# Phase 4 full-fold run: raw-direct WISE-PACE protocol evolution.
 
 model:
   name: "models/Meta-Llama-3.1-8B-Instruct"
@@ -70,15 +70,12 @@ llm:
   max_exemplar_length: 400
 
 output:
-  verbose: true
+  verbose: false
 
 debug:
-  enabled: true
+  enabled: false
   stratified: true
   seed: 42
-  n_train: 240
-  n_val: 128
-  n_test: 128
 
 pace:
   enabled: true
@@ -107,7 +104,7 @@ pace:
   lambda_qwk: 0.25
   use_compact_evidence: true
   use_enhanced_evidence: true
-  evidence_include_raw_score: false
+  evidence_include_raw_score: true
   anchor_softmax_temperature: 0.10
   early_reject_enabled: true
   early_reject_mini_set_size: 8

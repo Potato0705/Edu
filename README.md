@@ -1,168 +1,334 @@
-# Edu / WISE-AES / PACE-AES
+# WISE-PACE
 
-本仓库用于自动作文评分（Automated Essay Scoring, AES）实验，基础代码来自 WISE-AES，并在此基础上新增了本地复现实验、PACE-AES Layer-2 校准器，以及 Prompt-Aware Automatic Recipe Selector（PARS）。
+WISE-PACE is a research prototype for LLM-based Automated Essay Scoring (AES).
+It extends WISE-AES from raw validation-score prompt evolution into hidden-evidence-guided
+scoring protocol evolution.
 
-## 项目目标
-
-当前实验重点是：在不改动 WISE Layer-1 的协议进化、anchor 选择和 raw scoring 逻辑的前提下，利用 Layer-1 产生的 hidden evidence，对 Local-WISE replay 的原始分数进行二阶段校准。
-
-核心对照包括：
-
-- `Local-WISE replay`：本地复现 WISE-AES 的 raw scoring 结果。
-- `PACE-AES`：基于 hidden evidence 的 Layer-2 ordinal calibrator。
-- `Manual Prompt-wise Recipe`：人工指定每个 prompt 的 Layer-2 recipe。
-- `PARS`：基于 train/val diagnostics 自动选择 recipe 的 prompt-aware selector。
-
-## 方法概览
-
-PACE-AES 的输入来自 WISE Layer-1 评分过程：
-
-- `y_raw`：Local-WISE 生成的原始分数。
-- `r_emb`：LLM hidden state 构成的 residual evidence 表示。
-- `z`：由 raw score、hidden evidence、anchor relation、ordinal features 和 uncertainty features 拼接得到的 Layer-2 输入向量。
-
-Layer-2 使用 CORAL-style ordinal calibrator 输出校准后的分数。训练目标包括 ordinal loss、soft-QWK surrogate，以及可选的 boundary-aware MMD separation loss。
-
-PARS 在每个 `prompt × fold` 上执行两阶段选择：
-
-1. `Rule Gate`：根据 score range、Local-WISE error pattern、raw score collapse、`r_emb` adjacent overlap 等 diagnostics 缩小候选 recipe。
-2. `Inner-Val Selection`：只用 train/val，在候选 recipe 中按 QWK 选择；当 QWK 差距小于 tolerance 时，优先 MAE 更低，再比较 ACC 和 recipe 简单度。
-
-该流程不使用 test label 做选择，test set 只用于最终报告。
-
-## 目录结构
+The current project objective is:
 
 ```text
+Find the best scoring protocol P* = <I*, E*>
+
+I: scoring instruction / evolved rubric
+E: reference anchors / static exemplars
+M: local target LLM used for both scoring and hidden representation extraction
+```
+
+The final success metric is still the raw score produced by the LLM under the evolved
+protocol `<I*, E*>`. PACE is used as a protocol-selection and evolution signal, not as the
+final test-time post-processing calibrator.
+
+## Current Status
+
+Current implementation status:
+
+- Local model backend is enabled; OpenRouter is no longer required for the main experiments.
+- Scoring, reflection, rewrite, induction, hidden representation extraction, and PACE fitness all run through the local Llama backend.
+- PACE is used during evolution to evaluate candidate protocols with hidden evidence, anchor geometry, stability, and cost signals.
+- Final PACE-calibrated inference is disabled by default, because the research target is better raw LLM scoring under `<I*, E*>`, not a stronger post-hoc calibrator.
+- Anchor selection and mutation are score-band based and designed to generalize across ASAP prompts P1-P8, not only P1.
+- Training curves, generation snapshots, anchor mutation logs, and final candidate comparisons are saved for diagnosis.
+
+Latest single full-fold run:
+
+```text
+Config: configs/phase4_full_fold.yaml
+Prompt / fold: ASAP P1 fold 0
+Model: Meta-Llama-3.1-8B-Instruct local bf16
+Runtime: 865.6 minutes on RTX 5090 32GB
+Validation primary QWK: 0.5219
+Raw test QWK: 0.4780
+Raw test MAE: 1.3445
+Final PACE tokens: 0
+```
+
+Main diagnosis from this run:
+
+- The best raw validation protocol appeared in generation 1 and survived later generations.
+- PACE/protocol quality improved slightly, but raw validation QWK did not continue rising.
+- High-score prediction remains the biggest weakness. On P1 test, score 12 recall was only 1/14.
+- The method is running end-to-end, but it is not yet mature enough for expensive full multi-fold experiments without further improving high-score handling and mutation effectiveness.
+
+## Method Logic Chain
+
+WISE-PACE follows this logic:
+
+```text
+1. Build a candidate protocol P = <I, E>
+2. Use local LLM M to score validation essays under P
+3. Compute raw validation QWK and raw distribution diagnostics
+4. Extract hidden states from M under the same scoring context
+5. Build an evidence vector z from raw score, hidden geometry, anchor relations, uncertainty, and stability signals
+6. Train a small PACE probe on calibration items
+7. Evaluate top candidate protocols on held-out fitness items
+8. Combine raw QWK, guarded PACE signal, anchor geometry, and protocol-quality guards
+9. Select elite protocols
+10. Mutate I and E using error cases and hidden-evidence diagnostics
+11. Repeat for several generations
+12. Before test evaluation, select candidate protocols using validation-only signals
+13. Evaluate selected candidate(s) on test with raw LLM scoring
+```
+
+The key design principle is:
+
+```text
+PACE may guide protocol evolution.
+PACE must not become the final scoring model.
+```
+
+This avoids the failure mode where the project becomes "a strong calibrator after WISE-AES"
+instead of "a better way to find I* and E*".
+
+## Protocol Definition
+
+A protocol is:
+
+```text
+P = <I, E>
+```
+
+where:
+
+- `I` is the scoring instruction, including the evolved rubric, score range contract, and operational calibration rules.
+- `E` is a fixed-size set of reference anchors, each represented by an essay and its known score.
+
+The raw scoring function is:
+
+```text
+y_raw = M(x | I, E)
+```
+
+The target optimization problem is:
+
+```text
+P* = argmax_P QWK(y_raw(P), y)
+```
+
+PACE changes how candidate protocols are selected and mutated during search. It does not replace
+`y_raw` as the final answer.
+
+## Scoring-Context Encoding
+
+Hidden representations are extracted with a shared scoring-context template so target essays and
+anchor essays are comparable.
+
+For a target essay:
+
+```text
+Scoring Instruction:
+<I>
+
+Score Range:
+<score_min>-<score_max>
+
+Reference Anchors:
+Score: <low_score>
+Essay: <e_low>
+
+Score: <mid_score>
+Essay: <e_mid>
+
+Score: <high_score>
+Essay: <e_high>
+
+Essay to Represent:
+<x>
+
+Representation Target:
+Encode the essay to be scored.
+```
+
+For an anchor essay:
+
+```text
+Scoring Instruction:
+<I>
+
+Score Range:
+<score_min>-<score_max>
+
+Reference Anchors:
+Score: <low_score>
+Essay: <e_low>
+
+Score: <mid_score>
+Essay: <e_mid>
+
+Score: <high_score>
+Essay: <e_high>
+
+Essay to Represent:
+<e_low>
+
+Known Score:
+<low_score>
+
+Representation Target:
+Encode this reference essay as a low-score anchor.
+```
+
+The current implementation uses mean-pooled last-layer hidden states over the essay span whenever
+span localization is available, falling back to robust sequence pooling when necessary.
+
+## Evidence Vector z
+
+The evidence vector `z` is a compact protocol-quality feature vector. It is built from:
+
+- Raw score features: raw predicted score, normalized score, distance to score boundaries.
+- Hidden state features: target representation statistics and projected hidden information.
+- Anchor relation features: distance or similarity from target essay to low/mid/high anchors.
+- Ordinal geometry features: whether the target is closer to anchors whose scores match the raw prediction.
+- Score-consistency features: agreement between raw score and anchor-relative evidence.
+- Distribution/stability features: collapse ratio, prediction bias, TV distance, high-score recall.
+- Optional enhanced evidence features: extra diagnostics used by PACE and mutation feedback.
+
+The exact feature layout lives in:
+
+```text
+pace/pace_fitness.py
+```
+
+Current design note: `z` is useful enough for selection diagnostics, but it is still a research
+component. The next improvement should make `z` more explicitly decomposed into named feature
+blocks and log per-block contribution to protocol selection.
+
+## Evolution of I and E
+
+### Instruction I
+
+The instruction evolves through local-LLM reflection and rewrite:
+
+```text
+validation errors + evidence diagnostics -> reflection feedback -> rewritten rubric
+```
+
+Important guards:
+
+- Score range normalization keeps rubrics on the dataset score scale.
+- Rubrics are treated as holistic ordinal scoring instructions, not point-sum checklists.
+- The final score must be an integer inside the dataset score range.
+- Operational calibration text is appended to reduce score-scale drift.
+
+### Anchors E
+
+Anchor evolution is score-band based:
+
+```text
+low anchor
+boundary anchor near mid/high score bands
+boundary anchor near high score bands
+high/top anchor
+```
+
+The implementation avoids P1-only rules. Score bands are derived from the current prompt's
+`score_min`, `score_max`, and observed train scores.
+
+High-score handling includes:
+
+- Preference for observed top-score anchors when enough examples exist.
+- A top-score preservation probability during mutation.
+- Extra penalties when high-score recall or max-score recall collapses.
+
+Anchor mutation can use hidden-evidence representative selection:
+
+```text
+candidate pool from same score band
+-> evidence/diagnostic scoring
+-> optional hidden rerank
+-> replacement anchor
+```
+
+## Selection and Guards
+
+Candidate selection is raw-first and guarded:
+
+```text
+raw_val_qwk
+raw_adjusted_qwk
+PACE fitness on top candidates
+anchor geometry
+protocol quality
+distribution guard
+high-score guard
+max-score guard
+overfit guard
+```
+
+The selection policy is intentionally conservative:
+
+- A candidate with strong PACE but weak raw validation performance should not replace the raw-best protocol.
+- PACE can provide a small lift when raw validation is competitive.
+- Degenerate PACE results fall back to raw scoring.
+- Candidate protocols are selected before test evaluation using validation-only signals.
+
+Final evaluation compares candidate families such as:
+
+```text
+best_raw_val
+best_raw_guarded
+best_pace_guarded
+best_pareto
+```
+
+Duplicate candidates are detected and reported.
+
+## Repository Layout
+
+```text
+wise_aes.py                         Main WISE-PACE evolution runner
 pace/
-  calibration.py                         # Layer-2 ordinal calibrator、decode、QWK/MMD loss
-  evidence.py                            # hidden evidence / feature vector 构建
-  llm_backend.py                         # 本地 Llama backend
-  datasets/asap.py                       # ASAP 数据加载与 fold split
-  experiments/
-    build_anchor_cache.py                # anchor hidden cache 构建
-    train_pace_calibrator.py             # 单个 prompt/fold 的 Layer-2 训练
-    sweep_pace_calibrator.py             # 参数 sweep
-    run_auto_recipe_selector.py          # PARS 自动 recipe 选择入口
-  selector/
-    recipe_library.py                    # R0-R7 固定 recipe library
-    diagnostics.py                       # prompt-level diagnostics
-    rule_gate.py                         # rule-gated candidate selection
-    auto_select.py                       # inner-val selection + final retrain/eval
+  llm_backend.py                    Local Llama backend for generation and hidden states
+  pace_fitness.py                   PACE evidence, calibrator probe, fitness, diagnostics
 configs/
-  selector_default.yaml                  # selector 默认配置，默认关闭
+  default.yaml                      Backward-compatible default config
+  phase4_smoke.yaml                 Fast smoke test
+  phase4_evidence_mutation.yaml     Stability/pilot experiment config
+  phase4_full_fold.yaml             Single full-fold experiment config
+logs/                               Local experiment logs, ignored by git
+models/                             Local models, ignored by git
+data/                               ASAP data, ignored by git
 ```
 
-大型实验产物不会进入 Git：
+## Running Experiments
 
-- `models/`
-- `data/`
-- `cache/`
-- `logs/`
-- `results/`
-
-## 环境
-
-项目使用 Python 3.12。基础依赖见 `pyproject.toml`。
+Smoke test:
 
 ```bash
-uv sync
+python wise_aes.py --config configs/phase4_smoke.yaml --fold 0
 ```
 
-服务器离线运行时通常需要：
+Stability pilot:
 
 ```bash
-export TRANSFORMERS_OFFLINE=1
-export HF_DATASETS_OFFLINE=1
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+python wise_aes.py --config configs/phase4_evidence_mutation.yaml --fold 0
 ```
 
-## 常用命令
-
-### 构建 anchor cache
+Single full fold:
 
 ```bash
-python -m pace.experiments.build_anchor_cache \
-  --model-path /path/to/Meta-Llama-3.1-8B-Instruct \
-  --logs-root /path/to/logs \
-  --prompts 1 2 3 4 5 6 7 8 \
-  --folds 0 1 2 3 4 \
-  --cache-root /path/to/cache/pace_anchor_cache \
-  --dataset asap
+python wise_aes.py --config configs/phase4_full_fold.yaml --fold 0
 ```
 
-### 训练单个 Layer-2 calibrator
+On a 32GB GPU, current full-fold P1 runtime is about 14-15 hours with the local Llama-3.1-8B backend.
 
-```bash
-python -u -m pace.experiments.train_pace_calibrator \
-  --model-path /path/to/Meta-Llama-3.1-8B-Instruct \
-  --logs-root /path/to/logs \
-  --prompt 7 \
-  --fold 1 \
-  --cache-root /path/to/cache/pace_anchor_cache \
-  --out-dir /path/to/results/pace_fixed_recipe_5fold/p7_mmd_v1 \
-  --epochs 25 \
-  --batch-size 32 \
-  --lr 3e-4 \
-  --weight-decay 1e-4 \
-  --hidden-dim 512 \
-  --dropout 0.1 \
-  --lambda-qwk 2.0 \
-  --decode-mode blend_round \
-  --blend-alpha 0.65 \
-  --max-delta-frac 0.10 \
-  --mmd-enable \
-  --lambda-sep 0.05 \
-  --mmd-sample-mode boundary_only \
-  --mmd-boundary-mode raw_boundary \
-  --mmd-raw-boundary-epsilon 2.0 \
-  --mmd-num-bands 3 \
-  --mmd-project-dim 128
-```
+## Current Research Risks
 
-### 运行 PARS
+The model is not yet final. Known risks:
 
-PARS 只读取已有的 `evidence_cache.pt`，不会重新调用 WISE Layer-1。
+- High-score and max-score recall are still weak.
+- Mutation often fails to improve beyond the first strong protocol.
+- PACE signals can improve protocol quality without improving raw test QWK.
+- `z` needs clearer feature-block attribution.
+- The current result is only P1 fold 0; P1-P8 and multi-fold evidence are still required.
+- Baselines such as WISE-AES raw-only, OPRO-lite, APE-lite, and random/evidence ablations still need to be run systematically.
 
-```bash
-python -u -m pace.experiments.run_auto_recipe_selector \
-  --evidence-search-roots \
-    /path/to/results/pace_fixed_recipe_5fold \
-    /path/to/results/pace_struct_runs \
-    /path/to/results/pace_calibration_bf16 \
-  --out-dir /path/to/results/pars_v2_5fold \
-  --prompts 1 2 3 4 5 6 7 8 \
-  --folds 0 1 2 3 4 \
-  --mode pars \
-  --recipe-library v2 \
-  --epochs 25 \
-  --batch-size 32 \
-  --tie-qwk-tolerance 0.005 \
-  --device cuda
-```
+## Next Work
 
-主要输出：
+Highest-priority next steps:
 
-- `selector_features.csv`
-- `selector_decisions.csv`
-- `selector_summary.json`
-- `five_fold_main_results.csv`
-- `five_fold_main_results_by_prompt.csv`
-- `five_fold_main_results_overall.csv`
+1. Strengthen high-score and max-score anchor coverage without overfitting to P1.
+2. Improve mutation so child protocols can reliably outperform parents.
+3. Make `z` feature blocks explicit and log their contribution.
+4. Run raw-only and evidence-guided ablations under the same compute budget.
+5. Expand from P1 fold 0 to P1-P8 smoke/stability checks before full multi-fold training.
 
-## 当前 PARS v2 规则
-
-PARS v2 保留基础 recipe `R0-R4`，并为宽分域 raw-collapse 场景加入 `R5-R7`。
-
-关键约束：
-
-- `score_span < 20` 的 prompt 只允许选择 `R0/R1/R2`，避免 P1-P6 被误路由到 P7/P8 的 wide recipe。
-- `score_span >= 20` 的 prompt 才允许 `R3/R4/R5/R6/R7`。
-- 当 train/val 上出现 `raw_mode_share` 高或 `raw_std_frac` 低时，触发 raw-collapse gate，开放更强修正能力的 recipe。
-
-这个约束用于避免非宽分域 prompt 误选 blend/wide recipe，同时保留 P7/P8 的 collapse rescue 能力。
-
-## 注意事项
-
-- 不要提交 ASAP 原始数据、模型权重、cache 或实验输出。
-- `evidence_cache.pt` 是 PARS 的必要输入，但属于实验产物，默认不进 Git。
-- 完整 5-fold PARS 需要每个 `prompt × fold` 都已经生成对应的 `evidence_cache.pt`。
