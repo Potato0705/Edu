@@ -302,6 +302,50 @@ class ExperimentManager:
         with open(filename, 'w', encoding='utf-8') as f:
             json.dump(payload, f, ensure_ascii=False, indent=2)
 
+    def _csv_safe_value(self, value: Any) -> Any:
+        if isinstance(value, (dict, list, tuple)):
+            return json.dumps(value, ensure_ascii=False)
+        if isinstance(value, np.generic):
+            return value.item()
+        return value
+
+    def _write_csv_rows(self, relative_name: str, rows: List[Dict[str, Any]], append: bool = True) -> None:
+        if not rows:
+            return
+        path = self.exp_dir / relative_name
+        normalized = [
+            {str(k): self._csv_safe_value(v) for k, v in row.items()}
+            for row in rows
+        ]
+        existing_rows: List[Dict[str, Any]] = []
+        fieldnames: List[str] = []
+        if append and path.exists():
+            with open(path, "r", encoding="utf-8", newline="") as f:
+                reader = csv.DictReader(f)
+                fieldnames = list(reader.fieldnames or [])
+                existing_rows = list(reader)
+        for row in existing_rows + normalized:
+            for key in row.keys():
+                if key not in fieldnames:
+                    fieldnames.append(key)
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in existing_rows + normalized:
+                writer.writerow({k: row.get(k, "") for k in fieldnames})
+
+    def save_high_score_audit(self, rows: List[Dict[str, Any]]) -> None:
+        self._write_csv_rows("high_score_audit.csv", rows, append=True)
+
+    def save_candidate_high_score_summary(self, rows: List[Dict[str, Any]]) -> None:
+        self._write_csv_rows("candidate_high_score_summary.csv", rows, append=False)
+
+    def save_parent_child_audit(self, rows: List[Dict[str, Any]]) -> None:
+        self._write_csv_rows("parent_child_audit.csv", rows, append=True)
+
+    def save_mutation_effect_summary(self, rows: List[Dict[str, Any]]) -> None:
+        self._write_csv_rows("mutation_effect_summary.csv", rows, append=False)
+
     def save_final_results(self, best_ind, history, test_results=None):
         if best_ind is None:
             best_payload = None
@@ -315,6 +359,7 @@ class ExperimentManager:
         res = {
             **(best_payload or {}),
             "primary_candidate": test_results.get("primary_candidate") if test_results else None,
+            "config_snapshot": self.config,
             "history": history,
             "test_results": test_results
         }
@@ -681,6 +726,147 @@ def _adaptive_high_score_threshold(
     return threshold
 
 
+def _score_count_dict(values: List[int], score_min: int, score_max: int) -> Dict[str, int]:
+    counts = {str(s): 0 for s in range(int(score_min), int(score_max) + 1)}
+    for value in values:
+        key = str(int(value))
+        if key in counts:
+            counts[key] += 1
+    return counts
+
+
+def compute_high_score_audit(
+    y_true: List[int],
+    y_pred: List[int],
+    *,
+    score_min: int,
+    score_max: int,
+    high_score_threshold: int,
+) -> Dict[str, Any]:
+    """Compute high-tail diagnostics without requiring model state.
+
+    The same helper is used by runtime logging and offline tests, so the audit
+    definition stays stable across generation snapshots, final results, and
+    analysis scripts.
+    """
+    y_true = [int(x) for x in y_true]
+    y_pred = [int(x) for x in y_pred]
+    n = max(1, len(y_true))
+    true_counts = _score_count_dict(y_true, score_min, score_max)
+    pred_counts = _score_count_dict(y_pred, score_min, score_max)
+    true_probs = np.array([true_counts[str(s)] / n for s in range(score_min, score_max + 1)], dtype=float)
+    pred_probs = np.array([pred_counts[str(s)] / n for s in range(score_min, score_max + 1)], dtype=float)
+
+    high_true = [i for i, t in enumerate(y_true) if t >= high_score_threshold]
+    high_pred = [i for i, p in enumerate(y_pred) if p >= high_score_threshold]
+    high_tp = sum(1 for i in high_true if i < len(y_pred) and y_pred[i] >= high_score_threshold)
+    high_bias_vals = [
+        y_pred[i] - y_true[i]
+        for i in high_true
+        if i < len(y_pred)
+    ]
+
+    max_true = [i for i, t in enumerate(y_true) if t == score_max]
+    max_pred = [i for i, p in enumerate(y_pred) if p == score_max]
+    max_tp = sum(1 for i in max_true if i < len(y_pred) and y_pred[i] == score_max)
+
+    errors = [p - t for t, p in zip(y_true, y_pred)]
+    return {
+        "high_score_threshold": int(high_score_threshold),
+        "n_true_high": int(len(high_true)),
+        "n_pred_high": int(len(high_pred)),
+        "high_score_recall": float(high_tp / len(high_true)) if high_true else 1.0,
+        "high_score_precision": float(high_tp / len(high_pred)) if high_pred else (1.0 if not high_true else 0.0),
+        "high_score_bias": float(np.mean(high_bias_vals)) if high_bias_vals else 0.0,
+        "true_max_score": int(score_max),
+        "pred_max_score": int(max(y_pred)) if y_pred else None,
+        "n_true_max_score": int(len(max_true)),
+        "n_pred_max_score": int(len(max_pred)),
+        "max_score_recall": float(max_tp / len(max_true)) if max_true else 1.0,
+        "max_score_precision": float(max_tp / len(max_pred)) if max_pred else (1.0 if not max_true else 0.0),
+        "score_distribution_true": true_counts,
+        "score_distribution_pred": pred_counts,
+        "score_distribution_tv": float(0.5 * np.abs(pred_probs - true_probs).sum()),
+        "pred_collapse_ratio": float(pred_probs.max()) if len(pred_probs) else 0.0,
+        "true_mean": float(np.mean(y_true)) if y_true else 0.0,
+        "pred_mean": float(np.mean(y_pred)) if y_pred else 0.0,
+        "pred_bias": float(np.mean(errors)) if errors else 0.0,
+        "mae": float(np.mean([abs(x) for x in errors])) if errors else 0.0,
+        "pred_span": int(max(y_pred) - min(y_pred)) if y_pred else 0,
+    }
+
+
+def _max_score_contract_text(config: Dict[str, Any]) -> str:
+    evo_cfg = config.get("evolution", {})
+    if not bool(evo_cfg.get("max_score_contract_enabled", False)):
+        return ""
+    score_max = int(config["data"]["score_max"])
+    default_text = (
+        "The maximum score is attainable. Do not reserve the maximum score only for flawless essays. "
+        "If the essay is comparable to or stronger than the high-score anchor in content, organization, "
+        "and language use, assign a score near the top of the range, including the maximum score when appropriate."
+    )
+    text = str(evo_cfg.get("max_score_contract_text") or default_text).strip()
+    return text.replace("<score_max>", str(score_max))
+
+
+def choose_mutation_policy(
+    individual: Any,
+    pace_diagnostics: Optional[Dict[str, Any]],
+    config: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Rule-based first version of diagnostic-to-mutation routing."""
+    diagnostics = dict(pace_diagnostics or {})
+    dominant = str(diagnostics.get("dominant_error_type") or "")
+    raw_metrics = diagnostics.get("raw_prediction_metrics") or {}
+    high_floor = float(config.get("evolution", {}).get("raw_high_recall_floor", 0.30))
+    high_recall = float(raw_metrics.get("high_score_recall", raw_metrics.get("high_recall", 1.0)) or 0.0)
+    max_recall = float(raw_metrics.get("max_score_recall", 1.0) or 0.0)
+    suggested_slot = diagnostics.get("suggested_anchor_mutation_slot")
+
+    mutation_type = "general_reflection_mutation"
+    focus = "Improve the rubric using validation errors while preserving the score range contract."
+    if dominant == "under_score_high_hidden" or high_recall < high_floor or max_recall < 1.0:
+        mutation_type = "high_tail_instruction_mutation"
+        focus = (
+            "Strengthen high-score and maximum-score recognition. Clarify that strong essays comparable "
+            "to high anchors should receive top-band scores, including the maximum score when appropriate."
+        )
+        if suggested_slot is None:
+            suggested_slot = max(0, len(getattr(individual, "static_exemplars", []) or []) - 1)
+    elif dominant == "over_score_low_hidden":
+        mutation_type = "negative_constraint_mutation"
+        focus = "Add explicit deductions for weak content, organization, language control, and low-anchor similarity."
+        suggested_slot = 0 if suggested_slot is None else suggested_slot
+    elif dominant == "anchor_confusion":
+        mutation_type = "anchor_slot_mutation"
+        focus = "Replace or clarify the most confusing anchor slot so adjacent score bands separate better."
+    elif dominant == "reasoning_score_contradiction":
+        mutation_type = "score_mapping_mutation"
+        focus = "Force the final score to match the stated strengths, weaknesses, and anchor comparisons."
+    elif dominant == "raw_collapse":
+        mutation_type = "score_distribution_mutation"
+        focus = "Reduce score collapse by adding score-band diversity rules and adjacent-score decision tests."
+    elif dominant == "boundary_ambiguity":
+        mutation_type = "boundary_clarification_mutation"
+        focus = "Sharpen adjacent-score boundary criteria and near-miss top-band rules."
+
+    summary = diagnostics.get("pace_diagnostic_summary") or diagnostics.get("summary") or {}
+    evidence_summary = {
+        "dominant_error_type": dominant,
+        "summary": summary,
+        "high_score_recall": high_recall,
+        "max_score_recall": max_recall,
+        "suggested_anchor_mutation_slot": suggested_slot,
+    }
+    return {
+        "mutation_type": mutation_type,
+        "target_anchor_slot": suggested_slot,
+        "rubric_edit_focus": focus,
+        "evidence_summary_for_prompt": evidence_summary,
+    }
+
+
 def _stratified_debug_split(
     all_data: List[Dict],
     n_train: int,
@@ -812,6 +998,14 @@ Output ONLY the Rubric text. Do not output explanations."""
             "Remove incompatible point totals, percentages, letter grades, and decimal scores."
         )
 
+    def scoring_instruction_text(self) -> str:
+        contract = _max_score_contract_text(self.config)
+        if not contract:
+            return self.instruction_text
+        if contract.lower() in self.instruction_text.lower():
+            return self.instruction_text
+        return f"{self.instruction_text.rstrip()}\n\nMaximum-Score Attainable Contract:\n{contract}"
+
     def get_signature(self):
         # Fingerprint includes ordered anchors because Phase 2 uses low/mid/high slots.
         ex_payload = [
@@ -819,7 +1013,7 @@ Output ONLY the Rubric text. Do not output explanations."""
             for ex in self.static_exemplars
         ]
         content = json.dumps(
-            {"instruction": self.instruction_text, "anchors": ex_payload},
+            {"instruction": self.scoring_instruction_text(), "anchors": ex_payload},
             ensure_ascii=False,
             sort_keys=True,
         )
@@ -899,7 +1093,7 @@ Output ONLY the Rubric text. Do not output explanations."""
             req = ScoringRequest(
                 essay_id=essay_id,
                 essay_text=essay_text,
-                instruction=self.instruction_text,
+                instruction=self.scoring_instruction_text(),
                 static_exemplars=self.static_exemplars,
                 score_min=self.config['data']['score_min'],
                 score_max=self.config['data']['score_max'],
@@ -925,7 +1119,7 @@ Output ONLY the Rubric text. Do not output explanations."""
                 dynamic_exemplars = candidates[:self.config['rag']['n_selected']]
             
         base_prompt = self.SCORING_TEMPLATE.format(
-            instruction=self.instruction_text,
+            instruction=self.scoring_instruction_text(),
             static_ex=self._format_list(self.static_exemplars),
             dynamic_ex=self._format_list(dynamic_exemplars) if dynamic_exemplars else "(None)",
             essay=essay_text,
@@ -1171,12 +1365,24 @@ Return actionable rewrite guidance only. Preserve the score range contract.
             return _call_local_generate(prompt, call_type="reflection")
         return call_llm(prompt, temperature=temp, call_type="reflection")
 
-    def evolve_instruction(self, feedback):
+    def evolve_instruction(self, feedback, mutation_policy: Optional[Dict[str, Any]] = None):
         score_contract = self._score_range_contract()
+        mutation_policy = mutation_policy or {}
+        mutation_type = mutation_policy.get("mutation_type", "general_reflection_mutation")
+        rubric_focus = mutation_policy.get(
+            "rubric_edit_focus",
+            "Improve direct raw scoring quality while preserving the score range.",
+        )
+        policy_evidence = mutation_policy.get("evidence_summary_for_prompt", {})
         prompt = f"""Rewrite and improve the rubric based on the feedback.
 
 SCORE RANGE CONTRACT:
 {score_contract}
+
+MUTATION POLICY:
+- mutation_type: {mutation_type}
+- rubric_edit_focus: {rubric_focus}
+- evidence_summary: {json.dumps(policy_evidence, ensure_ascii=False)}
 
 FEEDBACK:
 {feedback}
@@ -1192,6 +1398,7 @@ Rewrite requirements:
 - Add high-score recognition rules when feedback shows underprediction of strong essays.
 - Add hidden-evidence-aware corrections when the feedback mentions over-score, under-score, anchor confusion, or reasoning-score contradiction.
 - Translate PACE teacher guidance into concrete score-band and boundary rules, but optimize direct raw final_score quality rather than post-hoc calibration.
+- Follow the mutation policy focus above; do not make unrelated rubric changes.
 - Keep the rubric concise enough to fit in an LLM grading prompt.
 
 OUTPUT ONLY THE NEW RUBRIC TEXT."""
@@ -1207,6 +1414,7 @@ OUTPUT ONLY THE NEW RUBRIC TEXT."""
             "fitness": self.fitness,
             "instruction_preview": self.instruction_text[:200] + "...",
             "full_instruction": self.instruction_text,
+            "effective_scoring_instruction": self.scoring_instruction_text(),
             "static_exemplar_ids": [ex['essay_id'] for ex in self.static_exemplars],
             "static_exemplar_scores": [ex['domain1_score'] for ex in self.static_exemplars]
         }
@@ -1237,6 +1445,7 @@ class EvolutionOptimizer:
 
         self.fitness_memo = {}  # [New] 全局 raw QWK 适应度缓存（仅缓存 raw，不缓存 combined）
         self.anchor_mutation_events = []
+        self.parent_child_audit_rows: List[Dict[str, Any]] = []
 
         # WISE-PACE
         self.pace_evaluator = pace_evaluator
@@ -1941,62 +2150,203 @@ class EvolutionOptimizer:
         score_min = int(self.config['data']['score_min'])
         score_max = int(self.config['data']['score_max'])
         high_threshold = _adaptive_high_score_threshold(self.config, y_true)
-        scores = list(range(score_min, score_max + 1))
-        n = max(1, len(y_true))
-        true_counts = {str(s): 0 for s in scores}
-        pred_counts = {str(s): 0 for s in scores}
-        for y in y_true:
-            key = str(int(y))
-            if key in true_counts:
-                true_counts[key] += 1
-        for y in y_pred:
-            key = str(int(y))
-            if key in pred_counts:
-                pred_counts[key] += 1
-        true_probs = np.array([true_counts[str(s)] / n for s in scores], dtype=float)
-        pred_probs = np.array([pred_counts[str(s)] / n for s in scores], dtype=float)
-        errors = [int(p) - int(t) for t, p in zip(y_true, y_pred)]
-        true_mean = float(np.mean(y_true)) if y_true else 0.0
-        pred_mean = float(np.mean(y_pred)) if y_pred else 0.0
-        high_pairs = [(int(t), int(p)) for t, p in zip(y_true, y_pred) if int(t) >= high_threshold]
-        pred_high_count = sum(1 for p in y_pred if int(p) >= high_threshold)
-        true_high_count = len(high_pairs)
-        high_recall = (
-            sum(1 for _, p in high_pairs if p >= high_threshold) / true_high_count
-            if true_high_count else 1.0
-        )
-        high_mean_pred = float(np.mean([p for _, p in high_pairs])) if high_pairs else 0.0
-        high_pred_bias = (
-            high_mean_pred - float(np.mean([t for t, _ in high_pairs]))
-            if high_pairs else 0.0
-        )
-        max_true_count = sum(1 for t in y_true if int(t) == score_max)
-        max_pred_count = sum(1 for p in y_pred if int(p) == score_max)
-        max_score_recall = (
-            sum(1 for t, p in zip(y_true, y_pred) if int(t) == score_max and int(p) == score_max)
-            / max_true_count
-            if max_true_count else 1.0
+        audit = compute_high_score_audit(
+            y_true,
+            y_pred,
+            score_min=score_min,
+            score_max=score_max,
+            high_score_threshold=high_threshold,
         )
         return {
-            "true_counts": true_counts,
-            "pred_counts": pred_counts,
-            "tv_distance": float(0.5 * np.abs(pred_probs - true_probs).sum()),
-            "pred_collapse_ratio": float(pred_probs.max()) if len(pred_probs) else 0.0,
-            "true_mean": true_mean,
-            "pred_mean": pred_mean,
-            "pred_bias": pred_mean - true_mean,
-            "mae": float(np.mean([abs(x) for x in errors])) if errors else 0.0,
-            "pred_span": int(max(y_pred) - min(y_pred)) if y_pred else 0,
-            "high_score_threshold": high_threshold,
-            "true_high_count": int(true_high_count),
-            "pred_high_count": int(pred_high_count),
-            "high_recall": float(high_recall),
-            "high_mean_pred": float(high_mean_pred),
-            "high_pred_bias": float(high_pred_bias),
-            "max_score_true_count": int(max_true_count),
-            "max_score_pred_count": int(max_pred_count),
-            "max_score_recall": float(max_score_recall),
+            **audit,
+            # Backward-compatible aliases used by existing logs/guards.
+            "true_counts": audit["score_distribution_true"],
+            "pred_counts": audit["score_distribution_pred"],
+            "tv_distance": audit["score_distribution_tv"],
+            "true_high_count": audit["n_true_high"],
+            "pred_high_count": audit["n_pred_high"],
+            "high_recall": audit["high_score_recall"],
+            "high_precision": audit["high_score_precision"],
+            "high_pred_bias": audit["high_score_bias"],
+            "max_score_true_count": audit["n_true_max_score"],
+            "max_score_pred_count": audit["n_pred_max_score"],
         }
+
+    def _anchor_high_score_audit(
+        self,
+        individual: PromptIndividual,
+        parent_trace: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        train_scores = [int(x["domain1_score"]) for x in self.train_data]
+        high_threshold = _adaptive_high_score_threshold(self.config, train_scores)
+        observed_top = max(train_scores) if train_scores else int(self.config["data"]["score_max"])
+        high_anchors = [
+            ex for ex in individual.static_exemplars
+            if int(ex.get("domain1_score", observed_top)) >= high_threshold
+        ]
+        parent_ids = set(parent_trace.get("parent_anchor_ids", []) if parent_trace else [])
+        return {
+            "high_anchor_ids": [ex.get("essay_id") for ex in high_anchors],
+            "high_anchor_scores": [int(ex.get("domain1_score", 0)) for ex in high_anchors],
+            "high_anchor_is_exact_top": [
+                int(ex.get("domain1_score", 0)) == int(observed_top)
+                for ex in high_anchors
+            ],
+            "high_anchor_word_count": [
+                len(str(ex.get("essay_text", "")).split())
+                for ex in high_anchors
+            ],
+            "high_anchor_distance_to_high_centroid": None,
+            "high_anchor_distance_to_mid_or_boundary_anchor": None,
+            "high_anchor_preserved_from_parent": [
+                ex.get("essay_id") in parent_ids for ex in high_anchors
+            ] if parent_trace else None,
+            "observed_top_score": int(observed_top),
+            "anchor_high_score_threshold": int(high_threshold),
+        }
+
+    def _candidate_high_score_audit_row(
+        self,
+        *,
+        generation: Optional[int],
+        individual_id: Optional[int],
+        label: str,
+        individual: PromptIndividual,
+        raw_metrics: Dict[str, Any],
+        parent_trace: Optional[Dict[str, Any]] = None,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        anchor_audit = self._anchor_high_score_audit(individual, parent_trace)
+        row = {
+            "generation": generation,
+            "individual_id": individual_id,
+            "label": label,
+            "signature": individual.get_signature(),
+            "raw_qwk": extra.get("raw_qwk") if extra else None,
+            "raw_adjusted_qwk": extra.get("raw_adjusted_qwk") if extra else None,
+            "protocol_quality": extra.get("protocol_quality") if extra else None,
+            "high_score_threshold": raw_metrics.get("high_score_threshold"),
+            "n_true_high": raw_metrics.get("n_true_high"),
+            "n_pred_high": raw_metrics.get("n_pred_high"),
+            "high_score_recall": raw_metrics.get("high_score_recall"),
+            "high_score_precision": raw_metrics.get("high_score_precision"),
+            "high_score_bias": raw_metrics.get("high_score_bias"),
+            "true_max_score": raw_metrics.get("true_max_score"),
+            "pred_max_score": raw_metrics.get("pred_max_score"),
+            "n_true_max_score": raw_metrics.get("n_true_max_score"),
+            "n_pred_max_score": raw_metrics.get("n_pred_max_score"),
+            "max_score_recall": raw_metrics.get("max_score_recall"),
+            "max_score_precision": raw_metrics.get("max_score_precision"),
+            "score_distribution_true": raw_metrics.get("score_distribution_true"),
+            "score_distribution_pred": raw_metrics.get("score_distribution_pred"),
+            "score_distribution_tv": raw_metrics.get("score_distribution_tv"),
+        }
+        row.update(anchor_audit)
+        if extra:
+            for key, value in extra.items():
+                row.setdefault(key, value)
+        return row
+
+    def _build_parent_child_audit_row(
+        self,
+        *,
+        generation: int,
+        child_index: int,
+        child: PromptIndividual,
+        child_snapshot: Dict[str, Any],
+        parent_trace: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        child_raw = child_snapshot.get("raw_fitness")
+        parent_raw = parent_trace.get("parent_raw_qwk")
+        child_high = child_snapshot.get("high_score_recall")
+        parent_high = parent_trace.get("parent_high_score_recall")
+        child_anchor_geom = child_snapshot.get("anchor_geometry_score")
+        parent_anchor_geom = parent_trace.get("parent_anchor_geometry_score")
+        return {
+            "generation": generation,
+            "child_index": child_index,
+            "parent_signature": parent_trace.get("parent_signature"),
+            "child_signature": child.get_signature(),
+            "parent_fitness": parent_trace.get("parent_protocol_quality"),
+            "child_fitness": child_snapshot.get("selection_fitness", child_snapshot.get("fitness")),
+            "parent_raw_qwk": parent_raw,
+            "child_raw_qwk": child_raw,
+            "delta_raw_qwk": (
+                float(child_raw) - float(parent_raw)
+                if isinstance(child_raw, (int, float)) and isinstance(parent_raw, (int, float))
+                else None
+            ),
+            "parent_raw_adjusted_qwk": parent_trace.get("parent_raw_adjusted_qwk"),
+            "child_raw_adjusted_qwk": child_snapshot.get("raw_adjusted_fitness"),
+            "parent_pace_probe_qwk": parent_trace.get("parent_pace_probe_qwk"),
+            "child_pace_probe_qwk": child_snapshot.get("pace_fitness"),
+            "parent_anchor_geometry_score": parent_anchor_geom,
+            "child_anchor_geometry_score": child_anchor_geom,
+            "delta_anchor_geometry": (
+                float(child_anchor_geom) - float(parent_anchor_geom)
+                if isinstance(child_anchor_geom, (int, float)) and isinstance(parent_anchor_geom, (int, float))
+                else None
+            ),
+            "parent_high_score_recall": parent_high,
+            "child_high_score_recall": child_high,
+            "delta_high_recall": (
+                float(child_high) - float(parent_high)
+                if isinstance(child_high, (int, float)) and isinstance(parent_high, (int, float))
+                else None
+            ),
+            "parent_max_score_recall": parent_trace.get("parent_max_score_recall"),
+            "child_max_score_recall": child_snapshot.get("max_score_recall"),
+            "mutation_type": parent_trace.get("mutation_type"),
+            "instruction_changed": parent_trace.get("instruction_changed"),
+            "anchors_changed": parent_trace.get("anchors_changed"),
+            "changed_anchor_slots": parent_trace.get("changed_anchor_slots"),
+            "changed_anchor_ids_before": parent_trace.get("changed_anchor_ids_before"),
+            "changed_anchor_ids_after": parent_trace.get("changed_anchor_ids_after"),
+            "dominant_error_type_used": parent_trace.get("dominant_error_type_used"),
+            "recommended_mutation_used": parent_trace.get("recommended_mutation_used"),
+            "target_anchor_slot": parent_trace.get("target_anchor_slot"),
+            "rubric_edit_focus": parent_trace.get("rubric_edit_focus"),
+        }
+
+    def _mutation_effect_summary(self, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        groups: Dict[str, List[Dict[str, Any]]] = {}
+        for row in rows:
+            mutation_type = str(row.get("mutation_type") or "unknown")
+            groups.setdefault(mutation_type, []).append(row)
+
+        def mean_numeric(items: List[Dict[str, Any]], key: str) -> Optional[float]:
+            vals = [
+                float(item[key]) for item in items
+                if isinstance(item.get(key), (int, float)) and np.isfinite(float(item[key]))
+            ]
+            return float(np.mean(vals)) if vals else None
+
+        summary = []
+        for mutation_type, items in sorted(groups.items()):
+            raw_deltas = [
+                float(item["delta_raw_qwk"]) for item in items
+                if isinstance(item.get("delta_raw_qwk"), (int, float))
+            ]
+            high_deltas = [
+                float(item["delta_high_recall"]) for item in items
+                if isinstance(item.get("delta_high_recall"), (int, float))
+            ]
+            summary.append({
+                "mutation_type": mutation_type,
+                "n_children": len(items),
+                "mean_delta_raw_qwk": mean_numeric(items, "delta_raw_qwk"),
+                "mean_delta_high_recall": mean_numeric(items, "delta_high_recall"),
+                "mean_delta_anchor_geometry": mean_numeric(items, "delta_anchor_geometry"),
+                "win_rate_vs_parent_raw_qwk": (
+                    float(np.mean([1.0 if x > 0 else 0.0 for x in raw_deltas]))
+                    if raw_deltas else None
+                ),
+                "win_rate_vs_parent_high_recall": (
+                    float(np.mean([1.0 if x > 0 else 0.0 for x in high_deltas]))
+                    if high_deltas else None
+                ),
+            })
+        return summary
 
     def _raw_distribution_penalty(self, metrics: Dict[str, Any]) -> float:
         evo_cfg = self.config.get('evolution', {})
@@ -2265,6 +2615,8 @@ class EvolutionOptimizer:
         raw_adjusted_scores = []
         pop_snapshot = []
         lineage_raw_deltas = []
+        high_score_audit_rows = []
+        parent_child_audit_rows = []
         true_scores_for_raw = [item['domain1_score'] for item in self.val_data]
 
         for i, ind in enumerate(self.population):
@@ -2285,6 +2637,7 @@ class EvolutionOptimizer:
                 f"| high_recall={raw_metrics['high_recall']:.3f}\n"
             )
 
+            parent_trace = getattr(ind, "parent_trace", None)
             ind_data = ind.to_dict()
             ind_data['individual_id'] = i
             ind_data['raw_fitness'] = qwk
@@ -2300,10 +2653,25 @@ class EvolutionOptimizer:
             ind_data['raw_pred_high_count'] = raw_metrics.get("pred_high_count")
             ind_data['raw_max_score_recall'] = raw_metrics.get("max_score_recall")
             ind_data['raw_prediction_metrics'] = raw_metrics
+            high_audit_row = self._candidate_high_score_audit_row(
+                generation=gen,
+                individual_id=i,
+                label=f"gen{gen}_ind{i:02d}",
+                individual=ind,
+                raw_metrics=raw_metrics,
+                parent_trace=parent_trace,
+                extra={
+                    "raw_qwk": qwk,
+                    "raw_adjusted_qwk": raw_adjusted,
+                    "protocol_quality": qwk,
+                    "raw_distribution_penalty": raw_penalty,
+                },
+            )
+            ind_data.update(high_audit_row)
+            high_score_audit_rows.append(high_audit_row)
             ind_data['pace_fitness'] = None
             ind_data['pace_raw_fitness'] = None
             ind_data['protocol_quality'] = qwk
-            parent_trace = getattr(ind, "parent_trace", None)
             if parent_trace:
                 parent_raw = parent_trace.get("parent_raw_qwk")
                 raw_delta = (
@@ -2315,6 +2683,15 @@ class EvolutionOptimizer:
                 ind_data['parent_child_raw_delta'] = raw_delta
                 if raw_delta is not None:
                     lineage_raw_deltas.append(raw_delta)
+                parent_child_audit_rows.append(
+                    self._build_parent_child_audit_row(
+                        generation=gen,
+                        child_index=i,
+                        child=ind,
+                        child_snapshot=ind_data,
+                        parent_trace=parent_trace,
+                    )
+                )
             ind_data['static_exemplar_strata'] = [
                 self._anchor_slot_name(slot) or self._get_stratum(ex)
                 for slot, ex in enumerate(ind.static_exemplars)
@@ -2400,6 +2777,9 @@ class EvolutionOptimizer:
                     'selection_distribution_penalty',
                     'evidence_dim',
                     'evidence_schema',
+                    'evidence_block_slices',
+                    'enabled_blocks',
+                    'block_dims',
                 ):
                     pop_snapshot[idx][key] = pace_result.get(key)
                 pop_snapshot[idx]['pace_diagnostics'] = pace_result.get('pace_diagnostics', [])
@@ -2435,6 +2815,25 @@ class EvolutionOptimizer:
             ind.fitness = selection_scores[i]
             pop_snapshot[i]['fitness'] = selection_scores[i]
             pop_snapshot[i]['selection_fitness'] = selection_scores[i]
+            if i < len(high_score_audit_rows):
+                high_score_audit_rows[i]["protocol_quality"] = pop_snapshot[i].get("protocol_quality")
+                high_score_audit_rows[i]["selection_fitness"] = selection_scores[i]
+                high_score_audit_rows[i]["pace_fitness"] = pop_snapshot[i].get("pace_fitness")
+                high_score_audit_rows[i]["anchor_geometry_score"] = pop_snapshot[i].get("anchor_geometry_score")
+
+        parent_child_audit_rows = []
+        for i, ind in enumerate(self.population):
+            parent_trace = pop_snapshot[i].get("parent_trace")
+            if parent_trace:
+                parent_child_audit_rows.append(
+                    self._build_parent_child_audit_row(
+                        generation=gen,
+                        child_index=i,
+                        child=ind,
+                        child_snapshot=pop_snapshot[i],
+                        parent_trace=parent_trace,
+                    )
+                )
 
         raw_best_idx = int(np.argmax(scores))
         raw_adjusted_best_idx = int(np.argmax(raw_adjusted_scores))
@@ -2519,12 +2918,20 @@ class EvolutionOptimizer:
         parent_eval_trace_by_object = {}
         for idx, ind in enumerate(self.population):
             pace_result = self.latest_pace_results.get(idx, {})
+            raw_metrics = pop_snapshot[idx].get("raw_prediction_metrics", {})
             parent_eval_trace_by_object[id(ind)] = {
                 "parent_generation": gen,
                 "parent_index": idx,
+                "parent_signature": ind.get_signature(),
+                "parent_anchor_ids": [ex.get("essay_id") for ex in ind.static_exemplars],
+                "parent_anchor_scores": [ex.get("domain1_score") for ex in ind.static_exemplars],
                 "parent_raw_qwk": float(scores[idx]),
                 "parent_raw_adjusted_qwk": float(raw_adjusted_scores[idx]),
                 "parent_protocol_quality": float(protocol_quality_scores[idx]),
+                "parent_pace_probe_qwk": pace_result.get("pace_qwk") if pace_result else None,
+                "parent_anchor_geometry_score": pace_result.get("anchor_geometry_score") if pace_result else None,
+                "parent_high_score_recall": raw_metrics.get("high_score_recall"),
+                "parent_max_score_recall": raw_metrics.get("max_score_recall"),
                 "parent_pace_teacher_guidance": self._pace_teacher_guidance(pace_result) if pace_result else [],
                 "parent_dominant_error_type": pace_result.get("dominant_error_type") if pace_result else None,
                 "parent_suggested_anchor_slot": pace_result.get("suggested_anchor_mutation_slot") if pace_result else None,
@@ -2552,13 +2959,25 @@ class EvolutionOptimizer:
         if not evolve_instr:
              print("  [Config] Instruction evolution DISABLED. Skipping reflection/rewrite.")
 
-        for elite in elites:
+        for elite_idx, elite in zip(elite_indices, elites):
+            pace_diag = dict(self.latest_pace_results.get(elite_idx, {}))
+            pace_diag["raw_prediction_metrics"] = pop_snapshot[elite_idx].get("raw_prediction_metrics", {})
+            mutation_policy = choose_mutation_policy(elite, pace_diag, self.config)
+            elite.mutation_policy = mutation_policy
+            parent_eval_trace_by_object[id(elite)].update({
+                "mutation_type": mutation_policy.get("mutation_type"),
+                "target_anchor_slot": mutation_policy.get("target_anchor_slot"),
+                "rubric_edit_focus": mutation_policy.get("rubric_edit_focus"),
+                "dominant_error_type_used": pace_diag.get("dominant_error_type"),
+                "recommended_mutation_used": True,
+            })
             elite.evidence_feedback = self._evidence_feedback_for(elite)
+            elite.evidence_feedback["mutation_policy"] = mutation_policy
             # 这里是修改原始 elite 对象的引用
             if evolve_instr:
                 real_feedback = elite.generate_real_feedback(self.val_data)
                 print(f"    [Feedback] {real_feedback[:100]}...")
-                new_text = elite.evolve_instruction(real_feedback)
+                new_text = elite.evolve_instruction(real_feedback, mutation_policy)
                 elite.instruction_text = new_text 
             mutated_parents.append(elite)
             
@@ -2577,14 +2996,24 @@ class EvolutionOptimizer:
             parent_trace = dict(parent_eval_trace_by_object.get(id(parent), {}))
             parent_trace.update({
                 "instruction_mutated": bool(evolve_instr),
+                "instruction_changed": bool(evolve_instr),
                 "anchor_mutated": False,
+                "anchors_changed": False,
                 "anchor_mutation_source": None,
                 "anchor_mutation_slot": None,
+                "changed_anchor_slots": [],
+                "changed_anchor_ids_before": [],
+                "changed_anchor_ids_after": [],
             })
             
             if evolve_exemplars:
                 for _ in range(10): 
-                    suggested_slot = self._evidence_suggested_anchor_slot(parent)
+                    policy_slot = parent_trace.get("target_anchor_slot")
+                    suggested_slot = (
+                        int(policy_slot)
+                        if policy_slot is not None and str(policy_slot) != ""
+                        else self._evidence_suggested_anchor_slot(parent)
+                    )
                     evidence_slot_prob = float(
                         self.config.get('evolution', {}).get('evidence_anchor_slot_prob', 1.0)
                     )
@@ -2595,7 +3024,7 @@ class EvolutionOptimizer:
                     )
                     if use_evidence_slot:
                         idx = suggested_slot
-                        slot_selection_source = "evidence"
+                        slot_selection_source = "mutation_policy" if policy_slot is not None else "evidence"
                     else:
                         idx = random.randint(0, len(child.static_exemplars)-1)
                         slot_selection_source = "random"
@@ -2643,17 +3072,24 @@ class EvolutionOptimizer:
                         "slot_selection_source": slot_selection_source,
                         "anchor_slot_name": old_stratum,
                         "preserved_top_high_anchor": preserve_top_high,
+                        "mutation_type": parent_trace.get("mutation_type"),
+                        "dominant_error_type_used": parent_trace.get("dominant_error_type_used"),
+                        "recommended_mutation_used": parent_trace.get("recommended_mutation_used"),
                         "parent_trace": dict(parent_trace),
                     }
                     event.update(replacement_meta)
                     parent_trace.update({
                         "anchor_mutated": True,
+                        "anchors_changed": True,
                         "anchor_mutation_source": slot_selection_source,
                         "anchor_mutation_slot": idx,
                         "anchor_mutation_stratum": old_stratum,
                         "old_anchor_score": old_ex['domain1_score'],
                         "new_anchor_score": new_ex['domain1_score'],
                         "anchor_mutation_strategy": replacement_meta.get('anchor_mutation_strategy'),
+                        "changed_anchor_slots": [idx],
+                        "changed_anchor_ids_before": [old_ex['essay_id']],
+                        "changed_anchor_ids_after": [new_ex['essay_id']],
                     })
                     mutation_events.append(event)
                     print(
@@ -2709,6 +3145,13 @@ class EvolutionOptimizer:
                 f"+ Repr {metrics['pace_representation_tokens']})"
             )
         if EXP_MANAGER:
+            EXP_MANAGER.save_high_score_audit(high_score_audit_rows)
+            if parent_child_audit_rows:
+                self.parent_child_audit_rows.extend(parent_child_audit_rows)
+                EXP_MANAGER.save_parent_child_audit(parent_child_audit_rows)
+                EXP_MANAGER.save_mutation_effect_summary(
+                    self._mutation_effect_summary(self.parent_child_audit_rows)
+                )
             EXP_MANAGER.save_generation_snapshot(gen, pop_snapshot, metrics=metrics)
             EXP_MANAGER.save_training_curve(self.history)
         return best_snapshot
@@ -2789,28 +3232,36 @@ def main(config_path="configs/default.yaml", fold=0, resume_path=None):
     _set_global_seed(seed)
     print(f"[Main] Global seed set to {seed}")
 
-    # WISE-PACE: 本地后端初始化（pace.enabled=false 时跳过）
+    # Local backend can be used with or without PACE. Raw-only baselines set
+    # pace.enabled=false but keep llm.local_backend_enabled=true so scoring,
+    # induction, reflection, and rewrite remain local.
     pace_cfg = config.get('pace', {})
-    pace_enabled = pace_cfg.get('enabled', False)
+    llm_cfg = config.get('llm', {})
+    pace_enabled = bool(pace_cfg.get('enabled', False))
+    local_backend_enabled = bool(
+        pace_enabled or llm_cfg.get('local_backend_enabled', False)
+    )
     pace_evaluator = None
     calib_items = None
     fitness_items = None
-    if not pace_enabled:
-        LOCAL_BACKEND = None
 
-    if pace_enabled:
+    if local_backend_enabled:
         if not _PACE_AVAILABLE:
             raise ImportError(
                 "pace/ 模块不可用，请检查 pace/llm_backend.py 和 pace/pace_fitness.py 是否存在。"
             )
         model_path = pace_cfg.get('model_path', 'models/Meta-Llama-3.1-8B-Instruct')
-        print(f"[PACE] Loading LocalLlamaBackend from {model_path} ...")
+        print(f"[Local] Loading LocalLlamaBackend from {model_path} ...")
         LOCAL_BACKEND = LocalLlamaBackend(
             config=config,
             model_path=model_path,
             dtype=pace_cfg.get('dtype', 'bfloat16'),
             load_in_4bit=pace_cfg.get('load_in_4bit', False),
         )
+    else:
+        LOCAL_BACKEND = None
+
+    if pace_enabled:
         pace_fit_cfg = PaceFitnessConfig.from_config(config)
         pace_evaluator = PaceFitnessEvaluator(
             local_backend=LOCAL_BACKEND,
@@ -2985,6 +3436,7 @@ def main(config_path="configs/default.yaml", fold=0, resume_path=None):
     print(f"  [Config] Inference Rerank: {'ENABLED' if use_rerank_test else 'DISABLED'}")
     
     candidate_results = {}
+    final_high_score_rows = []
     seen_signatures = {}
     final_pace_tokens = 0
     final_pace_enabled = bool(pace_enabled and pace_evaluator is not None and pace_cfg.get('final_pace_calibrated', False))
@@ -3008,6 +3460,21 @@ def main(config_path="configs/default.yaml", fold=0, resume_path=None):
             [x['domain1_score'] for x in test_set],
             candidate.last_pred_scores,
         )
+        final_high_row = optimizer._candidate_high_score_audit_row(
+            generation=None,
+            individual_id=None,
+            label=label,
+            individual=candidate,
+            raw_metrics=raw_test_metrics,
+            parent_trace=getattr(candidate, "parent_trace", None),
+            extra={
+                "raw_qwk": raw_test_qwk,
+                "raw_adjusted_qwk": None,
+                "protocol_quality": val_score,
+                "validation_score": val_score,
+            },
+        )
+        final_high_score_rows.append(final_high_row)
         candidate.fitness = val_score
 
         pace_calibrated = None
@@ -3052,6 +3519,7 @@ def main(config_path="configs/default.yaml", fold=0, resume_path=None):
             "raw_test_qwk": float(raw_test_qwk),
             "raw_test_mae": raw_test_metrics.get("mae"),
             "raw_test_distribution_metrics": raw_test_metrics,
+            "high_score_audit": final_high_row,
             "pace_calibrated_test": pace_calibrated,
             "guarded_calibrated_test": guarded_calibrated,
             "instruction": candidate.instruction_text,
@@ -3087,6 +3555,7 @@ def main(config_path="configs/default.yaml", fold=0, resume_path=None):
     total_duration = time.time() - EXP_MANAGER.exp_start_time
     total_pace_tokens = _sum_generation_metric(EXP_MANAGER.gens_dir, "pace_tokens_total")
     total_tokens_all = EXP_MANAGER.total_tokens + total_pace_tokens + final_pace_tokens
+    EXP_MANAGER.save_candidate_high_score_summary(final_high_score_rows)
     print(f"\n{'='*20} Experiment Summary {'='*20}")
     print(f"Total Duration:      {total_duration / 60:.1f} minutes")
     print(f"Total Tokens:        {EXP_MANAGER.total_tokens}")
@@ -3111,6 +3580,12 @@ def main(config_path="configs/default.yaml", fold=0, resume_path=None):
             candidate_results.get(raw_primary_label, {})
             .get("raw_test_distribution_metrics", {})
             .get("pred_counts", {})
+        ),
+        "primary_high_score_audit": (
+            candidate_results.get(primary_label, {}).get("high_score_audit", {})
+        ),
+        "raw_primary_high_score_audit": (
+            candidate_results.get(raw_primary_label, {}).get("high_score_audit", {})
         ),
         "raw_primary_val_qwk": raw_primary_val_qwk,
         "candidate_results": candidate_results,

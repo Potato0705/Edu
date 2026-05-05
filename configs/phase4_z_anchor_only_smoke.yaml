@@ -1,4 +1,4 @@
-# Phase 4 full-fold run: raw-direct WISE-PACE protocol evolution.
+# Phase 4 smoke ablation: keep raw + anchor evidence blocks, zero all other z blocks.
 
 model:
   name: "models/Meta-Llama-3.1-8B-Instruct"
@@ -25,8 +25,8 @@ induction:
   official_criteria: "Evaluate the essay based on content, organization, and language use."
 
 evolution:
-  population_size: 4
-  n_generations: 3
+  population_size: 2
+  n_generations: 1
   n_static_exemplars: 4
   anchor_profile: "boundary"
   anchor_stratum_strategy: "score_band"
@@ -38,13 +38,12 @@ evolution:
   anchor_high_preserve_top_prob: 0.85
   anchor_low_exact_floor: false
   anchor_mutation_strategy: "evidence_representative"
-  anchor_mutation_candidate_pool: 12
+  anchor_mutation_candidate_pool: 8
   anchor_mutation_hidden_rerank: true
-  anchor_mutation_hidden_top_m: 4
+  anchor_mutation_hidden_top_m: 3
   use_evidence_feedback: true
   use_evidence_anchor_slot: true
-  evidence_anchor_slot_prob: 0.6
-  n_elite_evolve: 2
+  n_elite_evolve: 1
   elite_diversity_max_score_gap: 0.20
   n_error_cases: 3
   max_workers: 1
@@ -64,8 +63,6 @@ evolution:
   raw_require_max_score_when_present: true
   raw_max_score_recall_penalty_weight: 0.03
   max_score_contract_enabled: true
-  max_score_contract_text: |
-    The maximum score is attainable. Do not reserve the maximum score only for flawless essays. If the essay is comparable to or stronger than the high-score anchor in content, organization, and language use, assign a score near the top of the range, including the maximum score when appropriate.
 
 llm:
   local_backend_enabled: true
@@ -74,19 +71,22 @@ llm:
   max_exemplar_length: 400
 
 output:
-  verbose: false
+  verbose: true
 
 debug:
-  enabled: false
+  enabled: true
   stratified: true
   seed: 42
+  n_train: 120
+  n_val: 16
+  n_test: 16
 
 pace:
   enabled: true
   model_path: "models/Meta-Llama-3.1-8B-Instruct"
   load_in_4bit: false
   dtype: "bfloat16"
-  top_k_pace: 2
+  top_k_pace: 1
   include_raw_elite_buffer: 1
   raw_guard_enabled: true
   raw_guard_margin: 0.03
@@ -102,7 +102,7 @@ pace:
   beta: 0.25
   gamma: 0.10
   hidden_dim: 64
-  epochs: 10
+  epochs: 5
   lr: 0.001
   batch_size: 16
   lambda_qwk: 0.25
@@ -112,14 +112,14 @@ pace:
   evidence_blocks_enabled:
     raw: true
     anchor: true
-    reasoning: true
-    objective: true
-    uncertainty: true
-    stability: true
-    enhanced_extra: true
+    reasoning: false
+    objective: false
+    uncertainty: false
+    stability: false
+    enhanced_extra: false
   anchor_softmax_temperature: 0.10
   early_reject_enabled: true
-  early_reject_mini_set_size: 8
+  early_reject_mini_set_size: 4
   score_collapse_threshold: 0.75
   anchor_sep_threshold: 0.02
   early_qwk_threshold: -0.05
@@ -133,4 +133,4 @@ pace:
   collapse_penalty_weight: 0.15
   max_score_overprediction_threshold: 3.0
   max_score_penalty_weight: 0.03
-  evidence_diagnostics_top_n: 8
+  evidence_diagnostics_top_n: 5

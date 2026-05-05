@@ -81,6 +81,17 @@ class PaceFitnessConfig:
     collapse_penalty_weight: float = 0.15
     max_score_overprediction_threshold: float = 3.0
     max_score_penalty_weight: float = 0.03
+    evidence_blocks_enabled: Dict[str, bool] = field(
+        default_factory=lambda: {
+            "raw": True,
+            "anchor": True,
+            "reasoning": True,
+            "objective": True,
+            "uncertainty": True,
+            "stability": True,
+            "enhanced_extra": True,
+        }
+    )
 
     @classmethod
     def from_config(cls, cfg: dict) -> "PaceFitnessConfig":
@@ -116,6 +127,10 @@ class PaceFitnessConfig:
             collapse_penalty_weight=p.get("collapse_penalty_weight", 0.15),
             max_score_overprediction_threshold=p.get("max_score_overprediction_threshold", 3.0),
             max_score_penalty_weight=p.get("max_score_penalty_weight", 0.03),
+            evidence_blocks_enabled={
+                **cls().evidence_blocks_enabled,
+                **dict(p.get("evidence_blocks_enabled", {}) or {}),
+            },
         )
 
 
@@ -158,6 +173,14 @@ class PaceFitnessEvaluator:
 
     def evidence_schema(self, n_anchors: int = 3) -> List[str]:
         """Return the ordered feature names used by _build_evidence_bundle."""
+        blocks = self.evidence_blocks(n_anchors)
+        names: List[str] = []
+        for block_names in blocks.values():
+            names.extend(block_names)
+        return names
+
+    def evidence_blocks(self, n_anchors: int = 3) -> Dict[str, List[str]]:
+        """Return ordered evidence feature names grouped by semantic block."""
         roles = self._anchor_role_names(n_anchors)
         reasoning = [
             "reasoning_log_words",
@@ -205,7 +228,15 @@ class PaceFitnessEvaluator:
                 [f"anchor_cos_{role}" for role in roles]
                 + [f"anchor_l2_raw_{role}" for role in roles]
             )
-            return ["y_raw_norm"] + anchor + reasoning + objective + uncertainty
+            return {
+                "raw": ["y_raw_norm"],
+                "anchor": anchor,
+                "reasoning": reasoning,
+                "objective": objective,
+                "uncertainty": uncertainty,
+                "stability": [],
+                "enhanced_extra": [],
+            }
 
         anchor = (
             [f"anchor_cos_{role}" for role in roles]
@@ -225,10 +256,52 @@ class PaceFitnessEvaluator:
                 "anchor_hidden_raw_band_agreement",
             ]
         )
-        return raw + anchor + reasoning + objective + uncertainty
+        return {
+            "raw": raw,
+            "anchor": anchor,
+            "reasoning": reasoning,
+            "objective": objective,
+            "uncertainty": uncertainty,
+            "stability": [],
+            "enhanced_extra": [],
+        }
 
     def evidence_dim(self, n_anchors: int = 3) -> int:
         return len(self.evidence_schema(n_anchors))
+
+    def evidence_block_slices(self, n_anchors: int = 3) -> Dict[str, List[int]]:
+        blocks = self.evidence_blocks(n_anchors)
+        mapping: Dict[str, List[int]] = {}
+        offset = 0
+        for name, names in blocks.items():
+            mapping[name] = list(range(offset, offset + len(names)))
+            offset += len(names)
+        return mapping
+
+    def evidence_block_dims(self, n_anchors: int = 3) -> Dict[str, int]:
+        return {k: len(v) for k, v in self.evidence_block_slices(n_anchors).items()}
+
+    def enabled_evidence_blocks(self) -> Dict[str, bool]:
+        defaults = {
+            "raw": True,
+            "anchor": True,
+            "reasoning": True,
+            "objective": True,
+            "uncertainty": True,
+            "stability": True,
+            "enhanced_extra": True,
+        }
+        defaults.update(dict(self.config.evidence_blocks_enabled or {}))
+        return defaults
+
+    def evidence_metadata(self, n_anchors: int = 3) -> Dict[str, object]:
+        return {
+            "evidence_dim": self.evidence_dim(n_anchors),
+            "evidence_schema": self.evidence_schema(n_anchors),
+            "evidence_block_slices": self.evidence_block_slices(n_anchors),
+            "enabled_blocks": self.enabled_evidence_blocks(),
+            "block_dims": self.evidence_block_dims(n_anchors),
+        }
 
     # ------------------------------------------------------------------
     # 公共接口
@@ -302,7 +375,11 @@ class PaceFitnessEvaluator:
           anchor_inference_sec, calib_inference_sec,
           fitness_inference_sec, calibrator_train_sec
         """
-        instruction = protocol.instruction_text  # type: ignore[attr-defined]
+        instruction = (
+            protocol.scoring_instruction_text()
+            if hasattr(protocol, "scoring_instruction_text")
+            else protocol.instruction_text
+        )  # type: ignore[attr-defined]
         static_exemplars = protocol.static_exemplars  # type: ignore[attr-defined]
         usage_before = self.backend.usage_snapshot()
 
@@ -315,6 +392,7 @@ class PaceFitnessEvaluator:
             return self._fallback_result(extra=self._usage_payload(usage_before))
         anchor_sec = time.time() - t0
         evidence_schema = self.evidence_schema(anchor_hiddens.shape[0])
+        evidence_payload = self.evidence_metadata(anchor_hiddens.shape[0])
 
         early_sec = 0.0
         early_results: Optional[List[ScoringResult]] = None
@@ -355,6 +433,7 @@ class PaceFitnessEvaluator:
                         "n_fitness": len(early_results),
                         "evidence_dim": len(evidence_schema),
                         "evidence_schema": evidence_schema,
+                        **evidence_payload,
                         "scoring_forward_passes": len(early_results),
                         "representation_forward_passes": len(static_exemplars) + len(early_results),
                         "total_local_forward_passes": len(static_exemplars) + 2 * len(early_results),
@@ -393,6 +472,7 @@ class PaceFitnessEvaluator:
                 extra={
                     "evidence_dim": len(evidence_schema),
                     "evidence_schema": evidence_schema,
+                    **evidence_payload,
                     "anchor_inference_sec": round(anchor_sec, 2),
                     "calib_inference_sec": round(calib_sec, 2),
                     "total_pace_sec": round(anchor_sec + calib_sec, 2),
@@ -452,6 +532,7 @@ class PaceFitnessEvaluator:
                 extra={
                     "evidence_dim": len(evidence_schema),
                     "evidence_schema": evidence_schema,
+                    **evidence_payload,
                     "anchor_inference_sec": round(anchor_sec, 2),
                     "calib_inference_sec": round(calib_sec, 2),
                     "fitness_inference_sec": round(fitness_sec, 2),
@@ -526,6 +607,7 @@ class PaceFitnessEvaluator:
                 extra={
                     "evidence_dim": len(evidence_schema),
                     "evidence_schema": evidence_schema,
+                    **evidence_payload,
                     **self._usage_payload(usage_before),
                 }
             )
@@ -555,6 +637,7 @@ class PaceFitnessEvaluator:
             "local_usage": usage_delta,
             "evidence_dim": len(evidence_schema),
             "evidence_schema": evidence_schema,
+            **evidence_payload,
             "calibrator_probe_combined": calibrator_probe_combined,
             "pace_qwk_used_for_selection": False,
             "anchor_inference_sec": round(anchor_sec, 2),
@@ -583,7 +666,11 @@ class PaceFitnessEvaluator:
         eval_items: List[Dict],
     ) -> Dict:
         """Train PACE calibrator on calib_items and evaluate it on eval_items."""
-        instruction = protocol.instruction_text  # type: ignore[attr-defined]
+        instruction = (
+            protocol.scoring_instruction_text()
+            if hasattr(protocol, "scoring_instruction_text")
+            else protocol.instruction_text
+        )  # type: ignore[attr-defined]
         static_exemplars = protocol.static_exemplars  # type: ignore[attr-defined]
         usage_before = self.backend.usage_snapshot()
         total_start = time.time()
@@ -593,6 +680,7 @@ class PaceFitnessEvaluator:
             anchor_hiddens = self.compute_anchor_hiddens(static_exemplars, instruction)
             anchor_sec = time.time() - t0
             evidence_schema = self.evidence_schema(anchor_hiddens.shape[0])
+            evidence_payload = self.evidence_metadata(anchor_hiddens.shape[0])
         except Exception as e:
             print(f"    [PACE Final] anchor_hiddens failed: {e}.")
             return self._fallback_result(extra=self._usage_payload(usage_before))
@@ -624,6 +712,7 @@ class PaceFitnessEvaluator:
                     "_fallback_reason": "calib_too_small_or_uniform",
                     "evidence_dim": len(evidence_schema),
                     "evidence_schema": evidence_schema,
+                    **evidence_payload,
                     "anchor_inference_sec": round(anchor_sec, 2),
                     "calib_inference_sec": round(calib_sec, 2),
                     "total_pace_sec": round(time.time() - total_start, 2),
@@ -671,6 +760,7 @@ class PaceFitnessEvaluator:
                     "_fallback_reason": "eval_too_small",
                     "evidence_dim": len(evidence_schema),
                     "evidence_schema": evidence_schema,
+                    **evidence_payload,
                     "anchor_inference_sec": round(anchor_sec, 2),
                     "calib_inference_sec": round(calib_sec, 2),
                     "fitness_inference_sec": round(eval_sec, 2),
@@ -728,6 +818,7 @@ class PaceFitnessEvaluator:
             "essay_ids": eval_ids,
             "evidence_dim": len(evidence_schema),
             "evidence_schema": evidence_schema,
+            **evidence_payload,
             "anchor_inference_sec": round(anchor_sec, 2),
             "calib_inference_sec": round(calib_sec, 2),
             "fitness_inference_sec": round(eval_sec, 2),
@@ -871,6 +962,12 @@ class PaceFitnessEvaluator:
             raise ValueError(f"Evidence dim mismatch: got {z.numel()}, expected {expected_dim}")
         if not torch.isfinite(z).all():
             z = torch.nan_to_num(z, nan=0.0, posinf=10.0, neginf=-10.0)
+        enabled = self.enabled_evidence_blocks()
+        if not all(bool(v) for v in enabled.values()):
+            z = z.clone()
+            for block, indices in self.evidence_block_slices(n_anchors).items():
+                if not bool(enabled.get(block, True)) and indices:
+                    z[indices] = 0.0
         return z
 
     def compute_anchor_geometry(
@@ -1305,6 +1402,7 @@ class PaceFitnessEvaluator:
         extra: Optional[Dict] = None,
     ) -> Dict:
         """PACE cannot run; caller uses full-val raw QWK for selection."""
+        evidence_payload = self.evidence_metadata()
         result = {
             "pace_qwk": 0.0,
             "raw_qwk": raw_qwk,
@@ -1322,6 +1420,7 @@ class PaceFitnessEvaluator:
             "cost_penalty": 0.0,
             "evidence_dim": self.evidence_dim(),
             "evidence_schema": self.evidence_schema(),
+            **evidence_payload,
             "calibrator_probe_combined": 0.0,
             "pace_qwk_used_for_selection": False,
             "anchor_inference_sec": 0.0,

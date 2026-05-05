@@ -62,8 +62,12 @@ evolution:
   raw_high_bias_penalty_weight: 0.04
   raw_require_max_score_when_present: true
   raw_max_score_recall_penalty_weight: 0.03
+  max_score_contract_enabled: true
+  max_score_contract_text: |
+    The maximum score is attainable. Do not reserve the maximum score only for flawless essays. If the essay is comparable to or stronger than the high-score anchor in content, organization, and language use, assign a score near the top of the range, including the maximum score when appropriate.
 
 llm:
+  local_backend_enabled: true
   temperature_scoring: 0.0
   temperature_induce: 0.8
   max_exemplar_length: 400
@@ -107,6 +111,14 @@ pace:
   use_compact_evidence: true
   use_enhanced_evidence: true
   evidence_include_raw_score: true
+  evidence_blocks_enabled:
+    raw: true
+    anchor: true
+    reasoning: true
+    objective: true
+    uncertainty: true
+    stability: true
+    enhanced_extra: true
   anchor_softmax_temperature: 0.10
   early_reject_enabled: true
   early_reject_mini_set_size: 4
