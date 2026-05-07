@@ -34,6 +34,50 @@ from sklearn.model_selection import KFold, StratifiedKFold, train_test_split
 from sklearn.metrics import cohen_kappa_score
 from transformers import AutoTokenizer # [NEW] For precise token counting
 
+PARENT_CHILD_AUDIT_FIELDS = [
+    "generation",
+    "child_index",
+    "parent_signature",
+    "child_signature",
+    "parent_fitness",
+    "child_fitness",
+    "parent_raw_qwk",
+    "child_raw_qwk",
+    "delta_raw_qwk",
+    "parent_raw_adjusted_qwk",
+    "child_raw_adjusted_qwk",
+    "parent_pace_probe_qwk",
+    "child_pace_probe_qwk",
+    "parent_anchor_geometry_score",
+    "child_anchor_geometry_score",
+    "delta_anchor_geometry",
+    "parent_high_score_recall",
+    "child_high_score_recall",
+    "delta_high_recall",
+    "parent_max_score_recall",
+    "child_max_score_recall",
+    "mutation_type",
+    "instruction_changed",
+    "anchors_changed",
+    "changed_anchor_slots",
+    "changed_anchor_ids_before",
+    "changed_anchor_ids_after",
+    "dominant_error_type_used",
+    "recommended_mutation_used",
+    "target_anchor_slot",
+    "rubric_edit_focus",
+]
+
+MUTATION_EFFECT_SUMMARY_FIELDS = [
+    "mutation_type",
+    "n_children",
+    "mean_delta_raw_qwk",
+    "mean_delta_high_recall",
+    "mean_delta_anchor_geometry",
+    "win_rate_vs_parent_raw_qwk",
+    "win_rate_vs_parent_high_recall",
+]
+
 # WISE-PACE 可选依赖（pace.enabled=false 时不加载，向后兼容）
 try:
     from pace.llm_backend import LocalLlamaBackend, ScoringRequest
@@ -309,20 +353,31 @@ class ExperimentManager:
             return value.item()
         return value
 
-    def _write_csv_rows(self, relative_name: str, rows: List[Dict[str, Any]], append: bool = True) -> None:
-        if not rows:
-            return
+    def _write_csv_rows(
+        self,
+        relative_name: str,
+        rows: List[Dict[str, Any]],
+        append: bool = True,
+        fieldnames: Optional[List[str]] = None,
+    ) -> None:
         path = self.exp_dir / relative_name
+        if not rows:
+            if fieldnames and not path.exists():
+                with open(path, "w", encoding="utf-8", newline="") as f:
+                    csv.DictWriter(f, fieldnames=fieldnames).writeheader()
+            return
         normalized = [
             {str(k): self._csv_safe_value(v) for k, v in row.items()}
             for row in rows
         ]
         existing_rows: List[Dict[str, Any]] = []
-        fieldnames: List[str] = []
+        fieldnames = list(fieldnames or [])
         if append and path.exists():
             with open(path, "r", encoding="utf-8", newline="") as f:
                 reader = csv.DictReader(f)
-                fieldnames = list(reader.fieldnames or [])
+                for key in list(reader.fieldnames or []):
+                    if key not in fieldnames:
+                        fieldnames.append(key)
                 existing_rows = list(reader)
         for row in existing_rows + normalized:
             for key in row.keys():
@@ -341,10 +396,20 @@ class ExperimentManager:
         self._write_csv_rows("candidate_high_score_summary.csv", rows, append=False)
 
     def save_parent_child_audit(self, rows: List[Dict[str, Any]]) -> None:
-        self._write_csv_rows("parent_child_audit.csv", rows, append=True)
+        self._write_csv_rows(
+            "parent_child_audit.csv",
+            rows,
+            append=True,
+            fieldnames=PARENT_CHILD_AUDIT_FIELDS,
+        )
 
     def save_mutation_effect_summary(self, rows: List[Dict[str, Any]]) -> None:
-        self._write_csv_rows("mutation_effect_summary.csv", rows, append=False)
+        self._write_csv_rows(
+            "mutation_effect_summary.csv",
+            rows,
+            append=False,
+            fieldnames=MUTATION_EFFECT_SUMMARY_FIELDS,
+        )
 
     def save_final_results(self, best_ind, history, test_results=None):
         if best_ind is None:
@@ -3148,10 +3213,10 @@ class EvolutionOptimizer:
             EXP_MANAGER.save_high_score_audit(high_score_audit_rows)
             if parent_child_audit_rows:
                 self.parent_child_audit_rows.extend(parent_child_audit_rows)
-                EXP_MANAGER.save_parent_child_audit(parent_child_audit_rows)
-                EXP_MANAGER.save_mutation_effect_summary(
-                    self._mutation_effect_summary(self.parent_child_audit_rows)
-                )
+            EXP_MANAGER.save_parent_child_audit(parent_child_audit_rows)
+            EXP_MANAGER.save_mutation_effect_summary(
+                self._mutation_effect_summary(self.parent_child_audit_rows)
+            )
             EXP_MANAGER.save_generation_snapshot(gen, pop_snapshot, metrics=metrics)
             EXP_MANAGER.save_training_curve(self.history)
         return best_snapshot
