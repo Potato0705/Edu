@@ -206,6 +206,27 @@ PACE tokens: 0.89M
 - max-score recall 仍然不稳定；test 中 true max 样本很少，不能过度解读。
 - calibrator probe 不稳定且昂贵，因此后续主线改为 diagnostic-only skip calibrator。
 
+WISE-PACE no-calibrator diagnostic gate：
+
+```text
+exp_dir: logs/exp_20260508_192233_fold0
+validation QWK: 0.3536
+raw test QWK: 0.2637
+raw test MAE: 1.4688
+high recall: 0.4444
+max recall: 0.0000
+runtime: 56.7 min
+tokens all: 1.45M
+PACE tokens: 0.30M
+```
+
+主要观察：
+
+- no-calibrator diagnostic 把 PACE tokens 从约 0.89M 降到约 0.30M，成本下降明显。
+- boundary_clarification child 仍然在 validation 上击败 parent，raw QWK 约 `+0.113`。
+- 但 raw test QWK 低于 raw-only gate，说明当前小规模 validation signal 仍有过拟合 / 不稳定风险。
+- 因此目前还不建议进入完整 full fold。
+
 ### neural diagnostic smoke
 
 ```text
@@ -288,8 +309,8 @@ python scripts/analysis/profile_asap_prompt.py --prompt 1 --fold 0 --config conf
 
 不要马上跑 5-fold。建议先跑：
 
-1. `phase4_cost_aware_mid.yaml` 新 no-calibrator 版，对比 `logs/exp_20260508_174135_fold0`，确认成本下降且 mutation 信号不丢。
-2. P1-P8 smoke 实跑，每个 prompt 只跑小规模，检查 score range 和 high-tail 风险是否泛化。
-3. raw-only vs WISE-PACE cost-aware gate 再做 2-3 个 seed，确认 `boundary_clarification_mutation` 的提升不是单次偶然。
+1. P1-P8 smoke 实跑，每个 prompt 只跑小规模，检查 score range 和 high-tail 风险是否泛化。
+2. raw-only vs WISE-PACE cost-aware gate 再做 2-3 个 seed，确认 `boundary_clarification_mutation` 的提升不是单次偶然。
+3. 加强 validation selection 的防过拟合约束，例如 MAE / score_distribution_tv / high recall 联合门槛，避免 val QWK 提升但 test 分布崩溃。
 
 只有当这些最小实验稳定后，再启动单个完整 full fold。
