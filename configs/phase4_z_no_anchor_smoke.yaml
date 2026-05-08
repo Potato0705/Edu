@@ -69,6 +69,10 @@ llm:
   temperature_scoring: 0.0
   temperature_induce: 0.8
   max_exemplar_length: 400
+  max_new_tokens_scoring: 192
+  max_new_tokens_reflection: 512
+  max_new_tokens_induction: 512
+  protocol_cache_enabled: true
 
 output:
   verbose: true
@@ -87,6 +91,9 @@ pace:
   load_in_4bit: false
   dtype: "bfloat16"
   top_k_pace: 1
+  evidence_mode: "compact_manual"
+  pace_result_cache_enabled: true
+  trigger_mode: "top_k"
   include_raw_elite_buffer: 1
   raw_guard_enabled: true
   raw_guard_margin: 0.03

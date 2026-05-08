@@ -68,12 +68,30 @@ evolution:
   max_score_contract_enabled: true
   max_score_contract_text: |
     The maximum score is attainable. Do not reserve the maximum score only for flawless essays. If the essay is comparable to or stronger than the high-score anchor in content, organization, and language use, assign a score near the top of the range, including the maximum score when appropriate.
+  mutation_diversity_enabled: true
+  mutation_type_quota:
+    high_tail_instruction_mutation: 1
+    max_score_contrastive_mutation: 1
+    boundary_clarification_mutation: 1
+    anchor_slot_mutation: 1
+  final_primary_candidate: 'best_raw_guarded'
+  instruction_mutation_mode: 'conservative_patch'
+  atomic_i_e_mutation_enabled: true
+  staged_validation_enabled: false
+  mini_val_size: 32
+  mid_val_size: 96
+  full_val_top_k: 1
+  full_val_always_include_elite: true
 
 llm:
   local_backend_enabled: true
   temperature_scoring: 0.0
   temperature_induce: 0.8
   max_exemplar_length: 400
+  max_new_tokens_scoring: 192
+  max_new_tokens_reflection: 512
+  max_new_tokens_induction: 512
+  protocol_cache_enabled: true
 
 output:
   verbose: false

@@ -56,6 +56,18 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 
+def resolve_llm_token_limits(config: Dict, default: int = 768) -> Dict[str, int]:
+    """Resolve per-call generation token budgets with backward compatibility."""
+    llm_cfg = dict(config.get("llm", {}) or {})
+    base = int(llm_cfg.get("max_new_tokens", llm_cfg.get("max_new_tokens_default", default)))
+    return {
+        "default": int(llm_cfg.get("max_new_tokens_default", base)),
+        "scoring": int(llm_cfg.get("max_new_tokens_scoring", base)),
+        "reflection": int(llm_cfg.get("max_new_tokens_reflection", base)),
+        "induction": int(llm_cfg.get("max_new_tokens_induction", base)),
+    }
+
+
 # ---------------------------------------------------------------------------
 # 1. Prompt construction (shared by both backends)
 # ---------------------------------------------------------------------------
@@ -292,7 +304,11 @@ class LocalLlamaBackend:
         self.model_path = model_path or self.DEFAULT_MODEL
         self.dtype_str = dtype
         self.device = device
-        self.max_new_tokens = max_new_tokens
+        token_limits = resolve_llm_token_limits(config, default=max_new_tokens)
+        self.max_new_tokens = int(token_limits["default"])
+        self.max_new_tokens_scoring = int(token_limits["scoring"])
+        self.max_new_tokens_reflection = int(token_limits["reflection"])
+        self.max_new_tokens_induction = int(token_limits["induction"])
         self.load_in_4bit = load_in_4bit
         if pool != "final_gen_token":
             raise NotImplementedError(
@@ -358,7 +374,10 @@ class LocalLlamaBackend:
         quant = "4bit_nf4" if self.load_in_4bit else "none"
         blob = (
             f"{self.model_path}|{self.dtype_str}|{self.pool}|{quant}|"
-            f"max_new_tokens={self.max_new_tokens}"
+            f"max_new_tokens={self.max_new_tokens}|"
+            f"score={self.max_new_tokens_scoring}|"
+            f"reflect={self.max_new_tokens_reflection}|"
+            f"induce={self.max_new_tokens_induction}"
         ).encode("utf-8")
         return hashlib.md5(blob).hexdigest()
 
@@ -377,7 +396,10 @@ class LocalLlamaBackend:
         prompt_tokens = self._count_tokens(chat_prompt)
         t0 = time.time()
         with self._lock:
-            response_text, final_hidden = self._generate(chat_prompt)
+            response_text, final_hidden = self._generate(
+                chat_prompt,
+                max_new_tokens=self.max_new_tokens_scoring,
+            )
         wall = time.time() - t0
         completion_tokens = self._count_tokens(response_text)
         self._record_usage(
@@ -453,6 +475,20 @@ class LocalLlamaBackend:
         )
         return hidden.to("cpu").float()
 
+    def encode_text_mean(self, text: str) -> "torch.Tensor":
+        """Return a mean-pooled last-layer representation for free text."""
+        text = str(text or "").strip()
+        if not text:
+            return torch.zeros(self.hidden_dim, dtype=torch.float32)
+        representation_tokens = self._count_tokens(text)
+        with self._lock:
+            hidden = self._encode_span_mean(text, 0, len(text))
+        self._record_usage(
+            representation_calls=1,
+            representation_tokens=representation_tokens,
+        )
+        return hidden.to("cpu").float()
+
     def usage_snapshot(self) -> Dict[str, int]:
         with self._usage_lock:
             return dict(self._usage)
@@ -488,12 +524,17 @@ class LocalLlamaBackend:
             for key, value in kwargs.items():
                 self._usage[key] = self._usage.get(key, 0) + int(value)
 
-    def _generate(self, chat_prompt: str) -> Tuple[str, "torch.Tensor"]:
+    def _generate(
+        self,
+        chat_prompt: str,
+        max_new_tokens: Optional[int] = None,
+    ) -> Tuple[str, "torch.Tensor"]:
         inputs = self.tokenizer(chat_prompt, return_tensors="pt").to(self.device)
+        generation_tokens = int(max_new_tokens or self.max_new_tokens)
         with torch.no_grad():
             out = self.model.generate(
                 **inputs,
-                max_new_tokens=self.max_new_tokens,
+                max_new_tokens=generation_tokens,
                 do_sample=False,
                 temperature=None,
                 top_p=None,

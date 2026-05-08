@@ -25,10 +25,15 @@ if "sentence_transformers" not in sys.modules:
 from pace.llm_backend import ScoringResult
 from pace.pace_fitness import PaceFitnessConfig, PaceFitnessEvaluator
 from wise_aes import (
+    EvolutionOptimizer,
     ExperimentManager,
     PromptIndividual,
+    apply_mutation_diversity_quota,
+    build_mutation_task_instructions,
     choose_mutation_policy,
+    choose_final_primary_label,
     compute_high_score_audit,
+    mutation_axis_for_type,
 )
 
 
@@ -63,6 +68,66 @@ def test_evidence_block_mask_preserves_dimension():
     assert torch.allclose(z_masked[slices["reasoning"]], torch.zeros(len(slices["reasoning"])))
 
 
+def test_diagnostic_only_pace_skips_calibrator(monkeypatch):
+    class FakeBackend:
+        hidden_dim = 8
+
+        def __init__(self):
+            self.usage = {"prompt_tokens": 0, "completion_tokens": 0, "representation_tokens": 0}
+
+        def usage_snapshot(self):
+            return dict(self.usage)
+
+        def usage_delta(self, before):
+            return {k: self.usage.get(k, 0) - before.get(k, 0) for k in self.usage}
+
+        def score(self, req):
+            self.usage["prompt_tokens"] += 10
+            self.usage["completion_tokens"] += 2
+            y_raw = int(req.score_min + (int(req.essay_id) % (req.score_max - req.score_min + 1)))
+            return ScoringResult(
+                essay_id=req.essay_id,
+                y_raw=y_raw,
+                raw_text='{"reasoning":"clear boundary case", "final_score": %d}' % y_raw,
+                prompt_text="",
+                hidden=torch.ones(8) * float(y_raw),
+            )
+
+        def encode_scoring_context(self, **kwargs):
+            self.usage["representation_tokens"] += 5
+            known = kwargs.get("known_score")
+            value = float(known if known is not None else len(str(kwargs.get("essay_text", ""))) % 5)
+            return torch.ones(8) * value
+
+    cfg = PaceFitnessConfig(
+        diagnostic_only_skip_calibrator=True,
+        diagnostic_sample_size=2,
+    )
+    evaluator = PaceFitnessEvaluator(FakeBackend(), cfg, score_min=2, score_max=12)
+
+    def fail_train(*_args, **_kwargs):
+        raise AssertionError("calibrator should be skipped in diagnostic-only mode")
+
+    monkeypatch.setattr(evaluator, "_train_calibrator", fail_train)
+    protocol = types.SimpleNamespace(
+        instruction_text="rubric",
+        static_exemplars=[
+            {"essay_id": 1, "essay_text": "low", "domain1_score": 2},
+            {"essay_id": 2, "essay_text": "mid", "domain1_score": 8},
+            {"essay_id": 3, "essay_text": "high", "domain1_score": 12},
+        ],
+    )
+    fitness_items = [
+        {"essay_id": 10 + i, "essay_text": f"essay {i}", "domain1_score": 2 + i}
+        for i in range(4)
+    ]
+    out = evaluator.compute_pace_fitness(protocol, calib_items=[], fitness_items=fitness_items)
+    assert out["diagnostic_only_skip_calibrator"] is True
+    assert out["n_calib"] == 0
+    assert out["n_fitness"] == 2
+    assert out["calibrator_train_sec"] == 0.0
+
+
 def test_max_score_contract_toggle_changes_scoring_instruction():
     cfg = {
         "data": {"score_min": 2, "score_max": 12},
@@ -77,6 +142,161 @@ def test_max_score_contract_toggle_changes_scoring_instruction():
     ind_on = PromptIndividual("Rubric body", [], config=cfg_on)
     assert "Maximum-Score Attainable Contract" in ind_on.scoring_instruction_text()
     assert "maximum score is attainable" in ind_on.scoring_instruction_text().lower()
+
+
+def test_feedback_uses_actual_eval_items(monkeypatch):
+    captured = {}
+
+    def fake_call_llm(prompt, *args, **kwargs):
+        captured["prompt"] = prompt
+        return "feedback"
+
+    monkeypatch.setattr("wise_aes.LOCAL_BACKEND", None)
+    monkeypatch.setattr("wise_aes.call_llm", fake_call_llm)
+    cfg = {
+        "data": {"score_min": 2, "score_max": 12},
+        "evolution": {"n_error_cases": 2},
+        "llm": {"temperature_induce": 0.0},
+    }
+    ind = PromptIndividual("Rubric body", [], config=cfg)
+    ind.last_pred_scores = [7]
+    ind.last_eval_items = [{"essay_id": 99, "essay_text": "actual evaluated essay", "domain1_score": 12}]
+    wrong_full_val = [{"essay_id": 1, "essay_text": "wrong first full-val essay", "domain1_score": 2}]
+    assert ind.generate_real_feedback(wrong_full_val) == "feedback"
+    assert "ID 99" in captured["prompt"]
+    assert "wrong first full-val essay" not in captured["prompt"]
+
+
+def test_feedback_high_band_text_is_scale_generic(monkeypatch):
+    captured = {}
+
+    def fake_call_llm(prompt, *args, **kwargs):
+        captured["prompt"] = prompt
+        return "feedback"
+
+    monkeypatch.setattr("wise_aes.LOCAL_BACKEND", None)
+    monkeypatch.setattr("wise_aes.call_llm", fake_call_llm)
+    cfg = {
+        "data": {"score_min": 0, "score_max": 60},
+        "evolution": {"n_error_cases": 1},
+        "llm": {"temperature_induce": 0.0},
+    }
+    ind = PromptIndividual("Rubric body", [], config=cfg)
+    ind.last_pred_scores = [50]
+    ind.last_eval_items = [{"essay_id": 99, "essay_text": "strong essay", "domain1_score": 60}]
+    assert ind.generate_real_feedback([]) == "feedback"
+    assert "adaptive high band" in captured["prompt"]
+    assert "10-60" not in captured["prompt"]
+
+
+def test_staged_validation_elite_selection_respects_full_eval_pool():
+    opt = EvolutionOptimizer.__new__(EvolutionOptimizer)
+    cfg = {"data": {"score_min": 2, "score_max": 12}}
+    opt.population = [
+        PromptIndividual("mini winner", [{"essay_id": 1}], config=cfg),
+        PromptIndividual("full candidate", [{"essay_id": 2}], config=cfg),
+        PromptIndividual("mid candidate", [{"essay_id": 3}], config=cfg),
+    ]
+    opt.config = {"evolution": {"elite_diversity_max_score_gap": 10.0}}
+    selected = opt._select_elite_indices(
+        [0.99, 0.40, 0.95],
+        n_elite=1,
+        candidate_indices=[1],
+    )
+    assert selected == [1]
+
+
+def test_track_candidate_keeps_validation_and_selection_scores_separate():
+    opt = EvolutionOptimizer.__new__(EvolutionOptimizer)
+    cfg = {"data": {"score_min": 2, "score_max": 12}}
+    ind = PromptIndividual("rubric", [{"essay_id": 1}], config=cfg)
+    opt.best_candidates = {}
+    opt.best_candidate_scores = {"best_raw_guarded": float("-inf")}
+    opt._track_candidate(
+        "best_raw_guarded",
+        ind,
+        score=0.12,
+        gen=1,
+        source_idx=0,
+        validation_score=0.34,
+    )
+    snap = opt.best_candidates["best_raw_guarded"]
+    assert snap.selection_score == pytest.approx(0.12)
+    assert snap.validation_score == pytest.approx(0.34)
+    assert snap.fitness == pytest.approx(0.12)
+
+
+def test_mutation_effect_summary_uses_only_comparable_full_eval_rows():
+    opt = EvolutionOptimizer.__new__(EvolutionOptimizer)
+    rows = [
+        {
+            "mutation_type": "high_tail_instruction_mutation",
+            "delta_comparable": False,
+            "delta_raw_qwk": 0.90,
+            "delta_high_recall": 0.90,
+        },
+        {
+            "mutation_type": "high_tail_instruction_mutation",
+            "delta_comparable": True,
+            "delta_raw_qwk": -0.10,
+            "delta_high_recall": 0.20,
+        },
+    ]
+    summary = opt._mutation_effect_summary(rows)
+    assert summary[0]["n_children"] == 2
+    assert summary[0]["n_children_full_eval"] == 1
+    assert summary[0]["mean_delta_raw_qwk"] == pytest.approx(-0.10)
+    assert summary[0]["win_rate_vs_parent_raw_qwk"] == pytest.approx(0.0)
+    assert summary[0]["win_rate_vs_parent_high_recall"] == pytest.approx(1.0)
+
+
+def test_pace_selection_default_is_diagnostic_only():
+    opt = EvolutionOptimizer.__new__(EvolutionOptimizer)
+    opt.config = {"pace": {}, "data": {"score_min": 2, "score_max": 12}}
+    opt.pace_evaluator = types.SimpleNamespace(config=types.SimpleNamespace(gamma=0.1))
+    pace_result = {
+        "anchor_geometry_score": 1.0,
+        "cost_penalty": 0.2,
+        "overfit_penalty": 0.2,
+        "distribution_penalty": 0.2,
+    }
+    out = opt._pace_selection_combined(pace_result, 0.33)
+    assert out == pytest.approx(0.33)
+    assert pace_result["selection_objective"].startswith("raw_val_qwk only")
+
+
+def test_raw_guard_ignores_pace_distribution_when_diagnostic_only():
+    opt = EvolutionOptimizer.__new__(EvolutionOptimizer)
+    opt.config = {
+        "pace": {
+            "selection_influence": "diagnostic_only",
+            "selection_max_distribution_penalty": 0.15,
+        },
+        "evolution": {
+            "raw_high_recall_floor": 0.30,
+            "raw_high_bias_floor": -1.0,
+        },
+        "data": {"score_min": 2, "score_max": 12},
+    }
+    pop_snapshot = [
+        {
+            "raw_prediction_metrics": {
+                "high_recall": 1.0,
+                "high_pred_bias": 0.0,
+            }
+        }
+    ]
+    selection, triggered, feasible = opt._apply_raw_guard(
+        raw_scores=[0.50],
+        protocol_quality_scores=[0.50],
+        pop_snapshot=pop_snapshot,
+        raw_adjusted_scores=[0.50],
+        pace_results={0: {"distribution_penalty": 1.0, "selection_influence": "diagnostic_only"}},
+    )
+    assert selection == [pytest.approx(0.50)]
+    assert triggered == []
+    assert feasible == [0]
+    assert "pace_distribution_penalty_high" not in pop_snapshot[0]["constraint_reasons"]
 
 
 def test_high_score_audit_toy_values():
@@ -109,13 +329,109 @@ def test_high_score_audit_toy_values():
     ],
 )
 def test_mutation_policy_mapping(dominant, expected):
-    cfg = {"evolution": {"raw_high_recall_floor": 0.30}}
+    cfg = {"data": {"score_min": 2, "score_max": 12}, "evolution": {"raw_high_recall_floor": 0.30}}
     policy = choose_mutation_policy(
         object(),
         {"dominant_error_type": dominant, "raw_prediction_metrics": {"high_score_recall": 1.0, "max_score_recall": 1.0}},
         cfg,
     )
     assert policy["mutation_type"] == expected
+    assert policy["mutation_axis"] == mutation_axis_for_type(expected)
+
+
+def test_final_primary_policy_defaults_to_raw_guarded():
+    candidates = {
+        "best_raw_val": object(),
+        "best_raw_guarded": object(),
+        "best_pareto": object(),
+        "best_protocol_quality": object(),
+    }
+    assert choose_final_primary_label(candidates, {"evolution": {}}) == "best_raw_guarded"
+    assert (
+        choose_final_primary_label(
+            candidates,
+            {"evolution": {"final_primary_candidate": "best_pareto"}},
+        )
+        == "best_pareto"
+    )
+
+
+def test_max_score_contrastive_policy_and_prompt_are_scale_generic():
+    cfg = {"data": {"score_min": 0, "score_max": 60}, "evolution": {"raw_high_recall_floor": 0.30}}
+    policy = choose_mutation_policy(
+        object(),
+        {
+            "dominant_error_type": "general_error",
+            "raw_prediction_metrics": {
+                "high_score_recall": 0.8,
+                "max_score_recall": 0.0,
+                "n_true_max_score": 2,
+            },
+        },
+        cfg,
+    )
+    assert policy["mutation_type"] == "max_score_contrastive_mutation"
+    task = build_mutation_task_instructions(policy["mutation_type"], cfg)
+    assert "60" in task
+    assert "12" not in task
+    assert "10" not in task
+
+
+def test_mutation_policy_prefers_dominant_boundary_over_generic_max_gap():
+    cfg = {"data": {"score_min": 2, "score_max": 12}, "evolution": {"raw_high_recall_floor": 0.30}}
+    policy = choose_mutation_policy(
+        object(),
+        {
+            "dominant_error_type": "boundary_ambiguity",
+            "raw_prediction_metrics": {
+                "high_score_recall": 0.3,
+                "max_score_recall": 0.0,
+                "n_true_max_score": 2,
+            },
+        },
+        cfg,
+    )
+    assert policy["mutation_type"] == "boundary_clarification_mutation"
+
+
+def test_mutation_diversity_quota_avoids_single_type():
+    cfg = {
+        "data": {"score_min": 2, "score_max": 12},
+        "evolution": {
+            "mutation_diversity_enabled": True,
+            "mutation_type_quota": {
+                "high_tail_instruction_mutation": 2,
+                "anchor_slot_mutation": 1,
+            },
+        },
+    }
+    planned = apply_mutation_diversity_quota(
+        [{"mutation_type": "high_tail_instruction_mutation"}],
+        cfg,
+        n_children=3,
+    )
+    assert len(planned) == 3
+    assert len({p["actual_mutation_type"] for p in planned}) > 1
+    assert all(p["mutation_axis"] in {"I", "E", "IE"} for p in planned)
+
+
+def test_mutation_diversity_keeps_diagnostic_primary_first():
+    cfg = {
+        "data": {"score_min": 2, "score_max": 12},
+        "evolution": {
+            "mutation_diversity_enabled": True,
+            "mutation_type_quota": {
+                "high_tail_instruction_mutation": 1,
+                "max_score_contrastive_mutation": 1,
+            },
+        },
+    }
+    planned = apply_mutation_diversity_quota(
+        [{"mutation_type": "boundary_clarification_mutation"}],
+        cfg,
+        n_children=2,
+    )
+    assert planned[0]["actual_mutation_type"] == "boundary_clarification_mutation"
 
 
 def test_parent_child_audit_row_serializes(tmp_path):
@@ -146,6 +462,13 @@ def test_parent_child_audit_row_serializes(tmp_path):
         "configs/phase4_raw_only_full_fold.yaml",
         "configs/phase4_raw_only_smoke.yaml",
         "configs/phase4_smoke.yaml",
+        "configs/phase4_neural_smoke.yaml",
+        "configs/phase4_neural_no_anchor_smoke.yaml",
+        "configs/phase4_neural_text_anchor_smoke.yaml",
+        "configs/phase4_neural_score_anchor_smoke.yaml",
+        "configs/phase4_neural_dual_anchor_smoke.yaml",
+        "configs/phase4_cost_aware_mid.yaml",
+        "configs/phase4_raw_only_cost_aware_mid.yaml",
     ],
 )
 def test_phase4_configs_load(path):

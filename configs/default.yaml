@@ -77,6 +77,8 @@ evolution:
   raw_high_bias_penalty_weight: 0.04
   raw_require_max_score_when_present: true
   raw_max_score_recall_penalty_weight: 0.03
+  final_primary_candidate: "best_raw_guarded"
+  atomic_i_e_mutation_enabled: false
   max_score_contract_enabled: false
   max_score_contract_text: |
     The maximum score is attainable. Do not reserve the maximum score only for flawless essays. If the essay is comparable to or stronger than the high-score anchor in content, organization, and language use, assign a score near the top of the range, including the maximum score when appropriate.
@@ -107,6 +109,10 @@ pace:
   load_in_4bit: false                  # 4-bit NF4 量化 (推荐在单卡 24GB 及以下开启)
   dtype: "bfloat16"
   top_k_pace: 3                        # 每代仅对 top-K 个体运行 PACE fitness
+  selection_influence: "diagnostic_only"
+  pace_result_cache_enabled: true
+  diagnostic_only_skip_calibrator: false
+  diagnostic_sample_size: 0
   include_raw_elite_buffer: 0          # extra raw-ranked candidates to reduce evidence-free elites
   raw_guard_enabled: true
   raw_guard_margin: 0.03

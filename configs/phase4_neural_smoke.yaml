@@ -1,4 +1,4 @@
-# Phase 4 full-fold run: raw-direct WISE-PACE protocol evolution.
+# Phase 4 neural-hidden evidence smoke test.
 
 model:
   name: "models/Meta-Llama-3.1-8B-Instruct"
@@ -25,8 +25,8 @@ induction:
   official_criteria: "Evaluate the essay based on content, organization, and language use."
 
 evolution:
-  population_size: 4
-  n_generations: 3
+  population_size: 2
+  n_generations: 1
   n_static_exemplars: 4
   anchor_profile: "boundary"
   anchor_stratum_strategy: "score_band"
@@ -38,13 +38,13 @@ evolution:
   anchor_high_preserve_top_prob: 0.85
   anchor_low_exact_floor: false
   anchor_mutation_strategy: "evidence_representative"
-  anchor_mutation_candidate_pool: 12
+  anchor_mutation_candidate_pool: 8
   anchor_mutation_hidden_rerank: true
-  anchor_mutation_hidden_top_m: 4
+  anchor_mutation_hidden_top_m: 3
   use_evidence_feedback: true
   use_evidence_anchor_slot: true
   evidence_anchor_slot_prob: 0.6
-  n_elite_evolve: 2
+  n_elite_evolve: 1
   elite_diversity_max_score_gap: 0.20
   n_error_cases: 3
   max_workers: 1
@@ -92,24 +92,26 @@ llm:
   protocol_cache_enabled: true
 
 output:
-  verbose: false
+  verbose: true
 
 debug:
-  enabled: false
+  enabled: true
   stratified: true
   seed: 42
+  n_train: 120
+  n_val: 16
+  n_test: 16
 
 pace:
   enabled: true
   model_path: "models/Meta-Llama-3.1-8B-Instruct"
   load_in_4bit: false
   dtype: "bfloat16"
-  top_k_pace: 2
-  evidence_mode: "compact_manual"
-  selection_influence: "diagnostic_only"
+  top_k_pace: 1
+  evidence_mode: "neural_hidden"
   pace_result_cache_enabled: true
-  diagnostic_only_skip_calibrator: false
-  diagnostic_sample_size: 0
+  diagnostic_only_skip_calibrator: true
+  diagnostic_sample_size: 16
   trigger_mode: "top_k"
   trigger_patience: 1
   trigger_high_recall_floor: 0.5
@@ -129,13 +131,13 @@ pace:
   beta: 0.25
   gamma: 0.10
   hidden_dim: 64
-  epochs: 10
+  epochs: 5
   lr: 0.001
   batch_size: 16
   lambda_qwk: 0.25
-  use_compact_evidence: true
-  use_enhanced_evidence: true
-  evidence_include_raw_score: true
+  use_compact_evidence: false
+  use_enhanced_evidence: false
+  evidence_include_raw_score: false
   neural_evidence:
     proj_dim: 128
     score_emb_dim: 32
@@ -146,17 +148,20 @@ pace:
     use_score_distribution: false
     use_raw_score_embedding: true
     num_attention_heads: 2
+    attention_mode: 'cosine'
+    preserve_block_structure: true
+    projection_seed: 42
   evidence_blocks_enabled:
-    raw: true
-    anchor: true
-    reasoning: true
-    objective: true
-    uncertainty: true
-    stability: true
-    enhanced_extra: true
+    raw: false
+    anchor: false
+    reasoning: false
+    objective: false
+    uncertainty: false
+    stability: false
+    enhanced_extra: false
   anchor_softmax_temperature: 0.10
   early_reject_enabled: true
-  early_reject_mini_set_size: 8
+  early_reject_mini_set_size: 4
   score_collapse_threshold: 0.75
   anchor_sep_threshold: 0.02
   early_qwk_threshold: -0.05
@@ -170,4 +175,4 @@ pace:
   collapse_penalty_weight: 0.15
   max_score_overprediction_threshold: 3.0
   max_score_penalty_weight: 0.03
-  evidence_diagnostics_top_n: 8
+  evidence_diagnostics_top_n: 5

@@ -28,11 +28,15 @@ import numpy as np
 import yaml
 import pandas as pd
 import pickle
-from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.model_selection import KFold, StratifiedKFold, train_test_split
 from sklearn.metrics import cohen_kappa_score
 from transformers import AutoTokenizer # [NEW] For precise token counting
+
+try:
+    from sentence_transformers import SentenceTransformer
+except ImportError:
+    SentenceTransformer = None
 
 PARENT_CHILD_AUDIT_FIELDS = [
     "generation",
@@ -41,9 +45,16 @@ PARENT_CHILD_AUDIT_FIELDS = [
     "child_signature",
     "parent_fitness",
     "child_fitness",
+    "parent_protocol_quality_before_guard",
+    "child_protocol_quality_before_guard",
     "parent_raw_qwk",
     "child_raw_qwk",
     "delta_raw_qwk",
+    "parent_validation_stage",
+    "child_validation_stage",
+    "parent_validation_n",
+    "child_validation_n",
+    "delta_comparable",
     "parent_raw_adjusted_qwk",
     "child_raw_adjusted_qwk",
     "parent_pace_probe_qwk",
@@ -57,6 +68,10 @@ PARENT_CHILD_AUDIT_FIELDS = [
     "parent_max_score_recall",
     "child_max_score_recall",
     "mutation_type",
+    "requested_mutation_type",
+    "actual_mutation_type",
+    "fallback_reason",
+    "mutation_axis",
     "instruction_changed",
     "anchors_changed",
     "changed_anchor_slots",
@@ -70,6 +85,7 @@ PARENT_CHILD_AUDIT_FIELDS = [
 
 MUTATION_EFFECT_SUMMARY_FIELDS = [
     "mutation_type",
+    "n_children_full_eval",
     "n_children",
     "mean_delta_raw_qwk",
     "mean_delta_high_recall",
@@ -415,8 +431,18 @@ class ExperimentManager:
         if best_ind is None:
             best_payload = None
         else:
+            primary_val = None
+            primary_selection = None
+            if test_results:
+                primary_val = test_results.get("primary_validation_score")
+                primary_selection = test_results.get("primary_selection_score")
             best_payload = {
-                "best_qwk_val": best_ind.fitness,
+                "best_qwk_val": primary_val if primary_val is not None else best_ind.fitness,
+                "best_selection_score": (
+                    primary_selection
+                    if primary_selection is not None
+                    else getattr(best_ind, "selection_score", best_ind.fitness)
+                ),
                 "instruction": best_ind.instruction_text,
                 "static_exemplars": [ex['essay_id'] for ex in best_ind.static_exemplars],
                 "static_exemplar_scores": [ex['domain1_score'] for ex in best_ind.static_exemplars],
@@ -434,6 +460,9 @@ class ExperimentManager:
 
 EXP_MANAGER = None
 LOCAL_BACKEND = None  # type: Optional[LocalLlamaBackend]  # 由 main() 在 pace.enabled=true 时初始化
+PROTOCOL_SCORE_CACHE: Dict[str, Dict[str, Any]] = {}
+PROTOCOL_SCORE_CACHE_LOCK = threading.Lock()
+PROTOCOL_CACHE_STATS = {"hits": 0, "misses": 0, "errors": 0}
 
 # ============================================================================
 # 1. 基础设施: 向量数据库
@@ -451,6 +480,11 @@ class SimpleVectorStore:
 
     def _load_model(self):
         if self.model is None:
+            if SentenceTransformer is None:
+                raise RuntimeError(
+                    "sentence_transformers is required only when RAG/vector retrieval is enabled. "
+                    "Install sentence-transformers or run with rag.enabled=false."
+                )
             self.model = SentenceTransformer(self.model_name)
 
     def add_documents(self, data: List[Dict[str, Any]]):
@@ -642,8 +676,14 @@ def _call_local_generate(prompt: str, call_type: str = "unknown") -> str:
     if LOCAL_BACKEND is None:
         return call_llm(prompt, temperature=0.7, call_type=call_type)
     chat_prompt = LOCAL_BACKEND._apply_chat_template(prompt)
+    if call_type == "induction":
+        max_tokens = getattr(LOCAL_BACKEND, "max_new_tokens_induction", None)
+    elif call_type in {"reflection", "rewrite"}:
+        max_tokens = getattr(LOCAL_BACKEND, "max_new_tokens_reflection", None)
+    else:
+        max_tokens = getattr(LOCAL_BACKEND, "max_new_tokens", None)
     with LOCAL_BACKEND._lock:
-        text, _ = LOCAL_BACKEND._generate(chat_prompt)
+        text, _ = LOCAL_BACKEND._generate(chat_prompt, max_new_tokens=max_tokens)
     LOCAL_BACKEND.record_generation_usage(chat_prompt, text)
     if EXP_MANAGER:
         p_tokens = EXP_MANAGER.count_tokens(chat_prompt)
@@ -757,6 +797,11 @@ def _score_band_distribution(items: List[Dict], score_min: int, score_max: int) 
     return counts
 
 
+def _essay_id_fingerprint(items: List[Dict]) -> str:
+    ids = [str(item.get("essay_id", idx)) for idx, item in enumerate(items)]
+    return hashlib.md5(json.dumps(ids, sort_keys=False).encode("utf-8")).hexdigest()[:12]
+
+
 def _high_score_threshold(config: Dict[str, Any]) -> int:
     evo_cfg = config.get('evolution', {})
     score_min = int(config['data']['score_min'])
@@ -861,6 +906,55 @@ def compute_high_score_audit(
     }
 
 
+def mutation_axis_for_type(mutation_type: str) -> str:
+    """Return the protocol component primarily changed by a mutation type."""
+    if mutation_type == "anchor_slot_mutation":
+        return "E"
+    if mutation_type in {
+        "max_score_contrastive_mutation",
+        "high_tail_instruction_mutation",
+        "boundary_clarification_mutation",
+        "score_mapping_mutation",
+        "negative_constraint_mutation",
+        "score_distribution_mutation",
+        "general_reflection_mutation",
+    }:
+        return "I"
+    return "IE"
+
+
+def choose_final_primary_label(candidates: Dict[str, Any], config: Dict[str, Any]) -> str:
+    """Choose the final report primary candidate using validation-only policy.
+
+    The default is deliberately raw-first: PACE/protocol-quality candidates are
+    still evaluated and reported, but they do not become the headline test
+    candidate unless the config explicitly opts into that policy.
+    """
+    requested = str(
+        config.get("evolution", {}).get("final_primary_candidate", "best_raw_guarded")
+    )
+    aliases = {
+        "raw_first": "best_raw_guarded",
+        "raw_guarded": "best_raw_guarded",
+        "pareto": "best_pareto",
+        "protocol_quality": "best_protocol_quality",
+        "pace_guarded": "best_pace_guarded",
+    }
+    requested = aliases.get(requested, requested)
+    fallback_order = [
+        requested,
+        "best_raw_guarded",
+        "best_raw_val",
+        "best_pareto",
+        "best_pace_guarded",
+        "best_protocol_quality",
+    ]
+    for label in fallback_order:
+        if candidates.get(label) is not None:
+            return label
+    return requested
+
+
 def _max_score_contract_text(config: Dict[str, Any]) -> str:
     evo_cfg = config.get("evolution", {})
     if not bool(evo_cfg.get("max_score_contract_enabled", False)):
@@ -875,6 +969,136 @@ def _max_score_contract_text(config: Dict[str, Any]) -> str:
     return text.replace("<score_max>", str(score_max))
 
 
+def build_mutation_task_instructions(
+    mutation_type: str,
+    config: Dict[str, Any],
+    evidence_summary: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Return mutation-specific rewrite guidance without prompt-specific scores."""
+    score_min = int(config["data"]["score_min"])
+    score_max = int(config["data"]["score_max"])
+    span = max(1, score_max - score_min)
+    near_top_gap = max(1, int(math.ceil(span * 0.20)))
+    near_top_score = max(score_min, score_max - near_top_gap)
+    evidence_summary = evidence_summary or {}
+    common = (
+        f"Use the dataset scale {score_min}-{score_max}. The maximum score {score_max} "
+        "is attainable; do not require perfection."
+    )
+    tasks = {
+        "max_score_contrastive_mutation": (
+            f"{common} Create a contrastive top-band patch that distinguishes true "
+            f"maximum-score essays ({score_max}) from near-top essays around {near_top_score}. "
+            "Explain which content, organization, and language evidence justifies the maximum, "
+            "and compare explicitly with the high-score anchor."
+        ),
+        "high_tail_instruction_mutation": (
+            f"{common} Improve high-tail recognition without making every strong essay a maximum. "
+            "Add rules for when high essays should stay near-top and when they should reach the maximum."
+        ),
+        "boundary_clarification_mutation": (
+            f"{common} Clarify adjacent score boundaries. Add short decision tests for essays that sit "
+            "between neighboring score bands."
+        ),
+        "score_mapping_mutation": (
+            f"{common} Repair the mapping from stated strengths and weaknesses to final_score. "
+            "The final score must match the reasoning and anchor comparison."
+        ),
+        "anchor_slot_mutation": (
+            f"{common} Focus the rewrite on anchor use. Clarify how the scorer should compare against "
+            "the confusing anchor slot and when to prefer adjacent anchors."
+        ),
+        "negative_constraint_mutation": (
+            f"{common} Add explicit deduction rules for weak development, organization, language control, "
+            "or low-anchor similarity so weak essays are not over-scored."
+        ),
+        "score_distribution_mutation": (
+            f"{common} Reduce score collapse or range compression. Encourage use of the full valid range "
+            "only when essay evidence supports it."
+        ),
+        "general_reflection_mutation": (
+            f"{common} Apply the validation feedback as concise, direct-scoring rubric edits."
+        ),
+    }
+    detail = tasks.get(mutation_type, tasks["general_reflection_mutation"])
+    if evidence_summary:
+        detail += f"\nRelevant diagnostic summary: {json.dumps(evidence_summary, ensure_ascii=False)}"
+    return detail
+
+
+def apply_mutation_diversity_quota(
+    policies: List[Dict[str, Any]],
+    config: Dict[str, Any],
+    n_children: int,
+) -> List[Dict[str, Any]]:
+    """Plan child mutation policies while avoiding single-type collapse."""
+    if n_children <= 0:
+        return []
+    evo_cfg = config.get("evolution", {})
+    if not bool(evo_cfg.get("mutation_diversity_enabled", False)):
+        out = []
+        for i in range(n_children):
+            base = dict(policies[i % max(1, len(policies))] if policies else {})
+            mtype = base.get("mutation_type", "general_reflection_mutation")
+            base.setdefault("requested_mutation_type", mtype)
+            base.setdefault("actual_mutation_type", mtype)
+            base.setdefault("mutation_axis", mutation_axis_for_type(str(base.get("actual_mutation_type", mtype))))
+            base.setdefault("fallback_reason", "")
+            out.append(base)
+        return out
+
+    quota = dict(evo_cfg.get("mutation_type_quota", {}) or {})
+    requested: List[str] = []
+    for policy in policies:
+        primary_type = str(policy.get("mutation_type", "general_reflection_mutation"))
+        if primary_type and primary_type not in requested:
+            requested.append(primary_type)
+        if len(requested) >= n_children:
+            break
+    for mtype, count in quota.items():
+        for _ in range(max(0, int(count))):
+            if len(requested) >= n_children:
+                break
+            requested.append(str(mtype))
+    while len(requested) < n_children:
+        if policies:
+            requested.append(str(policies[len(requested) % len(policies)].get("mutation_type", "general_reflection_mutation")))
+        else:
+            requested.append("general_reflection_mutation")
+    requested = requested[:n_children]
+
+    out = []
+    for i, requested_type in enumerate(requested):
+        base = dict(policies[i % max(1, len(policies))] if policies else {})
+        actual_type = requested_type or base.get("mutation_type") or "general_reflection_mutation"
+        base["requested_mutation_type"] = requested_type
+        base["actual_mutation_type"] = actual_type
+        base["mutation_type"] = actual_type
+        base["mutation_axis"] = mutation_axis_for_type(actual_type)
+        base.setdefault("fallback_reason", "")
+        base["rubric_edit_focus"] = build_mutation_task_instructions(
+            actual_type,
+            config,
+            base.get("evidence_summary_for_prompt", {}),
+        )
+        out.append(base)
+    if len({x.get("actual_mutation_type") for x in out}) == 1 and len(out) > 1:
+        fallback_type = "general_reflection_mutation"
+        if out[0].get("actual_mutation_type") == fallback_type:
+            fallback_type = "boundary_clarification_mutation"
+        out[-1]["requested_mutation_type"] = fallback_type
+        out[-1]["actual_mutation_type"] = fallback_type
+        out[-1]["mutation_type"] = fallback_type
+        out[-1]["mutation_axis"] = mutation_axis_for_type(fallback_type)
+        out[-1]["fallback_reason"] = "diversity_floor"
+        out[-1]["rubric_edit_focus"] = build_mutation_task_instructions(
+            fallback_type,
+            config,
+            out[-1].get("evidence_summary_for_prompt", {}),
+        )
+    return out
+
+
 def choose_mutation_policy(
     individual: Any,
     pace_diagnostics: Optional[Dict[str, Any]],
@@ -887,34 +1111,41 @@ def choose_mutation_policy(
     high_floor = float(config.get("evolution", {}).get("raw_high_recall_floor", 0.30))
     high_recall = float(raw_metrics.get("high_score_recall", raw_metrics.get("high_recall", 1.0)) or 0.0)
     max_recall = float(raw_metrics.get("max_score_recall", 1.0) or 0.0)
+    n_true_max = int(raw_metrics.get("n_true_max_score", raw_metrics.get("max_score_true_count", 0)) or 0)
+    dist_tv = float(raw_metrics.get("score_distribution_tv", raw_metrics.get("tv_distance", 0.0)) or 0.0)
+    collapse = float(raw_metrics.get("pred_collapse_ratio", 0.0) or 0.0)
+    pred_span = int(raw_metrics.get("pred_span", 999) or 0)
+    score_min = int(config["data"]["score_min"])
+    score_max = int(config["data"]["score_max"])
+    score_span = max(1, score_max - score_min)
     suggested_slot = diagnostics.get("suggested_anchor_mutation_slot")
 
     mutation_type = "general_reflection_mutation"
-    focus = "Improve the rubric using validation errors while preserving the score range contract."
-    if dominant == "under_score_high_hidden" or high_recall < high_floor or max_recall < 1.0:
-        mutation_type = "high_tail_instruction_mutation"
-        focus = (
-            "Strengthen high-score and maximum-score recognition. Clarify that strong essays comparable "
-            "to high anchors should receive top-band scores, including the maximum score when appropriate."
-        )
-        if suggested_slot is None:
-            suggested_slot = max(0, len(getattr(individual, "static_exemplars", []) or []) - 1)
-    elif dominant == "over_score_low_hidden":
-        mutation_type = "negative_constraint_mutation"
-        focus = "Add explicit deductions for weak content, organization, language control, and low-anchor similarity."
-        suggested_slot = 0 if suggested_slot is None else suggested_slot
-    elif dominant == "anchor_confusion":
+    if dominant == "anchor_confusion":
         mutation_type = "anchor_slot_mutation"
-        focus = "Replace or clarify the most confusing anchor slot so adjacent score bands separate better."
-    elif dominant == "reasoning_score_contradiction":
-        mutation_type = "score_mapping_mutation"
-        focus = "Force the final score to match the stated strengths, weaknesses, and anchor comparisons."
-    elif dominant == "raw_collapse":
+    elif dominant == "raw_collapse" or collapse >= 0.70 or pred_span <= max(1, score_span // 4):
         mutation_type = "score_distribution_mutation"
-        focus = "Reduce score collapse by adding score-band diversity rules and adjacent-score decision tests."
     elif dominant == "boundary_ambiguity":
         mutation_type = "boundary_clarification_mutation"
-        focus = "Sharpen adjacent-score boundary criteria and near-miss top-band rules."
+    elif dominant == "reasoning_score_contradiction":
+        mutation_type = "score_mapping_mutation"
+    elif dominant == "over_score_low_hidden":
+        mutation_type = "negative_constraint_mutation"
+        suggested_slot = 0 if suggested_slot is None else suggested_slot
+    elif dominant == "under_score_high_hidden":
+        mutation_type = "high_tail_instruction_mutation"
+        if suggested_slot is None:
+            suggested_slot = max(0, len(getattr(individual, "static_exemplars", []) or []) - 1)
+    elif n_true_max > 0 and max_recall < 1.0:
+        mutation_type = "max_score_contrastive_mutation"
+        if suggested_slot is None:
+            suggested_slot = max(0, len(getattr(individual, "static_exemplars", []) or []) - 1)
+    elif high_recall < high_floor:
+        mutation_type = "high_tail_instruction_mutation"
+        if suggested_slot is None:
+            suggested_slot = max(0, len(getattr(individual, "static_exemplars", []) or []) - 1)
+    elif dist_tv > float(config.get("evolution", {}).get("raw_distribution_tv_threshold", 0.35)):
+        mutation_type = "score_distribution_mutation"
 
     summary = diagnostics.get("pace_diagnostic_summary") or diagnostics.get("summary") or {}
     evidence_summary = {
@@ -922,10 +1153,18 @@ def choose_mutation_policy(
         "summary": summary,
         "high_score_recall": high_recall,
         "max_score_recall": max_recall,
+        "n_true_max_score": n_true_max,
+        "score_distribution_tv": dist_tv,
+        "pred_collapse_ratio": collapse,
         "suggested_anchor_mutation_slot": suggested_slot,
     }
+    focus = build_mutation_task_instructions(mutation_type, config, evidence_summary)
     return {
         "mutation_type": mutation_type,
+        "requested_mutation_type": mutation_type,
+        "actual_mutation_type": mutation_type,
+        "mutation_axis": mutation_axis_for_type(mutation_type),
+        "fallback_reason": "",
         "target_anchor_slot": suggested_slot,
         "rubric_edit_focus": focus,
         "evidence_summary_for_prompt": evidence_summary,
@@ -973,6 +1212,7 @@ class PromptIndividual:
     evidence_feedback: Dict[str, Any] = field(default_factory=dict)
     
     last_pred_scores: List[int] = field(default_factory=list)
+    last_eval_items: List[Dict[str, Any]] = field(default_factory=list)
 
     # Templates
     QUERY_GEN_RUBRIC_TEMPLATE = """Based on the SCORING RUBRIC below, extract 3-5 keywords from the STUDENT ESSAY.\nSCORING RUBRIC:\n{rubric}\nSTUDENT ESSAY:\n{essay}\nOUTPUT JSON LIST:"""
@@ -1155,6 +1395,34 @@ Output ONLY the Rubric text. Do not output explanations."""
     def predict_score(self, essay_text: str, vector_store: SimpleVectorStore, enable_rerank: bool = False, essay_id: int = 0) -> int:
         # 本地 PACE 模式：直接用 LocalLlamaBackend 评分，跳过 RAG 和 call_llm
         if LOCAL_BACKEND is not None:
+            scoring_context_hash = hashlib.md5(
+                (
+                    self.scoring_instruction_text()
+                    + "|"
+                    + "|".join(str(ex.get("essay_id")) for ex in self.static_exemplars)
+                    + "|"
+                    + str(essay_id)
+                    + "|"
+                    + str(essay_text)
+                ).encode("utf-8")
+            ).hexdigest()
+            cache_key_blob = {
+                "protocol_signature": self.get_signature(),
+                "essay_id": essay_id,
+                "model_signature": LOCAL_BACKEND.signature(),
+                "evidence_mode": self.config.get("pace", {}).get("evidence_mode", "compact_manual"),
+                "representation_mode": "scoring_raw",
+                "scoring_context_hash": scoring_context_hash,
+            }
+            cache_key = hashlib.md5(
+                json.dumps(cache_key_blob, sort_keys=True, ensure_ascii=False).encode("utf-8")
+            ).hexdigest()
+            if self.config.get("llm", {}).get("protocol_cache_enabled", True):
+                with PROTOCOL_SCORE_CACHE_LOCK:
+                    cached = PROTOCOL_SCORE_CACHE.get(cache_key)
+                    if cached is not None:
+                        PROTOCOL_CACHE_STATS["hits"] = int(PROTOCOL_CACHE_STATS.get("hits", 0)) + 1
+                        return int(cached["y_raw"])
             req = ScoringRequest(
                 essay_id=essay_id,
                 essay_text=essay_text,
@@ -1170,6 +1438,19 @@ Output ONLY the Rubric text. Do not output explanations."""
                     result.meta.get("prompt_tokens", 0),
                     result.meta.get("completion_tokens", 0),
                 )
+            if self.config.get("llm", {}).get("protocol_cache_enabled", True):
+                with PROTOCOL_SCORE_CACHE_LOCK:
+                    PROTOCOL_CACHE_STATS["misses"] = int(PROTOCOL_CACHE_STATS.get("misses", 0)) + 1
+                    PROTOCOL_SCORE_CACHE[cache_key] = {
+                        **cache_key_blob,
+                        "y_raw": int(result.y_raw),
+                        "raw_text": result.raw_text,
+                        "target_hidden": result.hidden.cpu().float() if result.hidden is not None else None,
+                        "reasoning_hidden": None,
+                        "prompt_tokens": result.meta.get("prompt_tokens", 0),
+                        "completion_tokens": result.meta.get("completion_tokens", 0),
+                        "parse_status": "ok",
+                    }
             return result.y_raw
 
         dynamic_exemplars = []
@@ -1268,14 +1549,20 @@ Output ONLY the Rubric text. Do not output explanations."""
     def evaluate(self, val_set: List[Dict], vector_store: SimpleVectorStore, enable_rerank: bool = False, fitness_cache=None) -> float:
         # [Optimization] 1. 检查缓存
         sig = self.get_signature()
-        if fitness_cache is not None and sig in fitness_cache:
+        val_fingerprint = _essay_id_fingerprint(val_set)
+        cache_key = f"{sig}:{val_fingerprint}" if fitness_cache is not None else sig
+        if fitness_cache is not None and cache_key in fitness_cache:
             print(f"    [Cache Hit] Skipping evaluation for {sig[:8]}...")
-            cached = fitness_cache[sig]
+            stats = fitness_cache.setdefault("__stats__", {"hits": 0, "misses": 0})
+            stats["hits"] = int(stats.get("hits", 0)) + 1
+            cached = fitness_cache[cache_key]
             if isinstance(cached, dict):
                 self.fitness = float(cached.get("qwk", 0.0))
                 self.last_pred_scores = list(cached.get("pred_scores", []))
+                self.last_eval_items = list(val_set)
             else:
                 self.fitness = float(cached)
+                self.last_eval_items = list(val_set)
             return self.fitness
         
         true_scores = [item['domain1_score'] for item in val_set]
@@ -1301,6 +1588,7 @@ Output ONLY the Rubric text. Do not output explanations."""
                     pred_scores[idx] = (self.config['data']['score_min'] + self.config['data']['score_max']) // 2
                     
         self.last_pred_scores = pred_scores
+        self.last_eval_items = list(val_set)
         qwk = cohen_kappa_score(true_scores, pred_scores, weights='quadratic')
         if not np.isfinite(qwk):
             qwk = 0.0
@@ -1309,9 +1597,13 @@ Output ONLY the Rubric text. Do not output explanations."""
         
         # [Optimization] 2. 写入缓存
         if fitness_cache is not None:
-            fitness_cache[sig] = {
+            stats = fitness_cache.setdefault("__stats__", {"hits": 0, "misses": 0})
+            stats["misses"] = int(stats.get("misses", 0)) + 1
+            fitness_cache[cache_key] = {
                 "qwk": qwk,
                 "pred_scores": list(pred_scores),
+                "val_fingerprint": val_fingerprint,
+                "n_val": len(val_set),
             }
             
         return qwk
@@ -1325,13 +1617,19 @@ Output ONLY the Rubric text. Do not output explanations."""
             dict(self.evidence_feedback),
         )
         cloned.last_pred_scores = list(self.last_pred_scores)
+        cloned.last_eval_items = list(self.last_eval_items)
         if hasattr(self, "parent_trace"):
             cloned.parent_trace = dict(getattr(self, "parent_trace"))
         return cloned
     
     def generate_real_feedback(self, val_set: List[Dict]) -> str:
         if not self.last_pred_scores: return "Focus on improving general accuracy."
-        true_scores = [x['domain1_score'] for x in val_set]
+        feedback_items = (
+            list(self.last_eval_items)
+            if len(self.last_eval_items) == len(self.last_pred_scores)
+            else list(val_set[:len(self.last_pred_scores)])
+        )
+        true_scores = [x['domain1_score'] for x in feedback_items]
         score_min = self.config['data']['score_min']
         score_max = self.config['data']['score_max']
 
@@ -1379,7 +1677,7 @@ Output ONLY the Rubric text. Do not output explanations."""
         errors = []
         for i, (p, t) in enumerate(zip(self.last_pred_scores, true_scores)):
             if abs(p - t) >= 1: 
-                errors.append((val_set[i], p, t))
+                errors.append((feedback_items[i], p, t))
         
         errors.sort(key=lambda item: abs(item[1] - item[2]), reverse=True)
         selected_errors = errors[: self.config.get('evolution', {}).get('n_error_cases', 3)]
@@ -1419,7 +1717,7 @@ Analyze WHY these errors occurred. Use the evidence diagnostics when present:
 - If anchor confusion or boundary ambiguity is dominant, sharpen adjacent-score boundary rules.
 - If reasoning-score contradiction appears, require the final score to match the stated strengths and weaknesses.
 - If mean_pred_minus_true is strongly negative, add explicit recognition rules for high-quality essays and reduce overly harsh deductions.
-- If high_score_recall is low or high_score_pred_minus_true is negative, strengthen rules that assign 10-{score_max} to genuinely strong essays.
+- If high_score_recall is low or high_score_pred_minus_true is negative, strengthen rules that assign scores in the adaptive high band ({high_threshold}-{score_max}) to genuinely strong essays.
 - If predictions collapse into one or two scores, add score-band diversity and boundary calibration rules.
 - If pace_teacher_guidance is present, convert it into direct-scoring rubric edits; do not rely on a calibrator to fix raw scores.
 
@@ -1439,6 +1737,58 @@ Return actionable rewrite guidance only. Preserve the score range contract.
             "Improve direct raw scoring quality while preserving the score range.",
         )
         policy_evidence = mutation_policy.get("evidence_summary_for_prompt", {})
+        mutation_task = build_mutation_task_instructions(
+            mutation_type,
+            self.config,
+            policy_evidence,
+        )
+        mutation_mode = str(
+            self.config.get("evolution", {}).get("instruction_mutation_mode", "rewrite")
+        )
+        if mutation_mode in {"conservative_patch", "patch_append"}:
+            prompt = f"""Write a concise scoring-protocol addendum based on the feedback.
+
+SCORE RANGE CONTRACT:
+{score_contract}
+
+MUTATION POLICY:
+- mutation_type: {mutation_type}
+- rubric_edit_focus: {rubric_focus}
+- evidence_summary: {json.dumps(policy_evidence, ensure_ascii=False)}
+
+MUTATION-SPECIFIC TASK:
+{mutation_task}
+
+FEEDBACK:
+{feedback}
+
+CURRENT RUBRIC:
+{self.instruction_text}
+
+Patch requirements:
+- Do not rewrite the whole rubric.
+- Preserve the existing scoring scale and final_score JSON behavior.
+- Add only 3-6 operational calibration rules.
+- Rules must be directly actionable for raw LLM scoring under <I,E>.
+- For max/high-score patches, distinguish maximum-score from near-top essays without requiring perfection.
+- For boundary patches, specify adjacent-score decision tests.
+- Avoid broad wording that would raise every essay.
+- Keep the addendum under 180 words.
+
+OUTPUT ONLY THE ADDENDUM TEXT."""
+            temp = self.config['llm'].get('temperature_induce', 0.8)
+            if LOCAL_BACKEND is not None:
+                patch_text = _call_local_generate(prompt, call_type="rewrite")
+            else:
+                patch_text = call_llm(prompt, temperature=temp, call_type="rewrite")
+            patch_text = _normalize_score_rubric(patch_text, self.config)
+            merged = (
+                f"{self.instruction_text.strip()}\n\n"
+                f"Operational Calibration Addendum ({mutation_type}):\n"
+                f"{patch_text.strip()}"
+            )
+            return _normalize_score_rubric(merged, self.config)
+
         prompt = f"""Rewrite and improve the rubric based on the feedback.
 
 SCORE RANGE CONTRACT:
@@ -1448,6 +1798,9 @@ MUTATION POLICY:
 - mutation_type: {mutation_type}
 - rubric_edit_focus: {rubric_focus}
 - evidence_summary: {json.dumps(policy_evidence, ensure_ascii=False)}
+
+MUTATION-SPECIFIC TASK:
+{mutation_task}
 
 FEEDBACK:
 {feedback}
@@ -1517,6 +1870,8 @@ class EvolutionOptimizer:
         self.calib_items = calib_items
         self.fitness_items = fitness_items
         self.latest_pace_results = {}
+        self.pace_memo: Dict[str, Dict[str, Any]] = {}
+        self.pace_memo_stats = {"hits": 0, "misses": 0}
         self.best_candidates = {
             "best_raw_val": None,
             "best_raw_guarded": None,
@@ -2122,14 +2477,18 @@ class EvolutionOptimizer:
         diff_prompt = curr_prompt - start_stats['prompt']
         diff_compl = curr_compl - start_stats['completion']
 
+        fresh_pace_results = [
+            r for r in self.latest_pace_results.values()
+            if not bool(r.get("_pace_cache_hit", False))
+        ]
         pace_prompt_tokens = sum(
-            int(r.get("local_prompt_tokens", 0)) for r in self.latest_pace_results.values()
+            int(r.get("local_prompt_tokens", 0)) for r in fresh_pace_results
         )
         pace_completion_tokens = sum(
-            int(r.get("local_completion_tokens", 0)) for r in self.latest_pace_results.values()
+            int(r.get("local_completion_tokens", 0)) for r in fresh_pace_results
         )
         pace_representation_tokens = sum(
-            int(r.get("local_representation_tokens", 0)) for r in self.latest_pace_results.values()
+            int(r.get("local_representation_tokens", 0)) for r in fresh_pace_results
         )
 
         mutation_events = mutation_events or []
@@ -2158,14 +2517,18 @@ class EvolutionOptimizer:
             "pace_tokens_total": pace_tokens_total,
             "tokens_total_all": diff_total + pace_tokens_total,
             "pace_evaluated_count": len(self.latest_pace_results),
+            "pace_new_eval_count": len(fresh_pace_results),
+            "pace_cache_hit_count": sum(
+                1 for r in self.latest_pace_results.values() if r.get("_pace_cache_hit")
+            ),
             "pace_early_rejected_count": sum(
-                1 for r in self.latest_pace_results.values() if r.get("_early_rejected")
+                1 for r in fresh_pace_results if r.get("_early_rejected")
             ),
             "pace_total_forward_passes": sum(
-                int(r.get("total_local_forward_passes", 0)) for r in self.latest_pace_results.values()
+                int(r.get("total_local_forward_passes", 0)) for r in fresh_pace_results
             ),
             "pace_total_inference_sec": round(
-                sum(float(r.get("total_pace_sec", 0.0)) for r in self.latest_pace_results.values()),
+                sum(float(r.get("total_pace_sec", 0.0)) for r in fresh_pace_results),
                 2,
             ),
             "anchor_mutation_count": len(mutation_events),
@@ -2183,6 +2546,7 @@ class EvolutionOptimizer:
         pace_cfg = self.config.get('pace', {})
         cfg = self.pace_evaluator.config
         raw_val_qwk = float(raw_val_qwk)
+        selection_influence = str(pace_cfg.get("selection_influence", "diagnostic_only"))
         anchor_guidance_weight = float(pace_cfg.get("anchor_guidance_weight", cfg.gamma))
         max_anchor_bonus = float(pace_cfg.get("max_anchor_geometry_bonus", 0.02))
         anchor_bonus_raw = anchor_guidance_weight * float(pace_result.get("anchor_geometry_score", 0.0))
@@ -2190,6 +2554,19 @@ class EvolutionOptimizer:
         cost_penalty = float(pace_result.get("cost_penalty", 0.0))
         overfit_penalty = float(pace_result.get("overfit_penalty", 0.0))
         distribution_penalty = float(pace_result.get("distribution_penalty", 0.0))
+        if selection_influence in {"diagnostic_only", "none", "off"}:
+            pace_result["selection_objective"] = "raw_val_qwk only; PACE is diagnostic/mutation guidance"
+            pace_result["pace_qwk_used_for_selection"] = False
+            pace_result["selection_anchor_bonus_raw"] = anchor_bonus_raw
+            pace_result["selection_anchor_bonus"] = 0.0
+            pace_result["selection_max_anchor_bonus"] = max_anchor_bonus
+            pace_result["selection_uncapped_protocol_quality"] = raw_val_qwk
+            pace_result["selection_max_protocol_quality_lift"] = 0.0
+            pace_result["selection_cost_penalty"] = 0.0
+            pace_result["selection_overfit_penalty"] = 0.0
+            pace_result["selection_distribution_penalty"] = 0.0
+            pace_result["selection_influence"] = selection_influence
+            return raw_val_qwk
         uncapped_guided = (
             raw_val_qwk
             + anchor_bonus
@@ -2209,7 +2586,180 @@ class EvolutionOptimizer:
         pace_result["selection_cost_penalty"] = cost_penalty
         pace_result["selection_overfit_penalty"] = overfit_penalty
         pace_result["selection_distribution_penalty"] = distribution_penalty
+        pace_result["selection_influence"] = selection_influence
         return guided if np.isfinite(guided) else raw_val_qwk
+
+    def _pace_cache_key(self, individual: PromptIndividual) -> str:
+        """Cache PACE probe results for an unchanged protocol and val split."""
+        pace_cfg = self.config.get("pace", {})
+        backend_sig = ""
+        if self.pace_evaluator is not None and hasattr(self.pace_evaluator.backend, "signature"):
+            try:
+                backend_sig = self.pace_evaluator.backend.signature()
+            except Exception:
+                backend_sig = ""
+        payload = {
+            "protocol_signature": individual.get_signature(),
+            "calib_ids": [item.get("essay_id") for item in (self.calib_items or [])],
+            "fitness_ids": [item.get("essay_id") for item in (self.fitness_items or [])],
+            "backend_signature": backend_sig,
+            "evidence_mode": pace_cfg.get("evidence_mode", "compact_manual"),
+            "neural_evidence": pace_cfg.get("neural_evidence", {}),
+            "score_min": self.config.get("data", {}).get("score_min"),
+            "score_max": self.config.get("data", {}).get("score_max"),
+        }
+        return hashlib.md5(
+            json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+        ).hexdigest()
+
+    def _stratified_validation_subset(self, items: List[Dict], size: int, seed: int) -> List[Dict]:
+        """Deterministically choose a score-stratified validation subset."""
+        size = int(size)
+        if size <= 0 or size >= len(items):
+            return list(items)
+        rng = random.Random(seed)
+        by_score: Dict[int, List[Dict]] = {}
+        for item in items:
+            by_score.setdefault(int(item["domain1_score"]), []).append(item)
+        for group in by_score.values():
+            group.sort(key=lambda x: int(x.get("essay_id", 0)))
+
+        selected: List[Dict] = []
+        selected_ids = set()
+        total = max(1, len(items))
+        scores_sorted = sorted(by_score)
+        for score in scores_sorted:
+            group = list(by_score[score])
+            rng.shuffle(group)
+            quota = int(round(size * len(group) / total))
+            if quota <= 0 and len(selected) < size:
+                quota = 1
+            for item in group[:quota]:
+                if len(selected) >= size:
+                    break
+                selected.append(item)
+                selected_ids.add(item["essay_id"])
+
+        if len(selected) < size:
+            leftovers = [item for item in items if item["essay_id"] not in selected_ids]
+            leftovers.sort(key=lambda x: (int(x["domain1_score"]), int(x.get("essay_id", 0))))
+            rng.shuffle(leftovers)
+            selected.extend(leftovers[: size - len(selected)])
+        selected = selected[:size]
+        selected.sort(key=lambda x: int(x.get("essay_id", 0)))
+        return selected
+
+    def _evaluate_raw_stage(
+        self,
+        *,
+        ind: PromptIndividual,
+        items: List[Dict],
+        stage: str,
+        use_rerank: bool,
+    ) -> Dict[str, Any]:
+        qwk = ind.evaluate(items, self.vector_store, enable_rerank=use_rerank, fitness_cache=self.fitness_memo)
+        true_scores = [item["domain1_score"] for item in items]
+        raw_metrics = self._score_prediction_metrics(true_scores, ind.last_pred_scores)
+        raw_penalty = self._raw_distribution_penalty(raw_metrics)
+        raw_adjusted = float(qwk) - float(raw_penalty)
+        return {
+            "qwk": float(qwk),
+            "raw_metrics": raw_metrics,
+            "raw_penalty": float(raw_penalty),
+            "raw_adjusted": float(raw_adjusted),
+            "validation_stage": stage,
+            "validation_n": len(items),
+            "validation_fingerprint": _essay_id_fingerprint(items),
+        }
+
+    def _evaluate_population_raw(
+        self,
+        *,
+        gen: int,
+        use_rerank: bool,
+    ) -> List[Dict[str, Any]]:
+        evo_cfg = self.config.get("evolution", {})
+        staged = bool(evo_cfg.get("staged_validation_enabled", False))
+        if not staged:
+            return [
+                self._evaluate_raw_stage(
+                    ind=ind,
+                    items=self.val_data,
+                    stage="full",
+                    use_rerank=use_rerank,
+                )
+                for ind in self.population
+            ]
+
+        seed = int(self.config.get("debug", {}).get("seed", 42)) + int(gen) * 997
+        mini_items = self._stratified_validation_subset(
+            self.val_data,
+            int(evo_cfg.get("mini_val_size", 32)),
+            seed,
+        )
+        mid_items = self._stratified_validation_subset(
+            self.val_data,
+            int(evo_cfg.get("mid_val_size", 96)),
+            seed + 1,
+        )
+        records = []
+        print(
+            f"  [Staged Validation] mini={len(mini_items)} mid={len(mid_items)} full={len(self.val_data)}"
+        )
+        for ind in self.population:
+            records.append(
+                self._evaluate_raw_stage(
+                    ind=ind,
+                    items=mini_items,
+                    stage="mini",
+                    use_rerank=use_rerank,
+                )
+            )
+
+        pop_n = len(self.population)
+        full_top_k = max(1, min(pop_n, int(evo_cfg.get("full_val_top_k", 1))))
+        mid_top_k = int(evo_cfg.get("mid_val_top_k", max(full_top_k + 1, math.ceil(pop_n / 2))))
+        mid_top_k = max(full_top_k, min(pop_n, mid_top_k))
+        mid_indices = sorted(range(pop_n), key=lambda i: records[i]["raw_adjusted"], reverse=True)[:mid_top_k]
+        child_indices = [
+            i for i, ind in enumerate(self.population)
+            if getattr(ind, "parent_trace", None)
+        ]
+        if bool(evo_cfg.get("mid_val_include_best_child", False)) and child_indices:
+            best_child_idx = max(child_indices, key=lambda i: records[i]["raw_adjusted"])
+            if best_child_idx not in mid_indices:
+                mid_indices.append(best_child_idx)
+        if bool(evo_cfg.get("full_val_always_include_elite", True)) and 0 not in mid_indices:
+            mid_indices.append(0)
+        for idx in sorted(set(mid_indices)):
+            records[idx] = self._evaluate_raw_stage(
+                ind=self.population[idx],
+                items=mid_items,
+                stage="mid",
+                use_rerank=use_rerank,
+            )
+
+        full_indices = sorted(set(mid_indices), key=lambda i: records[i]["raw_adjusted"], reverse=True)[:full_top_k]
+        if bool(evo_cfg.get("full_val_always_include_elite", True)) and 0 not in full_indices:
+            full_indices.append(0)
+        if bool(evo_cfg.get("full_val_include_best_child", False)) and child_indices:
+            mid_child_indices = [i for i in child_indices if i in set(mid_indices)]
+            if mid_child_indices:
+                best_child_idx = max(mid_child_indices, key=lambda i: records[i]["raw_adjusted"])
+                if best_child_idx not in full_indices:
+                    full_indices.append(best_child_idx)
+        for idx in sorted(set(full_indices)):
+            records[idx] = self._evaluate_raw_stage(
+                ind=self.population[idx],
+                items=self.val_data,
+                stage="full",
+                use_rerank=use_rerank,
+            )
+        print(
+            f"  [Staged Validation] mid_indices={sorted(set(mid_indices))} "
+            f"full_indices={sorted(set(full_indices))}"
+        )
+        return records
 
     def _score_prediction_metrics(self, y_true: List[int], y_pred: List[int]) -> Dict[str, Any]:
         score_min = int(self.config['data']['score_min'])
@@ -2323,6 +2873,9 @@ class EvolutionOptimizer:
     ) -> Dict[str, Any]:
         child_raw = child_snapshot.get("raw_fitness")
         parent_raw = parent_trace.get("parent_raw_qwk")
+        child_stage = child_snapshot.get("validation_stage")
+        parent_stage = parent_trace.get("parent_validation_stage")
+        delta_comparable = (child_stage == "full" and parent_stage in (None, "full"))
         child_high = child_snapshot.get("high_score_recall")
         parent_high = parent_trace.get("parent_high_score_recall")
         child_anchor_geom = child_snapshot.get("anchor_geometry_score")
@@ -2334,13 +2887,20 @@ class EvolutionOptimizer:
             "child_signature": child.get_signature(),
             "parent_fitness": parent_trace.get("parent_protocol_quality"),
             "child_fitness": child_snapshot.get("selection_fitness", child_snapshot.get("fitness")),
+            "parent_protocol_quality_before_guard": parent_trace.get("parent_protocol_quality_before_guard"),
+            "child_protocol_quality_before_guard": child_snapshot.get("protocol_quality_before_guard"),
             "parent_raw_qwk": parent_raw,
             "child_raw_qwk": child_raw,
             "delta_raw_qwk": (
                 float(child_raw) - float(parent_raw)
-                if isinstance(child_raw, (int, float)) and isinstance(parent_raw, (int, float))
+                if delta_comparable and isinstance(child_raw, (int, float)) and isinstance(parent_raw, (int, float))
                 else None
             ),
+            "parent_validation_stage": parent_stage,
+            "child_validation_stage": child_stage,
+            "parent_validation_n": parent_trace.get("parent_validation_n"),
+            "child_validation_n": child_snapshot.get("validation_n"),
+            "delta_comparable": delta_comparable,
             "parent_raw_adjusted_qwk": parent_trace.get("parent_raw_adjusted_qwk"),
             "child_raw_adjusted_qwk": child_snapshot.get("raw_adjusted_fitness"),
             "parent_pace_probe_qwk": parent_trace.get("parent_pace_probe_qwk"),
@@ -2356,12 +2916,16 @@ class EvolutionOptimizer:
             "child_high_score_recall": child_high,
             "delta_high_recall": (
                 float(child_high) - float(parent_high)
-                if isinstance(child_high, (int, float)) and isinstance(parent_high, (int, float))
+                if delta_comparable and isinstance(child_high, (int, float)) and isinstance(parent_high, (int, float))
                 else None
             ),
             "parent_max_score_recall": parent_trace.get("parent_max_score_recall"),
             "child_max_score_recall": child_snapshot.get("max_score_recall"),
             "mutation_type": parent_trace.get("mutation_type"),
+            "requested_mutation_type": parent_trace.get("requested_mutation_type"),
+            "actual_mutation_type": parent_trace.get("actual_mutation_type"),
+            "fallback_reason": parent_trace.get("fallback_reason"),
+            "mutation_axis": parent_trace.get("mutation_axis"),
             "instruction_changed": parent_trace.get("instruction_changed"),
             "anchors_changed": parent_trace.get("anchors_changed"),
             "changed_anchor_slots": parent_trace.get("changed_anchor_slots"),
@@ -2388,20 +2952,25 @@ class EvolutionOptimizer:
 
         summary = []
         for mutation_type, items in sorted(groups.items()):
+            comparable_items = [
+                item for item in items
+                if item.get("delta_comparable") in (True, "True", "true", 1, "1")
+            ]
             raw_deltas = [
-                float(item["delta_raw_qwk"]) for item in items
+                float(item["delta_raw_qwk"]) for item in comparable_items
                 if isinstance(item.get("delta_raw_qwk"), (int, float))
             ]
             high_deltas = [
-                float(item["delta_high_recall"]) for item in items
+                float(item["delta_high_recall"]) for item in comparable_items
                 if isinstance(item.get("delta_high_recall"), (int, float))
             ]
             summary.append({
                 "mutation_type": mutation_type,
+                "n_children_full_eval": len(comparable_items),
                 "n_children": len(items),
-                "mean_delta_raw_qwk": mean_numeric(items, "delta_raw_qwk"),
-                "mean_delta_high_recall": mean_numeric(items, "delta_high_recall"),
-                "mean_delta_anchor_geometry": mean_numeric(items, "delta_anchor_geometry"),
+                "mean_delta_raw_qwk": mean_numeric(comparable_items, "delta_raw_qwk"),
+                "mean_delta_high_recall": mean_numeric(comparable_items, "delta_high_recall"),
+                "mean_delta_anchor_geometry": mean_numeric(comparable_items, "delta_anchor_geometry"),
                 "win_rate_vs_parent_raw_qwk": (
                     float(np.mean([1.0 if x > 0 else 0.0 for x in raw_deltas]))
                     if raw_deltas else None
@@ -2482,7 +3051,18 @@ class EvolutionOptimizer:
             raw_adjusted = float(raw_adjusted_scores[idx])
             protocol_quality = float(protocol_quality_scores[idx])
             pace_result = pace_results.get(idx, {})
-            dist_penalty = float(pace_result.get("distribution_penalty", 0.0) or 0.0)
+            pace_selection_influence = str(
+                pace_result.get(
+                    "selection_influence",
+                    pace_cfg.get("selection_influence", "diagnostic_only"),
+                )
+            )
+            pace_diagnostic_only = pace_selection_influence in {"diagnostic_only", "none", "off"}
+            dist_penalty = (
+                0.0
+                if pace_diagnostic_only
+                else float(pace_result.get("distribution_penalty", 0.0) or 0.0)
+            )
             reasons = []
             if raw_score < threshold:
                 reasons.append("raw_below_best_margin")
@@ -2519,9 +3099,20 @@ class EvolutionOptimizer:
             pop_snapshot[idx]['protocol_quality'] = selection_scores[idx]
         return selection_scores, triggered, feasible_indices
 
-    def _select_elite_indices(self, selection_scores: List[float], n_elite: int) -> List[int]:
-        n_elite = max(1, min(int(n_elite), len(self.population)))
-        ranked = sorted(range(len(selection_scores)), key=lambda i: float(selection_scores[i]), reverse=True)
+    def _select_elite_indices(
+        self,
+        selection_scores: List[float],
+        n_elite: int,
+        candidate_indices: Optional[List[int]] = None,
+    ) -> List[int]:
+        eligible = [
+            int(i) for i in (candidate_indices if candidate_indices is not None else range(len(selection_scores)))
+            if 0 <= int(i) < len(selection_scores)
+        ]
+        if not eligible:
+            eligible = list(range(len(selection_scores)))
+        n_elite = max(1, min(int(n_elite), len(eligible), len(self.population)))
+        ranked = sorted(eligible, key=lambda i: float(selection_scores[i]), reverse=True)
         selected: List[int] = []
         seen_anchor_fps = set()
         seen_instruction_fps = set()
@@ -2561,14 +3152,19 @@ class EvolutionOptimizer:
         score: float,
         gen: int,
         source_idx: int,
+        validation_score: Optional[float] = None,
     ):
         score = float(score)
         if not np.isfinite(score):
             return
+        validation_score = float(score if validation_score is None else validation_score)
         if score <= self.best_candidate_scores.get(label, float("-inf")):
             return
         snapshot = individual.clone()
         snapshot.fitness = score
+        snapshot.selection_score = score
+        snapshot.validation_score = validation_score
+        snapshot.raw_val_qwk = validation_score
         snapshot.selection_label = label
         snapshot.source_generation = gen
         snapshot.source_index = int(source_idx)
@@ -2682,16 +3278,17 @@ class EvolutionOptimizer:
         lineage_raw_deltas = []
         high_score_audit_rows = []
         parent_child_audit_rows = []
-        true_scores_for_raw = [item['domain1_score'] for item in self.val_data]
+        raw_eval_records = self._evaluate_population_raw(gen=gen, use_rerank=use_rerank_train)
 
         for i, ind in enumerate(self.population):
             ex_ids = [ex['essay_id'] for ex in ind.static_exemplars]
             print(f"  [Gen {gen}] Ind {i:02d} | Exemplars: {ex_ids}")
 
-            qwk = ind.evaluate(self.val_data, self.vector_store, enable_rerank=use_rerank_train, fitness_cache=self.fitness_memo)
-            raw_metrics = self._score_prediction_metrics(true_scores_for_raw, ind.last_pred_scores)
-            raw_penalty = self._raw_distribution_penalty(raw_metrics)
-            raw_adjusted = float(qwk) - float(raw_penalty)
+            raw_record = raw_eval_records[i]
+            qwk = float(raw_record["qwk"])
+            raw_metrics = raw_record["raw_metrics"]
+            raw_penalty = float(raw_record["raw_penalty"])
+            raw_adjusted = float(raw_record["raw_adjusted"])
             scores.append(qwk)
             raw_adjusted_scores.append(raw_adjusted)
             print(
@@ -2699,13 +3296,20 @@ class EvolutionOptimizer:
                 f"| raw_adj={raw_adjusted:.4f} "
                 f"| tv={raw_metrics['tv_distance']:.3f} "
                 f"| bias={raw_metrics['pred_bias']:.3f} "
-                f"| high_recall={raw_metrics['high_recall']:.3f}\n"
+                f"| high_recall={raw_metrics['high_recall']:.3f} "
+                f"| stage={raw_record['validation_stage']} n={raw_record['validation_n']}\n"
             )
 
             parent_trace = getattr(ind, "parent_trace", None)
             ind_data = ind.to_dict()
             ind_data['individual_id'] = i
             ind_data['raw_fitness'] = qwk
+            ind_data['validation_stage'] = raw_record["validation_stage"]
+            ind_data['validation_n'] = raw_record["validation_n"]
+            ind_data['validation_fingerprint'] = raw_record["validation_fingerprint"]
+            ind_data['staged_validation_enabled'] = bool(
+                self.config.get('evolution', {}).get('staged_validation_enabled', False)
+            )
             ind_data['raw_adjusted_fitness'] = raw_adjusted
             ind_data['raw_distribution_penalty'] = raw_penalty
             ind_data['raw_distribution_tv'] = raw_metrics.get("tv_distance")
@@ -2746,7 +3350,12 @@ class EvolutionOptimizer:
                 )
                 ind_data['parent_trace'] = parent_trace
                 ind_data['parent_child_raw_delta'] = raw_delta
-                if raw_delta is not None:
+                parent_stage = parent_trace.get("parent_validation_stage")
+                comparable_delta = (
+                    raw_record.get("validation_stage") == "full"
+                    and parent_stage in (None, "full")
+                )
+                if raw_delta is not None and comparable_delta:
                     lineage_raw_deltas.append(raw_delta)
                 parent_child_audit_rows.append(
                     self._build_parent_child_audit_row(
@@ -2766,20 +3375,72 @@ class EvolutionOptimizer:
         # WISE-PACE: top-K PACE fitness 评估
         protocol_quality_scores = list(scores)
         self.latest_pace_results = {}
+        full_eval_indices = [
+            i for i, record in enumerate(raw_eval_records)
+            if record.get("validation_stage") == "full"
+        ] or list(range(len(scores)))
         if self.pace_evaluator is not None and self.calib_items and self.fitness_items:
             top_k = self.pace_evaluator.config.top_k_pace
             elite_buffer = int(self.config.get('pace', {}).get('include_raw_elite_buffer', 0))
-            pace_eval_count = min(len(scores), max(1, top_k + max(0, elite_buffer)))
-            top_k_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:pace_eval_count]
+            pace_eval_count = min(len(full_eval_indices), max(1, top_k + max(0, elite_buffer)))
+            top_k_indices = sorted(full_eval_indices, key=lambda i: scores[i], reverse=True)[:pace_eval_count]
+            pace_cfg = self.config.get("pace", {})
+            trigger_mode = str(pace_cfg.get("trigger_mode", "top_k"))
+            pace_trigger_reason = "top_k"
+            if trigger_mode == "disabled":
+                top_k_indices = []
+                pace_trigger_reason = "disabled"
+            elif trigger_mode == "on_demand":
+                best_idx = int(max(full_eval_indices, key=lambda i: scores[i])) if full_eval_indices else 0
+                best_metrics = pop_snapshot[best_idx].get("raw_prediction_metrics", {}) if pop_snapshot else {}
+                previous_best_raw = max(
+                    [float(row.get("best_raw_val", float("-inf"))) for row in self.history if row.get("best_raw_val") is not None]
+                    or [float("-inf")]
+                )
+                stagnation_delta = float(pace_cfg.get("trigger_raw_stagnation_delta", 0.01))
+                high_floor = float(pace_cfg.get("trigger_high_recall_floor", 0.5))
+                reasons = []
+                current_best_full = max([scores[i] for i in full_eval_indices] or scores or [0.0])
+                if previous_best_raw != float("-inf") and current_best_full <= previous_best_raw + stagnation_delta:
+                    reasons.append("raw_stagnation")
+                if float(best_metrics.get("high_score_recall", best_metrics.get("high_recall", 1.0)) or 0.0) < high_floor:
+                    reasons.append("high_recall_low")
+                if float(best_metrics.get("max_score_recall", 1.0) or 0.0) < 1.0:
+                    reasons.append("max_recall_low")
+                if float(best_metrics.get("score_distribution_tv", best_metrics.get("tv_distance", 0.0)) or 0.0) > float(
+                    pace_cfg.get("distribution_tv_threshold", 0.25)
+                ):
+                    reasons.append("distribution_shift")
+                if not reasons:
+                    top_k_indices = []
+                    pace_trigger_reason = "not_triggered"
+                else:
+                    pace_trigger_reason = "+".join(reasons)
+            for idx in range(len(pop_snapshot)):
+                pop_snapshot[idx]["pace_trigger_mode"] = trigger_mode
+                pop_snapshot[idx]["pace_trigger_reason"] = pace_trigger_reason
             print(
-                f"  [PACE] Running PACE fitness for {pace_eval_count} individuals "
-                f"(top_k={top_k}, elite_buffer={elite_buffer}): {top_k_indices}"
+                f"  [PACE] Running PACE fitness for {len(top_k_indices)} individuals "
+                f"(top_k={top_k}, elite_buffer={elite_buffer}, trigger={pace_trigger_reason}): {top_k_indices}"
             )
             for idx in top_k_indices:
                 ind = self.population[idx]
-                pace_result = self.pace_evaluator.compute_pace_fitness(
-                    ind, self.calib_items, self.fitness_items
-                )
+                pace_cache_enabled = bool(pace_cfg.get("pace_result_cache_enabled", True))
+                pace_cache_key = self._pace_cache_key(ind)
+                if pace_cache_enabled and pace_cache_key in self.pace_memo:
+                    pace_result = dict(self.pace_memo[pace_cache_key])
+                    pace_result["_pace_cache_hit"] = True
+                    self.pace_memo_stats["hits"] = int(self.pace_memo_stats.get("hits", 0)) + 1
+                else:
+                    pace_result = self.pace_evaluator.compute_pace_fitness(
+                        ind, self.calib_items, self.fitness_items
+                    )
+                    pace_result["_pace_cache_hit"] = False
+                    if pace_cache_enabled:
+                        self.pace_memo[pace_cache_key] = dict(pace_result)
+                    self.pace_memo_stats["misses"] = int(self.pace_memo_stats.get("misses", 0)) + 1
+                pace_result["pace_trigger_mode"] = trigger_mode
+                pace_result["pace_trigger_reason"] = pace_trigger_reason
                 self.latest_pace_results[idx] = pace_result
                 calibrator_probe_combined = pace_result.get(
                     'calibrator_probe_combined',
@@ -2840,11 +3501,20 @@ class EvolutionOptimizer:
                     'selection_cost_penalty',
                     'selection_overfit_penalty',
                     'selection_distribution_penalty',
+                    'selection_influence',
                     'evidence_dim',
                     'evidence_schema',
                     'evidence_block_slices',
                     'enabled_blocks',
                     'block_dims',
+                    'evidence_mode',
+                    'neural_anchor_view',
+                    'neural_output_dim',
+                    'neural_attention_stats',
+                    'pace_trigger_mode',
+                    'pace_trigger_reason',
+                    'diagnostic_only_skip_calibrator',
+                    '_pace_cache_hit',
                 ):
                     pop_snapshot[idx][key] = pace_result.get(key)
                 pop_snapshot[idx]['pace_diagnostics'] = pace_result.get('pace_diagnostics', [])
@@ -2900,18 +3570,54 @@ class EvolutionOptimizer:
                     )
                 )
 
-        raw_best_idx = int(np.argmax(scores))
-        raw_adjusted_best_idx = int(np.argmax(raw_adjusted_scores))
-        protocol_quality_best_idx = int(np.argmax(protocol_quality_scores))
-        guarded_best_idx = int(np.argmax(selection_scores))
-        pareto_pool = pareto_feasible_indices or list(range(len(selection_scores)))
+        candidate_rank_pool = list(full_eval_indices) or list(range(len(selection_scores)))
+        raw_best_idx = int(max(candidate_rank_pool, key=lambda i: scores[i]))
+        raw_adjusted_best_idx = int(max(candidate_rank_pool, key=lambda i: raw_adjusted_scores[i]))
+        protocol_quality_best_idx = int(max(candidate_rank_pool, key=lambda i: protocol_quality_scores[i]))
+        guarded_best_idx = int(max(candidate_rank_pool, key=lambda i: selection_scores[i]))
+        pareto_pool = [i for i in pareto_feasible_indices if i in candidate_rank_pool] or candidate_rank_pool
         pareto_best_idx = int(max(pareto_pool, key=lambda i: selection_scores[i]))
 
-        self._track_candidate("best_raw_val", self.population[raw_best_idx], scores[raw_best_idx], gen, raw_best_idx)
-        self._track_candidate("best_raw_guarded", self.population[raw_adjusted_best_idx], raw_adjusted_scores[raw_adjusted_best_idx], gen, raw_adjusted_best_idx)
-        self._track_candidate("best_protocol_quality", self.population[protocol_quality_best_idx], protocol_quality_scores[protocol_quality_best_idx], gen, protocol_quality_best_idx)
-        self._track_candidate("best_pace_guarded", self.population[guarded_best_idx], selection_scores[guarded_best_idx], gen, guarded_best_idx)
-        self._track_candidate("best_pareto", self.population[pareto_best_idx], selection_scores[pareto_best_idx], gen, pareto_best_idx)
+        self._track_candidate(
+            "best_raw_val",
+            self.population[raw_best_idx],
+            scores[raw_best_idx],
+            gen,
+            raw_best_idx,
+            validation_score=scores[raw_best_idx],
+        )
+        self._track_candidate(
+            "best_raw_guarded",
+            self.population[raw_adjusted_best_idx],
+            raw_adjusted_scores[raw_adjusted_best_idx],
+            gen,
+            raw_adjusted_best_idx,
+            validation_score=scores[raw_adjusted_best_idx],
+        )
+        self._track_candidate(
+            "best_protocol_quality",
+            self.population[protocol_quality_best_idx],
+            protocol_quality_scores[protocol_quality_best_idx],
+            gen,
+            protocol_quality_best_idx,
+            validation_score=scores[protocol_quality_best_idx],
+        )
+        self._track_candidate(
+            "best_pace_guarded",
+            self.population[guarded_best_idx],
+            selection_scores[guarded_best_idx],
+            gen,
+            guarded_best_idx,
+            validation_score=scores[guarded_best_idx],
+        )
+        self._track_candidate(
+            "best_pareto",
+            self.population[pareto_best_idx],
+            selection_scores[pareto_best_idx],
+            gen,
+            pareto_best_idx,
+            validation_score=scores[pareto_best_idx],
+        )
 
         best_ind = self.population[pareto_best_idx]
         best_snapshot = best_ind.clone()
@@ -2971,6 +3677,9 @@ class EvolutionOptimizer:
             "protocol_quality_best_idx": protocol_quality_best_idx,
             "guarded_best_idx": guarded_best_idx,
             "pareto_best_idx": pareto_best_idx,
+            "full_eval_indices": list(full_eval_indices),
+            "full_eval_count": len(full_eval_indices),
+            "staged_validation_enabled": bool(self.config.get("evolution", {}).get("staged_validation_enabled", False)),
             "pareto_feasible_count": len(pareto_feasible_indices),
             "raw_guard_triggered_count": len(raw_guard_triggered),
             "pace_evaluated_count": len(self.latest_pace_results),
@@ -2992,7 +3701,10 @@ class EvolutionOptimizer:
                 "parent_anchor_scores": [ex.get("domain1_score") for ex in ind.static_exemplars],
                 "parent_raw_qwk": float(scores[idx]),
                 "parent_raw_adjusted_qwk": float(raw_adjusted_scores[idx]),
-                "parent_protocol_quality": float(protocol_quality_scores[idx]),
+                "parent_validation_stage": pop_snapshot[idx].get("validation_stage"),
+                "parent_validation_n": pop_snapshot[idx].get("validation_n"),
+                "parent_protocol_quality": float(selection_scores[idx]),
+                "parent_protocol_quality_before_guard": pop_snapshot[idx].get("protocol_quality_before_guard"),
                 "parent_pace_probe_qwk": pace_result.get("pace_qwk") if pace_result else None,
                 "parent_anchor_geometry_score": pace_result.get("anchor_geometry_score") if pace_result else None,
                 "parent_high_score_recall": raw_metrics.get("high_score_recall"),
@@ -3008,7 +3720,11 @@ class EvolutionOptimizer:
 
         # 2. Evolve Rubrics（基于 raw-guarded selection_scores 选 elite）
         n_elite = self.config['evolution']['n_elite_evolve']
-        elite_indices = self._select_elite_indices(selection_scores, n_elite)
+        elite_indices = self._select_elite_indices(
+            selection_scores,
+            n_elite,
+            candidate_indices=candidate_rank_pool,
+        )
         elites = [self.population[i] for i in elite_indices]
 
         # 精英保留策略：保留 protocol_quality 最高的个体直接晋级
@@ -3030,7 +3746,12 @@ class EvolutionOptimizer:
             mutation_policy = choose_mutation_policy(elite, pace_diag, self.config)
             elite.mutation_policy = mutation_policy
             parent_eval_trace_by_object[id(elite)].update({
+                "parent_instruction_text": elite.instruction_text,
                 "mutation_type": mutation_policy.get("mutation_type"),
+                "requested_mutation_type": mutation_policy.get("requested_mutation_type", mutation_policy.get("mutation_type")),
+                "actual_mutation_type": mutation_policy.get("actual_mutation_type", mutation_policy.get("mutation_type")),
+                "mutation_axis": mutation_policy.get("mutation_axis", mutation_axis_for_type(mutation_policy.get("mutation_type", ""))),
+                "fallback_reason": mutation_policy.get("fallback_reason", ""),
                 "target_anchor_slot": mutation_policy.get("target_anchor_slot"),
                 "rubric_edit_focus": mutation_policy.get("rubric_edit_focus"),
                 "dominant_error_type_used": pace_diag.get("dominant_error_type"),
@@ -3042,8 +3763,9 @@ class EvolutionOptimizer:
             if evolve_instr:
                 real_feedback = elite.generate_real_feedback(self.val_data)
                 print(f"    [Feedback] {real_feedback[:100]}...")
-                new_text = elite.evolve_instruction(real_feedback, mutation_policy)
-                elite.instruction_text = new_text 
+            else:
+                real_feedback = None
+            parent_eval_trace_by_object[id(elite)]["mutation_feedback"] = real_feedback
             mutated_parents.append(elite)
             
         # 补齐种群：从 mutated_parents 中克隆并变异 exemplars
@@ -3055,13 +3777,61 @@ class EvolutionOptimizer:
              print("  [Config] Static Exemplar evolution DISABLED. Skipping mutation.")
 
         # 剩下的位置用变异填充
+        child_slots_to_fill = max(0, len(self.population) - len(new_pop))
+        child_policy_plan = apply_mutation_diversity_quota(
+            [getattr(parent, "mutation_policy", {}) for parent in mutated_parents],
+            self.config,
+            child_slots_to_fill,
+        )
         while len(new_pop) < len(self.population):
             parent = random.choice(mutated_parents) # 选新 Rubric 的个体做父母
             child = parent.clone()
             parent_trace = dict(parent_eval_trace_by_object.get(id(parent), {}))
+            child_plan_idx = max(0, len(new_pop) - 1)
+            planned_policy = (
+                child_policy_plan[child_plan_idx]
+                if child_plan_idx < len(child_policy_plan)
+                else getattr(parent, "mutation_policy", {})
+            )
+            if planned_policy:
+                parent_trace.update({
+                    "mutation_type": planned_policy.get("mutation_type", parent_trace.get("mutation_type")),
+                    "requested_mutation_type": planned_policy.get(
+                        "requested_mutation_type",
+                        planned_policy.get("mutation_type", parent_trace.get("mutation_type")),
+                    ),
+                    "actual_mutation_type": planned_policy.get(
+                        "actual_mutation_type",
+                        planned_policy.get("mutation_type", parent_trace.get("mutation_type")),
+                    ),
+                    "mutation_axis": planned_policy.get(
+                        "mutation_axis",
+                        mutation_axis_for_type(str(planned_policy.get("mutation_type", parent_trace.get("mutation_type", "")))),
+                    ),
+                    "fallback_reason": planned_policy.get("fallback_reason", ""),
+                    "target_anchor_slot": planned_policy.get("target_anchor_slot", parent_trace.get("target_anchor_slot")),
+                    "rubric_edit_focus": planned_policy.get("rubric_edit_focus", parent_trace.get("rubric_edit_focus")),
+                    "recommended_mutation_used": True,
+                })
+                child.evidence_feedback["mutation_policy"] = planned_policy
+            atomic_ie = bool(self.config.get('evolution', {}).get("atomic_i_e_mutation_enabled", False))
+            mutation_axis = str(parent_trace.get("mutation_axis") or mutation_axis_for_type(str(parent_trace.get("mutation_type", ""))))
+            parent_instruction = parent_trace.get("parent_instruction_text", child.instruction_text)
+            if atomic_ie and mutation_axis == "E":
+                child.instruction_text = parent_instruction
+            elif evolve_instr and (not atomic_ie or mutation_axis in {"I", "IE"}):
+                feedback_for_child = parent_trace.get("mutation_feedback")
+                if not feedback_for_child:
+                    feedback_for_child = child.generate_real_feedback(self.val_data)
+                child.instruction_text = child.evolve_instruction(feedback_for_child, planned_policy)
+            should_mutate_anchor = bool(evolve_exemplars)
+            if atomic_ie and mutation_axis == "I":
+                should_mutate_anchor = False
             parent_trace.update({
-                "instruction_mutated": bool(evolve_instr),
-                "instruction_changed": bool(evolve_instr),
+                "instruction_mutated": bool(evolve_instr and (not atomic_ie or mutation_axis in {"I", "IE"})),
+                "instruction_changed": bool(
+                    child.instruction_text != parent_instruction
+                ),
                 "anchor_mutated": False,
                 "anchors_changed": False,
                 "anchor_mutation_source": None,
@@ -3071,7 +3841,7 @@ class EvolutionOptimizer:
                 "changed_anchor_ids_after": [],
             })
             
-            if evolve_exemplars:
+            if should_mutate_anchor:
                 for _ in range(10): 
                     policy_slot = parent_trace.get("target_anchor_slot")
                     suggested_slot = (
@@ -3138,6 +3908,9 @@ class EvolutionOptimizer:
                         "anchor_slot_name": old_stratum,
                         "preserved_top_high_anchor": preserve_top_high,
                         "mutation_type": parent_trace.get("mutation_type"),
+                        "requested_mutation_type": parent_trace.get("requested_mutation_type"),
+                        "actual_mutation_type": parent_trace.get("actual_mutation_type"),
+                        "fallback_reason": parent_trace.get("fallback_reason"),
                         "dominant_error_type_used": parent_trace.get("dominant_error_type_used"),
                         "recommended_mutation_used": parent_trace.get("recommended_mutation_used"),
                         "parent_trace": dict(parent_trace),
@@ -3296,6 +4069,9 @@ def main(config_path="configs/default.yaml", fold=0, resume_path=None):
     seed = config.get('debug', {}).get('seed', config.get('experiment', {}).get('seed', 42 + fold))
     _set_global_seed(seed)
     print(f"[Main] Global seed set to {seed}")
+    with PROTOCOL_SCORE_CACHE_LOCK:
+        PROTOCOL_SCORE_CACHE.clear()
+        PROTOCOL_CACHE_STATS.update({"hits": 0, "misses": 0, "errors": 0})
 
     # Local backend can be used with or without PACE. Raw-only baselines set
     # pace.enabled=false but keep llm.local_backend_enabled=true so scoring,
@@ -3483,7 +4259,7 @@ def main(config_path="configs/default.yaml", fold=0, resume_path=None):
         "best_protocol_quality": best_bundle.get("best_protocol_quality"),
         "best_pace_guarded": best_bundle.get("best_pace_guarded"),
     }
-    primary_label = "best_pareto"
+    primary_label = choose_final_primary_label(candidates, config)
     raw_primary_label = "best_raw_guarded" if candidates.get("best_raw_guarded") is not None else "best_raw_val"
     best = (
         candidates.get(primary_label)
@@ -3491,7 +4267,9 @@ def main(config_path="configs/default.yaml", fold=0, resume_path=None):
         or candidates.get("best_raw_val")
         or candidates.get("best_protocol_quality")
     )
-    val_best_fitness = best.fitness if best is not None else 0.0
+    primary_selection_score = (
+        float(getattr(best, "selection_score", best.fitness)) if best is not None else 0.0
+    )
     
     # 4. 最终测试
     print(f"\n{'='*20} Final Test Evaluation {'='*20}")
@@ -3518,8 +4296,12 @@ def main(config_path="configs/default.yaml", fold=0, resume_path=None):
             }
             continue
 
-        val_score = float(candidate.fitness)
-        print(f"\n  [Final] Evaluating {label} | val_score={val_score:.4f}")
+        val_score = float(getattr(candidate, "validation_score", candidate.fitness))
+        selection_score = float(getattr(candidate, "selection_score", candidate.fitness))
+        print(
+            f"\n  [Final] Evaluating {label} | "
+            f"val_qwk={val_score:.4f} selection_score={selection_score:.4f}"
+        )
         raw_test_qwk = candidate.evaluate(test_set, optimizer.vector_store, enable_rerank=use_rerank_test)
         raw_test_metrics = optimizer._score_prediction_metrics(
             [x['domain1_score'] for x in test_set],
@@ -3535,12 +4317,13 @@ def main(config_path="configs/default.yaml", fold=0, resume_path=None):
             extra={
                 "raw_qwk": raw_test_qwk,
                 "raw_adjusted_qwk": None,
-                "protocol_quality": val_score,
+                "protocol_quality": selection_score,
                 "validation_score": val_score,
+                "selection_score": selection_score,
             },
         )
         final_high_score_rows.append(final_high_row)
-        candidate.fitness = val_score
+        candidate.fitness = selection_score
 
         pace_calibrated = None
         guarded_calibrated = None
@@ -3579,6 +4362,7 @@ def main(config_path="configs/default.yaml", fold=0, resume_path=None):
         candidate_results[label] = {
             "label": label,
             "validation_score": val_score,
+            "selection_score": selection_score,
             "source_generation": getattr(candidate, "source_generation", None),
             "source_index": getattr(candidate, "source_index", None),
             "raw_test_qwk": float(raw_test_qwk),
@@ -3606,8 +4390,11 @@ def main(config_path="configs/default.yaml", fold=0, resume_path=None):
     raw_primary_val_qwk = float(
         candidate_results.get(raw_primary_label, {}).get("validation_score", 0.0) or 0.0
     )
+    primary_validation_score = float(
+        candidate_results.get(primary_label, {}).get("validation_score", 0.0) or 0.0
+    )
 
-    print(f"\nValidation Primary QWK: {val_best_fitness:.4f} ({primary_label})")
+    print(f"\nValidation Primary QWK: {primary_validation_score:.4f} ({primary_label})")
     print(f"Primary Raw Test QWK:   {test_qwk:.4f}")
     if raw_primary_label in candidate_results:
         print(
@@ -3633,12 +4420,16 @@ def main(config_path="configs/default.yaml", fold=0, resume_path=None):
     EXP_MANAGER.save_final_results(best, optimizer.history, test_results={
         "primary_candidate": primary_label,
         "raw_primary_candidate": raw_primary_label,
+        "final_primary_policy": config.get("evolution", {}).get("final_primary_candidate", "best_raw_guarded"),
         "selection_policy": (
-            "Primary candidate is selected before test evaluation by raw-first constrained/Pareto validation. "
+            "Primary candidate is selected before test evaluation by a configurable validation-only policy. "
+            "The default policy is raw-first best_raw_guarded; PACE/Pareto candidates remain diagnostics. "
             "PACE-calibrated test scores are diagnostics only; raw direct test QWK is the success metric."
         ),
         "test_qwk": test_qwk,
         "primary_raw_test_qwk": test_qwk,
+        "primary_validation_score": primary_validation_score,
+        "primary_selection_score": primary_selection_score,
         "raw_primary_test_qwk": raw_primary_test_qwk,
         "raw_primary_test_mae": raw_primary_test_mae,
         "raw_primary_score_distribution": (
@@ -3662,6 +4453,13 @@ def main(config_path="configs/default.yaml", fold=0, resume_path=None):
         "total_pace_tokens": total_pace_tokens,
         "final_pace_tokens": final_pace_tokens,
         "total_tokens_all": total_tokens_all,
+        "cache_stats": {
+            "protocol_qwk_cache": dict(optimizer.fitness_memo.get("__stats__", {})),
+            "protocol_score_cache": dict(PROTOCOL_CACHE_STATS),
+            "protocol_score_cache_size": len(PROTOCOL_SCORE_CACHE),
+            "pace_result_cache": dict(optimizer.pace_memo_stats),
+            "pace_result_cache_size": len(optimizer.pace_memo),
+        },
     })
 
 if __name__ == "__main__":

@@ -39,6 +39,7 @@ from pace.evidence import (
     build_uncertainty_features,
 )
 from pace.llm_backend import LocalLlamaBackend, ScoringRequest, ScoringResult
+from pace.neural_evidence import NeuralEvidenceConfig, NeuralEvidenceEncoder
 
 if TYPE_CHECKING:
     pass  # PromptIndividual 用字符串注解，避免循环导入
@@ -61,6 +62,8 @@ class PaceFitnessConfig:
     lr: float = 1e-3
     batch_size: int = 16
     lambda_qwk: float = 0.25
+    evidence_mode: str = "compact_manual"
+    neural_evidence: Dict[str, object] = field(default_factory=dict)
     use_compact_evidence: bool = True
     early_reject_enabled: bool = False
     early_reject_mini_set_size: int = 16
@@ -81,6 +84,8 @@ class PaceFitnessConfig:
     collapse_penalty_weight: float = 0.15
     max_score_overprediction_threshold: float = 3.0
     max_score_penalty_weight: float = 0.03
+    diagnostic_only_skip_calibrator: bool = False
+    diagnostic_sample_size: int = 0
     evidence_blocks_enabled: Dict[str, bool] = field(
         default_factory=lambda: {
             "raw": True,
@@ -107,6 +112,8 @@ class PaceFitnessConfig:
             lr=p.get("lr", 1e-3),
             batch_size=p.get("batch_size", 16),
             lambda_qwk=p.get("lambda_qwk", 0.25),
+            evidence_mode=p.get("evidence_mode", "compact_manual"),
+            neural_evidence=dict(p.get("neural_evidence", {}) or {}),
             use_compact_evidence=p.get("use_compact_evidence", True),
             early_reject_enabled=p.get("early_reject_enabled", False),
             early_reject_mini_set_size=p.get("early_reject_mini_set_size", 16),
@@ -127,6 +134,8 @@ class PaceFitnessConfig:
             collapse_penalty_weight=p.get("collapse_penalty_weight", 0.15),
             max_score_overprediction_threshold=p.get("max_score_overprediction_threshold", 3.0),
             max_score_penalty_weight=p.get("max_score_penalty_weight", 0.03),
+            diagnostic_only_skip_calibrator=p.get("diagnostic_only_skip_calibrator", False),
+            diagnostic_sample_size=p.get("diagnostic_sample_size", 0),
             evidence_blocks_enabled={
                 **cls().evidence_blocks_enabled,
                 **dict(p.get("evidence_blocks_enabled", {}) or {}),
@@ -170,6 +179,21 @@ class PaceFitnessEvaluator:
         self.score_min = score_min
         self.score_max = score_max
         self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.evidence_mode = str(config.evidence_mode or "compact_manual")
+        hidden_input_dim = int(
+            config.neural_evidence.get(
+                "hidden_input_dim",
+                getattr(local_backend, "hidden_dim", 4096),
+            )
+        )
+        neural_kwargs = dict(config.neural_evidence or {})
+        neural_kwargs["hidden_input_dim"] = hidden_input_dim
+        self.neural_config = NeuralEvidenceConfig(**neural_kwargs)
+        self.neural_encoder: Optional[NeuralEvidenceEncoder] = None
+        if self.evidence_mode == "neural_hidden":
+            self.neural_encoder = NeuralEvidenceEncoder(self.neural_config).to(self._device)
+            self.neural_encoder.eval()
+        self._last_neural_attention_stats: Dict[str, float] = {}
 
     def evidence_schema(self, n_anchors: int = 3) -> List[str]:
         """Return the ordered feature names used by _build_evidence_bundle."""
@@ -181,6 +205,19 @@ class PaceFitnessEvaluator:
 
     def evidence_blocks(self, n_anchors: int = 3) -> Dict[str, List[str]]:
         """Return ordered evidence feature names grouped by semantic block."""
+        if self.evidence_mode == "neural_hidden":
+            dim = int(self.neural_config.output_dim)
+            p = max(1, dim // 4)
+            a = max(1, dim // 4)
+            r = max(1, dim // 4)
+            used = p + a + r
+            s = max(0, dim - used)
+            return {
+                "neural_target": [f"neural_target_{i}" for i in range(p)],
+                "neural_anchor_context": [f"neural_anchor_context_{i}" for i in range(a)],
+                "neural_reasoning": [f"neural_reasoning_{i}" for i in range(r)],
+                "neural_score": [f"neural_score_{i}" for i in range(s)],
+            }
         roles = self._anchor_role_names(n_anchors)
         reasoning = [
             "reasoning_log_words",
@@ -282,6 +319,16 @@ class PaceFitnessEvaluator:
         return {k: len(v) for k, v in self.evidence_block_slices(n_anchors).items()}
 
     def enabled_evidence_blocks(self) -> Dict[str, bool]:
+        if self.evidence_mode == "neural_hidden":
+            return {
+                "neural_target": True,
+                "neural_anchor_context": self.neural_config.anchor_view != "none",
+                "neural_reasoning": bool(self.neural_config.use_reasoning_hidden),
+                "neural_score": bool(
+                    self.neural_config.use_raw_score_embedding
+                    or self.neural_config.use_score_distribution
+                ),
+            }
         defaults = {
             "raw": True,
             "anchor": True,
@@ -295,13 +342,24 @@ class PaceFitnessEvaluator:
         return defaults
 
     def evidence_metadata(self, n_anchors: int = 3) -> Dict[str, object]:
-        return {
+        payload = {
             "evidence_dim": self.evidence_dim(n_anchors),
             "evidence_schema": self.evidence_schema(n_anchors),
             "evidence_block_slices": self.evidence_block_slices(n_anchors),
             "enabled_blocks": self.enabled_evidence_blocks(),
             "block_dims": self.evidence_block_dims(n_anchors),
+            "evidence_mode": self.evidence_mode,
         }
+        if self.evidence_mode == "neural_hidden":
+            payload.update({
+                "neural_anchor_view": self.neural_config.anchor_view,
+                "neural_output_dim": self.neural_config.output_dim,
+                "neural_attention_mode": self.neural_config.attention_mode,
+                "neural_projection_seed": self.neural_config.projection_seed,
+                "neural_preserve_block_structure": self.neural_config.preserve_block_structure,
+                "neural_attention_stats": dict(self._last_neural_attention_stats),
+            })
+        return payload
 
     # ------------------------------------------------------------------
     # 公共接口
@@ -341,15 +399,28 @@ class PaceFitnessEvaluator:
         self,
         static_exemplars: List[Dict],
         instruction: str,
-    ) -> torch.Tensor:
+        return_dual: bool = False,
+    ) -> torch.Tensor | Dict[str, object]:
         """计算 anchor essay 的 scoring-context hidden states。
 
         返回 shape (n_anchors, hidden_dim)。
         """
-        hiddens = []
+        hiddens_score = []
+        hiddens_text = []
         roles = self._anchor_role_names(len(static_exemplars))
         for idx, ex in enumerate(static_exemplars):
             role = roles[idx] if idx < len(roles) else self._score_band_label(ex["domain1_score"])
+            if return_dual:
+                text_hidden = self.backend.encode_scoring_context(
+                    instruction=instruction,
+                    static_exemplars=static_exemplars,
+                    essay_text=ex["essay_text"],
+                    score_min=self.score_min,
+                    score_max=self.score_max,
+                    known_score=None,
+                    representation_target="Encode this essay as a reference essay without using its score label.",
+                )
+                hiddens_text.append(text_hidden.float())
             hidden = self.backend.encode_scoring_context(
                 instruction=instruction,
                 static_exemplars=static_exemplars,
@@ -359,8 +430,110 @@ class PaceFitnessEvaluator:
                 known_score=ex["domain1_score"],
                 representation_target=f"Encode this reference essay as a {role}-score anchor.",
             )
-            hiddens.append(hidden.float())
-        return torch.stack(hiddens, dim=0)  # (n_anchors, hidden_dim)
+            hiddens_score.append(hidden.float())
+        score_stack = torch.stack(hiddens_score, dim=0)
+        if not return_dual:
+            return score_stack  # (n_anchors, hidden_dim)
+        text_stack = torch.stack(hiddens_text, dim=0) if hiddens_text else score_stack
+        return {
+            "anchor_hiddens_text": text_stack,
+            "anchor_hiddens_score": score_stack,
+            "anchor_scores": [int(ex["domain1_score"]) for ex in static_exemplars],
+        }
+
+    def _anchor_forward_pass_count(self, static_exemplars: List[Dict]) -> int:
+        multiplier = 2 if self.evidence_mode == "neural_hidden" else 1
+        return int(len(static_exemplars) * multiplier)
+
+    def _compute_diagnostic_only_probe(
+        self,
+        *,
+        items: List[Dict],
+        results: List[ScoringResult],
+        anchor_hiddens: torch.Tensor,
+        anchor_scores: List[int],
+        evidence_schema: List[str],
+        evidence_payload: Dict[str, object],
+        anchor_sec: float,
+        fitness_sec: float,
+        usage_before: Dict[str, int],
+        static_exemplars: List[Dict],
+    ) -> Dict:
+        """Return hidden-error diagnostics without training a PACE calibrator."""
+        y_true = [int(item["domain1_score"]) for item in items]
+        y_raw = [int(result.y_raw) for result in results]
+        essay_hiddens = [result.hidden.float() for result in results if result.hidden is not None]
+        if essay_hiddens:
+            anchor_geometry = self.compute_anchor_geometry(
+                anchor_hiddens=anchor_hiddens,
+                essay_hiddens=torch.stack(essay_hiddens, dim=0),
+                y_true=y_true,
+                anchor_scores=anchor_scores,
+            )
+        else:
+            anchor_geometry = {
+                "anchor_geometry_score": 0.0,
+                "anchor_separation": 0.0,
+                "anchor_separation_raw": 0.0,
+                "anchor_ordinal_consistency": 0.0,
+                "anchor_monotonicity": 0.0,
+                "anchor_min_pair": [],
+            }
+        diagnostics = self.classify_error_types(
+            items=items,
+            results=results,
+            y_true=y_true,
+            anchor_hiddens=anchor_hiddens,
+            anchor_scores=anchor_scores,
+            anchor_geometry=anchor_geometry,
+        )
+        distribution_metrics = self._prediction_distribution_metrics(y_true, y_raw)
+        usage_delta = self.backend.usage_delta(usage_before)
+        total_sec = anchor_sec + fitness_sec
+        anchor_passes = self._anchor_forward_pass_count(static_exemplars)
+        return {
+            "pace_qwk": 0.0,
+            "raw_qwk": self._safe_qwk(y_true, y_raw),
+            "calib_pace_qwk": None,
+            "calib_raw_qwk": None,
+            "overfit_gap": 0.0,
+            "overfit_penalty": 0.0,
+            "distribution_penalty": 0.0,
+            "pace_distribution_metrics": distribution_metrics,
+            **self._distribution_flat_payload(distribution_metrics),
+            "anchor_geometry_score": anchor_geometry["anchor_geometry_score"],
+            "anchor_separation": anchor_geometry["anchor_separation"],
+            "anchor_separation_raw": anchor_geometry["anchor_separation_raw"],
+            "anchor_ordinal_consistency": anchor_geometry["anchor_ordinal_consistency"],
+            "anchor_monotonicity": anchor_geometry["anchor_monotonicity"],
+            "anchor_min_pair": anchor_geometry["anchor_min_pair"],
+            "pace_diagnostics": diagnostics["diagnostics"],
+            "pace_diagnostic_summary": diagnostics["summary"],
+            "dominant_error_type": diagnostics["dominant_error_type"],
+            "suggested_anchor_mutation_slot": diagnostics["suggested_anchor_mutation_slot"],
+            "early_rejection_metrics": {},
+            "cost_penalty": 0.0,
+            "local_usage": usage_delta,
+            "evidence_dim": len(evidence_schema),
+            "evidence_schema": evidence_schema,
+            **evidence_payload,
+            "calibrator_probe_combined": 0.0,
+            "pace_qwk_used_for_selection": False,
+            "diagnostic_only_skip_calibrator": True,
+            "anchor_inference_sec": round(anchor_sec, 2),
+            "calib_inference_sec": 0.0,
+            "fitness_inference_sec": round(fitness_sec, 2),
+            "calibrator_train_sec": 0.0,
+            "total_pace_sec": round(total_sec, 2),
+            "n_calib": 0,
+            "n_fitness": len(results),
+            "scoring_forward_passes": len(results),
+            "representation_forward_passes": anchor_passes + len(results),
+            "total_local_forward_passes": anchor_passes + 2 * len(results),
+            "local_prompt_tokens": usage_delta.get("prompt_tokens", 0),
+            "local_completion_tokens": usage_delta.get("completion_tokens", 0),
+            "local_representation_tokens": usage_delta.get("representation_tokens", 0),
+        }
 
     def compute_pace_fitness(
         self,
@@ -386,13 +559,43 @@ class PaceFitnessEvaluator:
         # 1. Anchor hidden states
         t0 = time.time()
         try:
-            anchor_hiddens = self.compute_anchor_hiddens(static_exemplars, instruction)
+            anchor_payload = None
+            if self.evidence_mode == "neural_hidden":
+                anchor_payload = self.compute_anchor_hiddens(
+                    static_exemplars,
+                    instruction,
+                    return_dual=True,
+                )
+                anchor_hiddens = anchor_payload["anchor_hiddens_score"]  # type: ignore[index]
+            else:
+                anchor_hiddens = self.compute_anchor_hiddens(static_exemplars, instruction)
         except Exception as e:
             print(f"    [PACE] anchor_hiddens failed: {e}. Returning raw QWK as fallback.")
             return self._fallback_result(extra=self._usage_payload(usage_before))
         anchor_sec = time.time() - t0
         evidence_schema = self.evidence_schema(anchor_hiddens.shape[0])
         evidence_payload = self.evidence_metadata(anchor_hiddens.shape[0])
+
+        if self.config.diagnostic_only_skip_calibrator:
+            diag_items = list(fitness_items)
+            n_diag = int(self.config.diagnostic_sample_size or 0)
+            if n_diag > 0 and n_diag < len(diag_items):
+                diag_items = self._select_mini_items(diag_items, n_diag)
+            t0 = time.time()
+            diag_results = self.score_essays(diag_items, instruction, static_exemplars)
+            diag_sec = time.time() - t0
+            return self._compute_diagnostic_only_probe(
+                items=diag_items,
+                results=diag_results,
+                anchor_hiddens=anchor_hiddens,
+                anchor_scores=[ex["domain1_score"] for ex in static_exemplars],
+                evidence_schema=evidence_schema,
+                evidence_payload=evidence_payload,
+                anchor_sec=anchor_sec,
+                fitness_sec=diag_sec,
+                usage_before=usage_before,
+                static_exemplars=static_exemplars,
+            )
 
         early_sec = 0.0
         early_results: Optional[List[ScoringResult]] = None
@@ -458,6 +661,7 @@ class PaceFitnessEvaluator:
                 item["essay_text"],
                 anchor_hiddens,
                 anchor_scores=[ex["domain1_score"] for ex in static_exemplars],
+                anchor_payload=anchor_payload,
             )
             z_calib_list.append(z)
             y_calib_list.append(item["domain1_score"])
@@ -521,6 +725,7 @@ class PaceFitnessEvaluator:
                 item["essay_text"],
                 anchor_hiddens,
                 anchor_scores=[ex["domain1_score"] for ex in static_exemplars],
+                anchor_payload=anchor_payload,
             )
             z_fitness_list.append(z)
             y_fitness_true.append(item["domain1_score"])
@@ -593,6 +798,7 @@ class PaceFitnessEvaluator:
         total_sec = anchor_sec + calib_sec + fitness_sec + train_sec
         cost_penalty = self.config.cost_penalty_lambda * self._cost_scale(total_sec)
         usage_delta = self.backend.usage_delta(usage_before)
+        evidence_payload = self.evidence_metadata(anchor_hiddens.shape[0])
         calibrator_probe_combined = (
             self.config.alpha * pace_qwk
             + self.config.beta * raw_qwk
@@ -677,7 +883,16 @@ class PaceFitnessEvaluator:
 
         try:
             t0 = time.time()
-            anchor_hiddens = self.compute_anchor_hiddens(static_exemplars, instruction)
+            anchor_payload = None
+            if self.evidence_mode == "neural_hidden":
+                anchor_payload = self.compute_anchor_hiddens(
+                    static_exemplars,
+                    instruction,
+                    return_dual=True,
+                )
+                anchor_hiddens = anchor_payload["anchor_hiddens_score"]  # type: ignore[index]
+            else:
+                anchor_hiddens = self.compute_anchor_hiddens(static_exemplars, instruction)
             anchor_sec = time.time() - t0
             evidence_schema = self.evidence_schema(anchor_hiddens.shape[0])
             evidence_payload = self.evidence_metadata(anchor_hiddens.shape[0])
@@ -701,6 +916,7 @@ class PaceFitnessEvaluator:
                     item["essay_text"],
                     anchor_hiddens,
                     anchor_scores=[ex["domain1_score"] for ex in static_exemplars],
+                    anchor_payload=anchor_payload,
                 )
             )
             y_calib_list.append(item["domain1_score"])
@@ -746,6 +962,7 @@ class PaceFitnessEvaluator:
                     item["essay_text"],
                     anchor_hiddens,
                     anchor_scores=[ex["domain1_score"] for ex in static_exemplars],
+                    anchor_payload=anchor_payload,
                 )
             )
             y_eval_true.append(item["domain1_score"])
@@ -798,6 +1015,7 @@ class PaceFitnessEvaluator:
         distribution_penalty = self._distribution_penalty(distribution_metrics)
         usage_delta = self.backend.usage_delta(usage_before)
         total_sec = time.time() - total_start
+        evidence_payload = self.evidence_metadata(anchor_hiddens.shape[0])
 
         return {
             "pace_qwk": pace_qwk,
@@ -840,6 +1058,7 @@ class PaceFitnessEvaluator:
         essay_text: str,
         anchor_hiddens: torch.Tensor,
         anchor_scores: Optional[List[int]] = None,
+        anchor_payload: Optional[Dict[str, object]] = None,
     ) -> torch.Tensor:
         """Build compact, schema-backed evidence vector z.
 
@@ -848,6 +1067,13 @@ class PaceFitnessEvaluator:
         features (11), objective essay features (11), and uncertainty features
         (6).
         """
+        if self.evidence_mode == "neural_hidden":
+            return self._build_neural_evidence_bundle(
+                result=result,
+                anchor_hiddens=anchor_hiddens,
+                anchor_scores=anchor_scores,
+                anchor_payload=anchor_payload,
+            )
         h = result.hidden.float()  # (hidden_dim,)
         anchors = anchor_hiddens.float()  # (n_anchors, hidden_dim)
         n_anchors = int(anchors.shape[0])
@@ -955,6 +1181,67 @@ class PaceFitnessEvaluator:
             dim=0,
         ).float()
         return self._validate_evidence_vector(z, n_anchors)
+
+    def _build_neural_evidence_bundle(
+        self,
+        *,
+        result: ScoringResult,
+        anchor_hiddens: torch.Tensor,
+        anchor_scores: Optional[List[int]],
+        anchor_payload: Optional[Dict[str, object]],
+    ) -> torch.Tensor:
+        if result.hidden is None:
+            raise ValueError("neural_hidden evidence requires result.hidden")
+        if self.neural_encoder is None:
+            self.neural_encoder = NeuralEvidenceEncoder(self.neural_config).to(self._device)
+            self.neural_encoder.eval()
+        target_hidden = result.hidden.float().to(self._device).unsqueeze(0)
+        payload = anchor_payload or {}
+        anchor_text = payload.get("anchor_hiddens_text")
+        anchor_score = payload.get("anchor_hiddens_score")
+        if anchor_text is None:
+            anchor_text = anchor_hiddens
+        if anchor_score is None:
+            anchor_score = anchor_hiddens
+        scores = payload.get("anchor_scores") or anchor_scores or []
+        anchor_scores_tensor = torch.tensor(scores, dtype=torch.float32, device=self._device)
+
+        reasoning_hidden = None
+        if self.neural_config.use_reasoning_hidden:
+            try:
+                reasoning_hidden = self.backend.encode_text_mean(result.raw_text).float().to(self._device)
+            except Exception:
+                reasoning_hidden = torch.zeros_like(target_hidden[0])
+
+        y_raw = torch.tensor([result.y_raw], dtype=torch.float32, device=self._device)
+        with torch.no_grad():
+            z, aux = self.neural_encoder(
+                target_hidden=target_hidden,
+                anchor_hidden_text=anchor_text.to(self._device) if isinstance(anchor_text, torch.Tensor) else None,
+                anchor_hidden_score=anchor_score.to(self._device) if isinstance(anchor_score, torch.Tensor) else None,
+                anchor_scores=anchor_scores_tensor,
+                score_min=self.score_min,
+                score_max=self.score_max,
+                reasoning_hidden=reasoning_hidden,
+                y_raw=y_raw,
+            )
+        attn = aux.get("attention_weights")
+        if isinstance(attn, torch.Tensor) and attn.numel():
+            attn_cpu = attn.detach().float().cpu()
+            self._last_neural_attention_stats = {
+                "mean": float(attn_cpu.mean().item()),
+                "max": float(attn_cpu.max().item()),
+                "min": float(attn_cpu.min().item()),
+            }
+        else:
+            self._last_neural_attention_stats = {"mean": 0.0, "max": 0.0, "min": 0.0}
+        z_flat = z[0].detach().cpu().float()
+        if not torch.isfinite(z_flat).all():
+            z_flat = torch.nan_to_num(z_flat, nan=0.0, posinf=10.0, neginf=-10.0)
+        expected_dim = self.evidence_dim(anchor_hiddens.shape[0])
+        if z_flat.numel() != expected_dim:
+            raise ValueError(f"Neural evidence dim mismatch: got {z_flat.numel()}, expected {expected_dim}")
+        return z_flat
 
     def _validate_evidence_vector(self, z: torch.Tensor, n_anchors: int) -> torch.Tensor:
         expected_dim = self.evidence_dim(n_anchors)
