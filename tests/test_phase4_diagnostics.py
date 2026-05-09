@@ -858,6 +858,11 @@ def test_contrastive_anchor_pairs_are_score_range_generic():
         "configs/phase4_z_no_anchor_smoke.yaml",
         "configs/phase4_cost_aware_mid.yaml",
         "configs/phase4_raw_only_cost_aware_mid.yaml",
+        "configs/phase4_fixed_mid.yaml",
+        "configs/phase4_raw_error_pe_mid.yaml",
+        "configs/phase4_reflection_pe_mid.yaml",
+        "configs/phase4_hidden_pe_mid.yaml",
+        "configs/phase4_hidden_contrastive_mid.yaml",
     ],
 )
 def test_phase4_configs_load(path):
