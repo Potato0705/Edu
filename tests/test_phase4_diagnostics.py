@@ -744,6 +744,52 @@ def test_parent_child_audit_row_serializes(tmp_path):
     assert json.loads(rows[0]["changed_anchor_slots"]) == [1]
 
 
+def test_candidate_lineage_jsonl_serializes(tmp_path):
+    mgr = ExperimentManager.__new__(ExperimentManager)
+    mgr.exp_dir = tmp_path
+    mgr.config = {
+        "evolution": {"diagnostic_source": "hidden_evidence"},
+        "data": {"prompt_id": 1},
+    }
+    population = [
+        {
+            "signature": "child",
+            "static_exemplar_ids": [1, 2],
+            "static_exemplar_scores": [8, 12],
+            "contrastive_anchor_pair_ids": ["8_vs_9:1-2"],
+            "contrastive_anchor_boundaries": ["8_vs_9"],
+            "raw_fitness": 0.4,
+            "raw_adjusted_fitness": 0.35,
+            "selection_fitness": 0.35,
+            "protocol_quality": 0.4,
+            "validation_stage": "full",
+            "validation_n": 16,
+            "raw_prediction_metrics": {
+                "high_score_recall": 0.5,
+                "max_score_recall": 0.25,
+                "score_distribution_tv": 0.4,
+                "mae": 1.0,
+            },
+            "protocol_candidate": {
+                "id": "child",
+                "parent_id": "parent",
+                "diagnostic_source": "hidden_evidence",
+                "diagnostic_type": "HIGH_TAIL_UNDERSCORE",
+                "mutation_operator": "max_score_contrastive_mutation",
+            },
+        }
+    ]
+    mgr.save_candidate_lineage(2, population, metrics={"tokens_total_all": 100, "duration_sec": 3.0})
+    out = tmp_path / "candidate_lineage.jsonl"
+    assert out.exists()
+    row = json.loads(out.read_text(encoding="utf-8").splitlines()[0])
+    assert row["generation"] == 2
+    assert row["candidate_id"] == "child"
+    assert row["parent_id"] == "parent"
+    assert row["val_sel_metrics"]["high_score_recall"] == 0.5
+    assert row["contrastive_anchor_pair_ids"] == ["8_vs_9:1-2"]
+
+
 def test_dual_validation_split_is_disjoint_and_stratified():
     val_set = [
         {"essay_id": i, "essay_text": f"essay {i}", "domain1_score": 2 + (i % 11)}

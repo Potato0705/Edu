@@ -265,6 +265,74 @@ class ExperimentManager:
         }
         with open(filename, 'w', encoding='utf-8') as f:
             json.dump(snapshot, f, ensure_ascii=False, indent=2)
+        self.save_candidate_lineage(generation, population_data, metrics=metrics)
+
+    def save_candidate_lineage(self, generation: int, population_data: List[Dict], metrics: Dict = None):
+        """Append one JSONL row per candidate for paper-facing lineage audits."""
+        path = self.exp_dir / "candidate_lineage.jsonl"
+        rows = []
+        for idx, candidate in enumerate(population_data):
+            protocol_candidate = candidate.get("protocol_candidate") or {}
+            parent_trace = candidate.get("parent_trace") or {}
+            raw_metrics = candidate.get("raw_prediction_metrics") or {}
+            rows.append({
+                "generation": generation,
+                "candidate_index": idx,
+                "candidate_id": protocol_candidate.get("id") or candidate.get("signature"),
+                "parent_id": protocol_candidate.get("parent_id") or parent_trace.get("parent_signature"),
+                "method_type": (
+                    candidate.get("diagnostic_source")
+                    or protocol_candidate.get("diagnostic_source")
+                    or parent_trace.get("diagnostic_source")
+                    or self.config.get("evolution", {}).get("diagnostic_source", "")
+                ),
+                "signature": candidate.get("signature"),
+                "parent_signature": parent_trace.get("parent_signature"),
+                "diagnostic_source": candidate.get("diagnostic_source") or protocol_candidate.get("diagnostic_source") or parent_trace.get("diagnostic_source"),
+                "diagnostic_type": candidate.get("diagnostic_type") or protocol_candidate.get("diagnostic_type") or parent_trace.get("diagnostic_type"),
+                "mutation_operator": candidate.get("mutation_type") or protocol_candidate.get("mutation_operator") or parent_trace.get("mutation_type"),
+                "mutation_prompt": candidate.get("mutation_prompt") or parent_trace.get("mutation_feedback"),
+                "evidence_summary": candidate.get("evidence_summary") or protocol_candidate.get("evidence_summary") or parent_trace.get("evidence_summary"),
+                "protocol_diff": candidate.get("protocol_diff") or protocol_candidate.get("protocol_diff") or parent_trace.get("protocol_diff"),
+                "absolute_anchor_ids": candidate.get("static_exemplar_ids"),
+                "absolute_anchor_scores": candidate.get("static_exemplar_scores"),
+                "contrastive_anchor_pair_ids": candidate.get("contrastive_anchor_pair_ids"),
+                "contrastive_anchor_boundaries": candidate.get("contrastive_anchor_boundaries"),
+                "val_sel_metrics": {
+                    "raw_qwk": candidate.get("raw_fitness"),
+                    "raw_adjusted_qwk": candidate.get("raw_adjusted_fitness"),
+                    "selection_fitness": candidate.get("selection_fitness"),
+                    "protocol_quality": candidate.get("protocol_quality"),
+                    "validation_stage": candidate.get("validation_stage"),
+                    "validation_n": candidate.get("validation_n"),
+                    "high_score_recall": raw_metrics.get("high_score_recall"),
+                    "max_score_recall": raw_metrics.get("max_score_recall"),
+                    "score_distribution_tv": raw_metrics.get("score_distribution_tv"),
+                    "mae": raw_metrics.get("mae"),
+                },
+                "val_diag_metrics": {
+                    "pace_fitness": candidate.get("pace_fitness"),
+                    "pace_raw_fitness": candidate.get("pace_raw_fitness"),
+                    "anchor_geometry_score": candidate.get("anchor_geometry_score"),
+                    "dominant_error_type": candidate.get("dominant_error_type"),
+                },
+                "accepted": candidate.get("mutation_acceptance_status") == "accepted",
+                "rejection_reason": candidate.get("mutation_acceptance_reasons"),
+                "token_cost": {
+                    "generation_tokens_total": (metrics or {}).get("tokens_total_all"),
+                    "pace_tokens_total": (metrics or {}).get("pace_tokens_total"),
+                },
+                "runtime": {
+                    "generation_duration_sec": (metrics or {}).get("duration_sec"),
+                },
+                "config_hash": hashlib.md5(
+                    json.dumps(self.config, sort_keys=True, default=str).encode("utf-8")
+                ).hexdigest()[:12],
+                "commit_hash": os.environ.get("WISE_PACE_COMMIT", ""),
+            })
+        with open(path, "a", encoding="utf-8") as f:
+            for row in rows:
+                f.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
 
     def save_training_curve(self, history: List[Dict]):
         if not history:
