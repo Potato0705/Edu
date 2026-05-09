@@ -30,9 +30,13 @@ def write_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("exp_dir")
+    parser.add_argument("exp_dir", nargs="?")
+    parser.add_argument("--exp-dir", dest="exp_dir_flag")
     args = parser.parse_args()
-    exp_dir = Path(args.exp_dir)
+    exp_dir_arg = args.exp_dir_flag or args.exp_dir
+    if not exp_dir_arg:
+        parser.error("exp_dir is required, either positionally or via --exp-dir")
+    exp_dir = Path(exp_dir_arg)
     final_result = json.loads((exp_dir / "final_result.json").read_text(encoding="utf-8"))
     test_results = final_result.get("test_results", {})
     candidate_results = test_results.get("candidate_results", {})
@@ -45,6 +49,9 @@ def main() -> int:
             "label": label,
             "duplicate_of": result.get("duplicate_of"),
             "validation_score": result.get("validation_score"),
+            "selection_score": result.get("selection_score"),
+            "primary_candidate": test_results.get("primary_candidate"),
+            "final_primary_policy": test_results.get("final_primary_policy"),
             "raw_test_qwk": result.get("raw_test_qwk"),
             "raw_test_mae": result.get("raw_test_mae"),
             "source_generation": result.get("source_generation"),
@@ -54,6 +61,7 @@ def main() -> int:
             "high_score_recall": audit.get("high_score_recall"),
             "max_score_recall": audit.get("max_score_recall"),
             "score_distribution_tv": audit.get("score_distribution_tv"),
+            "validation_split": test_results.get("validation_split"),
         }
         candidate_rows.append(row)
         final_rows.append({**row, "selection_policy": test_results.get("selection_policy")})

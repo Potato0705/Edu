@@ -57,6 +57,12 @@ PARENT_CHILD_AUDIT_FIELDS = [
     "delta_comparable",
     "parent_raw_adjusted_qwk",
     "child_raw_adjusted_qwk",
+    "parent_raw_mae",
+    "child_raw_mae",
+    "delta_raw_mae",
+    "parent_score_distribution_tv",
+    "child_score_distribution_tv",
+    "delta_score_distribution_tv",
     "parent_pace_probe_qwk",
     "child_pace_probe_qwk",
     "parent_anchor_geometry_score",
@@ -81,6 +87,20 @@ PARENT_CHILD_AUDIT_FIELDS = [
     "recommended_mutation_used",
     "target_anchor_slot",
     "rubric_edit_focus",
+    "mutation_acceptance_status",
+    "mutation_acceptance_reasons",
+    "mutation_acceptance_comparable",
+    "mutation_acceptance_original_selection",
+    "mutation_acceptance_guarded_selection",
+    "mutation_acceptance_min_raw_delta",
+    "mutation_acceptance_min_raw_adjusted_delta",
+    "mutation_acceptance_max_mae_increase",
+    "mutation_acceptance_max_tv_increase",
+    "mutation_acceptance_min_high_recall_delta",
+    "mutation_acceptance_min_max_recall_delta",
+    "mutation_acceptance_mode",
+    "mutation_acceptance_tradeoff_improvements",
+    "mutation_acceptance_tradeoff_metrics",
 ]
 
 MUTATION_EFFECT_SUMMARY_FIELDS = [
@@ -89,9 +109,14 @@ MUTATION_EFFECT_SUMMARY_FIELDS = [
     "n_children",
     "mean_delta_raw_qwk",
     "mean_delta_high_recall",
+    "mean_delta_raw_mae",
+    "mean_delta_score_distribution_tv",
     "mean_delta_anchor_geometry",
     "win_rate_vs_parent_raw_qwk",
     "win_rate_vs_parent_high_recall",
+    "accepted_children",
+    "rejected_children",
+    "acceptance_rate",
 ]
 
 # WISE-PACE 可选依赖（pace.enabled=false 时不加载，向后兼容）
@@ -253,6 +278,8 @@ class ExperimentManager:
             "pareto_best_idx",
             "pareto_feasible_count",
             "raw_guard_triggered_count",
+            "mutation_acceptance_rejected_count",
+            "mutation_acceptance_accepted_count",
             "pace_evaluated_count",
             "duration_sec",
             "tokens_total_all",
@@ -1199,6 +1226,76 @@ def _stratified_debug_split(
     return list(train_set), list(val_set), list(test_set)
 
 
+def _split_mutation_selection_val(
+    val_set: List[Dict],
+    config: Dict[str, Any],
+    seed: int,
+) -> Tuple[List[Dict], List[Dict], Dict[str, Any]]:
+    """Split validation into mutation-discovery and protocol-selection roles."""
+    evo_cfg = config.get("evolution", {})
+    if not bool(evo_cfg.get("dual_validation_enabled", False)):
+        ids = [int(x.get("essay_id", -1)) for x in val_set]
+        meta = {
+            "dual_validation_enabled": False,
+            "mutation_val_size": len(val_set),
+            "selection_val_size": len(val_set),
+            "mutation_selection_overlap": len(set(ids)),
+            "mutation_val_fingerprint": _essay_id_fingerprint(val_set),
+            "selection_val_fingerprint": _essay_id_fingerprint(val_set),
+            "split_mode": "shared_validation",
+        }
+        return list(val_set), list(val_set), meta
+
+    if len(val_set) < 4:
+        ids = [int(x.get("essay_id", -1)) for x in val_set]
+        meta = {
+            "dual_validation_enabled": True,
+            "mutation_val_size": len(val_set),
+            "selection_val_size": len(val_set),
+            "mutation_selection_overlap": len(set(ids)),
+            "mutation_val_fingerprint": _essay_id_fingerprint(val_set),
+            "selection_val_fingerprint": _essay_id_fingerprint(val_set),
+            "split_mode": "shared_fallback_too_small",
+        }
+        return list(val_set), list(val_set), meta
+
+    score_min = int(config.get("data", {}).get("score_min", min(x["domain1_score"] for x in val_set)))
+    score_max = int(config.get("data", {}).get("score_max", max(x["domain1_score"] for x in val_set)))
+    mutation_ratio = float(evo_cfg.get("mutation_val_ratio", 0.5))
+    mutation_ratio = max(0.2, min(0.8, mutation_ratio))
+    labels = _score_band_labels(val_set, score_min, score_max)
+    try:
+        mutation_val, selection_val = train_test_split(
+            val_set,
+            train_size=mutation_ratio,
+            stratify=labels,
+            random_state=seed,
+        )
+        split_mode = "score_band_stratified"
+    except Exception:
+        shuffled = list(val_set)
+        random.Random(seed).shuffle(shuffled)
+        cut = max(1, min(len(shuffled) - 1, int(round(len(shuffled) * mutation_ratio))))
+        mutation_val = shuffled[:cut]
+        selection_val = shuffled[cut:]
+        split_mode = "seeded_shuffle_fallback"
+
+    mutation_val = sorted(list(mutation_val), key=lambda x: int(x.get("essay_id", 0)))
+    selection_val = sorted(list(selection_val), key=lambda x: int(x.get("essay_id", 0)))
+    mutation_ids = {int(x.get("essay_id", -1)) for x in mutation_val}
+    selection_ids = {int(x.get("essay_id", -1)) for x in selection_val}
+    meta = {
+        "dual_validation_enabled": True,
+        "mutation_val_size": len(mutation_val),
+        "selection_val_size": len(selection_val),
+        "mutation_selection_overlap": len(mutation_ids & selection_ids),
+        "mutation_val_fingerprint": _essay_id_fingerprint(mutation_val),
+        "selection_val_fingerprint": _essay_id_fingerprint(selection_val),
+        "split_mode": split_mode,
+    }
+    return mutation_val, selection_val, meta
+
+
 # ============================================================================
 # 3. PromptIndividual (包含核心修改)
 # ============================================================================
@@ -1845,10 +1942,17 @@ class EvolutionOptimizer:
     def __init__(self, train_data, val_data, config,
                  pace_evaluator=None,   # Optional[PaceFitnessEvaluator]
                  calib_items=None,      # Optional[List[Dict]]
-                 fitness_items=None):   # Optional[List[Dict]]
+                 fitness_items=None,    # Optional[List[Dict]]
+                 mutation_val_data=None):  # Optional[List[Dict]]
         self.config = config
         self.train_data = train_data
-        self.val_data = val_data
+        # val_data is reserved for protocol selection. mutation_val_data is
+        # used for mutation prompts / PACE diagnostics when dual validation is
+        # enabled, preventing the same examples from writing and selecting a
+        # protocol in one generation.
+        self.val_data = list(val_data)
+        self.selection_val_data = self.val_data
+        self.mutation_val_data = list(mutation_val_data) if mutation_val_data is not None else self.val_data
 
         self.vector_store = SimpleVectorStore(model_name=config['rag']['model_name'])
         if config['rag'].get('enabled', False):
@@ -1887,6 +1991,15 @@ class EvolutionOptimizer:
             "best_pareto": float("-inf"),
         }
         self._build_stratum_pools()
+        if bool(self.config.get("evolution", {}).get("dual_validation_enabled", False)):
+            selection_ids = {x.get("essay_id") for x in self.selection_val_data}
+            mutation_ids = {x.get("essay_id") for x in self.mutation_val_data}
+            print(
+                "[Optimizer] Dual validation roles: "
+                f"mutation={len(self.mutation_val_data)} "
+                f"selection={len(self.selection_val_data)} "
+                f"overlap={len(selection_ids & mutation_ids)}"
+            )
 
     def _build_stratum_pools(self):
         strategy = self._stratum_strategy()
@@ -2880,6 +2993,10 @@ class EvolutionOptimizer:
         parent_high = parent_trace.get("parent_high_score_recall")
         child_anchor_geom = child_snapshot.get("anchor_geometry_score")
         parent_anchor_geom = parent_trace.get("parent_anchor_geometry_score")
+        child_mae = child_snapshot.get("raw_mae")
+        parent_mae = parent_trace.get("parent_raw_mae")
+        child_tv = child_snapshot.get("raw_distribution_tv")
+        parent_tv = parent_trace.get("parent_score_distribution_tv")
         return {
             "generation": generation,
             "child_index": child_index,
@@ -2903,6 +3020,20 @@ class EvolutionOptimizer:
             "delta_comparable": delta_comparable,
             "parent_raw_adjusted_qwk": parent_trace.get("parent_raw_adjusted_qwk"),
             "child_raw_adjusted_qwk": child_snapshot.get("raw_adjusted_fitness"),
+            "parent_raw_mae": parent_mae,
+            "child_raw_mae": child_mae,
+            "delta_raw_mae": (
+                float(child_mae) - float(parent_mae)
+                if delta_comparable and isinstance(child_mae, (int, float)) and isinstance(parent_mae, (int, float))
+                else None
+            ),
+            "parent_score_distribution_tv": parent_tv,
+            "child_score_distribution_tv": child_tv,
+            "delta_score_distribution_tv": (
+                float(child_tv) - float(parent_tv)
+                if delta_comparable and isinstance(child_tv, (int, float)) and isinstance(parent_tv, (int, float))
+                else None
+            ),
             "parent_pace_probe_qwk": parent_trace.get("parent_pace_probe_qwk"),
             "child_pace_probe_qwk": child_snapshot.get("pace_fitness"),
             "parent_anchor_geometry_score": parent_anchor_geom,
@@ -2935,6 +3066,20 @@ class EvolutionOptimizer:
             "recommended_mutation_used": parent_trace.get("recommended_mutation_used"),
             "target_anchor_slot": parent_trace.get("target_anchor_slot"),
             "rubric_edit_focus": parent_trace.get("rubric_edit_focus"),
+            "mutation_acceptance_status": child_snapshot.get("mutation_acceptance_status"),
+            "mutation_acceptance_reasons": child_snapshot.get("mutation_acceptance_reasons"),
+            "mutation_acceptance_comparable": child_snapshot.get("mutation_acceptance_comparable"),
+            "mutation_acceptance_original_selection": child_snapshot.get("mutation_acceptance_original_selection"),
+            "mutation_acceptance_guarded_selection": child_snapshot.get("mutation_acceptance_guarded_selection"),
+            "mutation_acceptance_min_raw_delta": child_snapshot.get("mutation_acceptance_min_raw_delta"),
+            "mutation_acceptance_min_raw_adjusted_delta": child_snapshot.get("mutation_acceptance_min_raw_adjusted_delta"),
+            "mutation_acceptance_max_mae_increase": child_snapshot.get("mutation_acceptance_max_mae_increase"),
+            "mutation_acceptance_max_tv_increase": child_snapshot.get("mutation_acceptance_max_tv_increase"),
+            "mutation_acceptance_min_high_recall_delta": child_snapshot.get("mutation_acceptance_min_high_recall_delta"),
+            "mutation_acceptance_min_max_recall_delta": child_snapshot.get("mutation_acceptance_min_max_recall_delta"),
+            "mutation_acceptance_mode": child_snapshot.get("mutation_acceptance_mode"),
+            "mutation_acceptance_tradeoff_improvements": child_snapshot.get("mutation_acceptance_tradeoff_improvements"),
+            "mutation_acceptance_tradeoff_metrics": child_snapshot.get("mutation_acceptance_tradeoff_metrics"),
         }
 
     def _mutation_effect_summary(self, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -2964,12 +3109,22 @@ class EvolutionOptimizer:
                 float(item["delta_high_recall"]) for item in comparable_items
                 if isinstance(item.get("delta_high_recall"), (int, float))
             ]
+            accepted = [
+                item for item in items
+                if str(item.get("mutation_acceptance_status", "")).lower() in {"accepted", "accepted_tradeoff"}
+            ]
+            rejected = [
+                item for item in items
+                if str(item.get("mutation_acceptance_status", "")).lower() == "rejected"
+            ]
             summary.append({
                 "mutation_type": mutation_type,
                 "n_children_full_eval": len(comparable_items),
                 "n_children": len(items),
                 "mean_delta_raw_qwk": mean_numeric(comparable_items, "delta_raw_qwk"),
                 "mean_delta_high_recall": mean_numeric(comparable_items, "delta_high_recall"),
+                "mean_delta_raw_mae": mean_numeric(comparable_items, "delta_raw_mae"),
+                "mean_delta_score_distribution_tv": mean_numeric(comparable_items, "delta_score_distribution_tv"),
                 "mean_delta_anchor_geometry": mean_numeric(comparable_items, "delta_anchor_geometry"),
                 "win_rate_vs_parent_raw_qwk": (
                     float(np.mean([1.0 if x > 0 else 0.0 for x in raw_deltas]))
@@ -2978,6 +3133,12 @@ class EvolutionOptimizer:
                 "win_rate_vs_parent_high_recall": (
                     float(np.mean([1.0 if x > 0 else 0.0 for x in high_deltas]))
                     if high_deltas else None
+                ),
+                "accepted_children": len(accepted),
+                "rejected_children": len(rejected),
+                "acceptance_rate": (
+                    float(len(accepted) / (len(accepted) + len(rejected)))
+                    if (len(accepted) + len(rejected)) else None
                 ),
             })
         return summary
@@ -3099,6 +3260,181 @@ class EvolutionOptimizer:
             pop_snapshot[idx]['protocol_quality'] = selection_scores[idx]
         return selection_scores, triggered, feasible_indices
 
+    def _apply_mutation_acceptance_guard(
+        self,
+        selection_scores: List[float],
+        pop_snapshot: List[Dict[str, Any]],
+    ) -> Tuple[List[float], List[int], List[int]]:
+        """Reject child protocols that improve one metric by sacrificing core raw quality.
+
+        This is intentionally validation-only. It compares a child only against
+        the recorded parent evaluation from the previous generation, and only
+        when both were evaluated on comparable full validation sets by default.
+        """
+        evo_cfg = self.config.get("evolution", {})
+        if not bool(evo_cfg.get("mutation_acceptance_guard_enabled", False)):
+            return selection_scores, [], []
+
+        guarded_scores = [float(x) for x in selection_scores]
+        rejected: List[int] = []
+        accepted: List[int] = []
+        min_raw_delta = float(evo_cfg.get("mutation_acceptance_min_raw_delta", -0.005))
+        min_raw_adjusted_delta = float(evo_cfg.get("mutation_acceptance_min_raw_adjusted_delta", -0.010))
+        max_mae_increase = float(evo_cfg.get("mutation_acceptance_max_mae_increase", 0.10))
+        max_tv_increase = float(evo_cfg.get("mutation_acceptance_max_tv_increase", 0.12))
+        min_high_delta = float(evo_cfg.get("mutation_acceptance_min_high_recall_delta", -0.10))
+        min_max_delta = float(evo_cfg.get("mutation_acceptance_min_max_recall_delta", -1.0))
+        reject_penalty = float(evo_cfg.get("mutation_acceptance_reject_penalty", 0.03))
+        require_full = bool(evo_cfg.get("mutation_acceptance_require_full_comparable", True))
+        acceptance_mode = str(evo_cfg.get("mutation_acceptance_mode", "strict")).lower()
+        allow_tradeoff = bool(evo_cfg.get("mutation_acceptance_allow_tradeoff", acceptance_mode in {"pareto", "tradeoff", "balanced"}))
+        min_tradeoff_improvements = int(evo_cfg.get("mutation_acceptance_min_tradeoff_improvements", 2))
+        qwk_hard_drop = float(evo_cfg.get("mutation_acceptance_qwk_hard_drop", -0.08))
+        raw_adjusted_hard_drop = float(evo_cfg.get("mutation_acceptance_raw_adjusted_hard_drop", -0.08))
+        tradeoff_eps = float(evo_cfg.get("mutation_acceptance_tradeoff_epsilon", 1e-6))
+
+        def finite(value: Any) -> Optional[float]:
+            try:
+                out = float(value)
+            except (TypeError, ValueError):
+                return None
+            return out if np.isfinite(out) else None
+
+        for idx, snapshot in enumerate(pop_snapshot):
+            parent_trace = snapshot.get("parent_trace")
+            if not parent_trace:
+                snapshot["mutation_acceptance_status"] = "no_parent"
+                snapshot["mutation_acceptance_reasons"] = []
+                snapshot["mutation_acceptance_comparable"] = False
+                continue
+
+            child_stage = snapshot.get("validation_stage")
+            parent_stage = parent_trace.get("parent_validation_stage")
+            same_stage = child_stage == parent_stage
+            full_comparable = child_stage == "full" and parent_stage in (None, "full")
+            comparable = full_comparable if require_full else same_stage
+            snapshot["mutation_acceptance_comparable"] = bool(comparable)
+            snapshot["mutation_acceptance_original_selection"] = guarded_scores[idx]
+            snapshot["mutation_acceptance_min_raw_delta"] = min_raw_delta
+            snapshot["mutation_acceptance_min_raw_adjusted_delta"] = min_raw_adjusted_delta
+            snapshot["mutation_acceptance_max_mae_increase"] = max_mae_increase
+            snapshot["mutation_acceptance_max_tv_increase"] = max_tv_increase
+            snapshot["mutation_acceptance_min_high_recall_delta"] = min_high_delta
+            snapshot["mutation_acceptance_min_max_recall_delta"] = min_max_delta
+            snapshot["mutation_acceptance_mode"] = acceptance_mode
+
+            if not comparable:
+                snapshot["mutation_acceptance_status"] = "not_comparable"
+                snapshot["mutation_acceptance_reasons"] = [
+                    f"child_stage={child_stage}",
+                    f"parent_stage={parent_stage}",
+                ]
+                snapshot["mutation_acceptance_guarded_selection"] = guarded_scores[idx]
+                continue
+
+            child_raw = finite(snapshot.get("raw_fitness"))
+            parent_raw = finite(parent_trace.get("parent_raw_qwk"))
+            child_raw_adj = finite(snapshot.get("raw_adjusted_fitness"))
+            parent_raw_adj = finite(parent_trace.get("parent_raw_adjusted_qwk"))
+            child_mae = finite(snapshot.get("raw_mae"))
+            parent_mae = finite(parent_trace.get("parent_raw_mae"))
+            child_tv = finite(snapshot.get("raw_distribution_tv"))
+            parent_tv = finite(parent_trace.get("parent_score_distribution_tv"))
+            child_high = finite(snapshot.get("high_score_recall"))
+            parent_high = finite(parent_trace.get("parent_high_score_recall"))
+            child_max = finite(snapshot.get("max_score_recall"))
+            parent_max = finite(parent_trace.get("parent_max_score_recall"))
+
+            reasons: List[str] = []
+            raw_delta = None if child_raw is None or parent_raw is None else child_raw - parent_raw
+            raw_adjusted_delta = (
+                None if child_raw_adj is None or parent_raw_adj is None else child_raw_adj - parent_raw_adj
+            )
+            mae_delta = None if child_mae is None or parent_mae is None else child_mae - parent_mae
+            tv_delta = None if child_tv is None or parent_tv is None else child_tv - parent_tv
+            high_delta = None if child_high is None or parent_high is None else child_high - parent_high
+            max_delta = None if child_max is None or parent_max is None else child_max - parent_max
+
+            snapshot["mutation_acceptance_delta_raw_qwk"] = raw_delta
+            snapshot["mutation_acceptance_delta_raw_adjusted_qwk"] = raw_adjusted_delta
+            snapshot["mutation_acceptance_delta_raw_mae"] = mae_delta
+            snapshot["mutation_acceptance_delta_score_distribution_tv"] = tv_delta
+            snapshot["mutation_acceptance_delta_high_recall"] = high_delta
+            snapshot["mutation_acceptance_delta_max_recall"] = max_delta
+
+            if raw_delta is not None and raw_delta < min_raw_delta:
+                reasons.append("raw_qwk_drop")
+            if raw_adjusted_delta is not None and raw_adjusted_delta < min_raw_adjusted_delta:
+                reasons.append("raw_adjusted_qwk_drop")
+            if mae_delta is not None and mae_delta > max_mae_increase:
+                reasons.append("mae_increase")
+            if tv_delta is not None and tv_delta > max_tv_increase:
+                reasons.append("distribution_tv_increase")
+            if high_delta is not None and high_delta < min_high_delta:
+                reasons.append("high_recall_drop")
+            if max_delta is not None and max_delta < min_max_delta:
+                reasons.append("max_recall_drop")
+
+            tradeoff_metrics: List[str] = []
+            if raw_adjusted_delta is not None and raw_adjusted_delta > tradeoff_eps:
+                tradeoff_metrics.append("raw_adjusted_qwk_improved")
+            if mae_delta is not None and mae_delta < -tradeoff_eps:
+                tradeoff_metrics.append("mae_improved")
+            if tv_delta is not None and tv_delta < -tradeoff_eps:
+                tradeoff_metrics.append("score_distribution_tv_improved")
+            if high_delta is not None and high_delta > tradeoff_eps:
+                tradeoff_metrics.append("high_recall_improved")
+            if max_delta is not None and max_delta > tradeoff_eps:
+                tradeoff_metrics.append("max_recall_improved")
+            hard_reasons = {
+                "mae_increase",
+                "distribution_tv_increase",
+                "high_recall_drop",
+                "max_recall_drop",
+            } & set(reasons)
+            if raw_delta is not None and raw_delta < qwk_hard_drop:
+                hard_reasons.add("raw_qwk_hard_drop")
+            if raw_adjusted_delta is not None and raw_adjusted_delta < raw_adjusted_hard_drop:
+                hard_reasons.add("raw_adjusted_qwk_hard_drop")
+            tradeoff_accept = (
+                allow_tradeoff
+                and reasons
+                and not hard_reasons
+                and len(tradeoff_metrics) >= min_tradeoff_improvements
+            )
+            snapshot["mutation_acceptance_tradeoff_improvements"] = len(tradeoff_metrics)
+            snapshot["mutation_acceptance_tradeoff_metrics"] = tradeoff_metrics
+            snapshot["mutation_acceptance_hard_reasons"] = sorted(hard_reasons)
+
+            if reasons and not tradeoff_accept:
+                parent_quality = finite(parent_trace.get("parent_protocol_quality"))
+                cap = (
+                    parent_quality - reject_penalty
+                    if parent_quality is not None
+                    else guarded_scores[idx] - reject_penalty
+                )
+                guarded_scores[idx] = min(guarded_scores[idx], cap)
+                snapshot["mutation_acceptance_status"] = "rejected"
+                rejected.append(idx)
+                print(
+                    f"    [Mutation Acceptance] Reject child {idx:02d}: "
+                    f"reasons={','.join(reasons)} raw_delta={raw_delta} "
+                    f"mae_delta={mae_delta} tv_delta={tv_delta}"
+                )
+            else:
+                snapshot["mutation_acceptance_status"] = "accepted_tradeoff" if tradeoff_accept else "accepted"
+                accepted.append(idx)
+                if tradeoff_accept:
+                    print(
+                        f"    [Mutation Acceptance] Accept tradeoff child {idx:02d}: "
+                        f"soft_reasons={','.join(reasons)} improvements={','.join(tradeoff_metrics)}"
+                    )
+            snapshot["mutation_acceptance_reasons"] = reasons
+            snapshot["mutation_acceptance_guarded_selection"] = guarded_scores[idx]
+            snapshot["protocol_quality"] = guarded_scores[idx]
+
+        return guarded_scores, rejected, accepted
+
     def _select_elite_indices(
         self,
         selection_scores: List[float],
@@ -3144,6 +3480,99 @@ class EvolutionOptimizer:
             if idx not in selected:
                 selected.append(idx)
         return selected[:n_elite]
+
+    def _acceptance_safe_candidate_indices(
+        self,
+        pop_snapshot: List[Dict[str, Any]],
+        candidate_indices: List[int],
+    ) -> List[int]:
+        """Return full-evaluated candidates that were not rejected by acceptance guard."""
+        safe = []
+        for idx in candidate_indices:
+            if not (0 <= int(idx) < len(pop_snapshot)):
+                continue
+            status = str(pop_snapshot[int(idx)].get("mutation_acceptance_status", "") or "")
+            if status.lower() == "rejected":
+                continue
+            safe.append(int(idx))
+        return safe or list(candidate_indices)
+
+    def _pareto_selection_score(
+        self,
+        idx: int,
+        raw_scores: List[float],
+        raw_adjusted_scores: List[float],
+        pop_snapshot: List[Dict[str, Any]],
+    ) -> float:
+        """Validation-only robust protocol score for final candidate choice."""
+        evo_cfg = self.config.get("evolution", {})
+        raw_qwk = float(raw_scores[idx])
+        raw_adjusted = float(raw_adjusted_scores[idx])
+        metrics = pop_snapshot[idx].get("raw_prediction_metrics", {}) or {}
+
+        def finite(name: str, default: float) -> float:
+            try:
+                value = float(metrics.get(name, default))
+            except (TypeError, ValueError):
+                return default
+            return value if np.isfinite(value) else default
+
+        mae = finite("mae", 0.0)
+        tv = finite("score_distribution_tv", finite("tv_distance", 0.0))
+        high_recall = finite("high_score_recall", finite("high_recall", 1.0))
+        max_recall = finite("max_score_recall", 1.0)
+        score = (
+            float(evo_cfg.get("pareto_qwk_weight", 1.0)) * raw_qwk
+            + float(evo_cfg.get("pareto_raw_adjusted_weight", 0.35)) * raw_adjusted
+            - float(evo_cfg.get("pareto_mae_weight", 0.06)) * mae
+            - float(evo_cfg.get("pareto_tv_weight", 0.12)) * tv
+            + float(evo_cfg.get("pareto_high_recall_weight", 0.08)) * high_recall
+            + float(evo_cfg.get("pareto_max_recall_weight", 0.02)) * max_recall
+        )
+        pop_snapshot[idx]["pareto_selection_score"] = float(score)
+        pop_snapshot[idx]["pareto_selection_components"] = {
+            "raw_qwk": raw_qwk,
+            "raw_adjusted": raw_adjusted,
+            "mae": mae,
+            "score_distribution_tv": tv,
+            "high_score_recall": high_recall,
+            "max_score_recall": max_recall,
+        }
+        return float(score)
+
+    def _select_pareto_best_index(
+        self,
+        candidate_indices: List[int],
+        raw_scores: List[float],
+        raw_adjusted_scores: List[float],
+        pop_snapshot: List[Dict[str, Any]],
+    ) -> Tuple[int, Dict[int, float]]:
+        if not candidate_indices:
+            candidate_indices = list(range(len(raw_scores)))
+        pareto_scores = {
+            int(idx): self._pareto_selection_score(int(idx), raw_scores, raw_adjusted_scores, pop_snapshot)
+            for idx in candidate_indices
+        }
+        best_idx = max(candidate_indices, key=lambda i: pareto_scores[int(i)])
+        return int(best_idx), pareto_scores
+
+    def _refresh_mutation_feedback(
+        self,
+        individual: PromptIndividual,
+        *,
+        use_rerank: bool,
+    ) -> Dict[str, Any]:
+        """Evaluate a parent on mutation-val before asking it how to mutate."""
+        if not bool(self.config.get("evolution", {}).get("dual_validation_enabled", False)):
+            return {}
+        if not self.mutation_val_data:
+            return {}
+        return self._evaluate_raw_stage(
+            ind=individual,
+            items=self.mutation_val_data,
+            stage="mutation_feedback",
+            use_rerank=use_rerank,
+        )
 
     def _track_candidate(
         self,
@@ -3545,6 +3974,9 @@ class EvolutionOptimizer:
             raw_adjusted_scores=raw_adjusted_scores,
             pace_results=self.latest_pace_results,
         )
+        selection_scores, mutation_acceptance_rejected, mutation_acceptance_accepted = (
+            self._apply_mutation_acceptance_guard(selection_scores, pop_snapshot)
+        )
 
         for i, ind in enumerate(self.population):
             ind.fitness = selection_scores[i]
@@ -3571,12 +4003,25 @@ class EvolutionOptimizer:
                 )
 
         candidate_rank_pool = list(full_eval_indices) or list(range(len(selection_scores)))
+        acceptance_safe_rank_pool = self._acceptance_safe_candidate_indices(
+            pop_snapshot,
+            candidate_rank_pool,
+        )
         raw_best_idx = int(max(candidate_rank_pool, key=lambda i: scores[i]))
-        raw_adjusted_best_idx = int(max(candidate_rank_pool, key=lambda i: raw_adjusted_scores[i]))
-        protocol_quality_best_idx = int(max(candidate_rank_pool, key=lambda i: protocol_quality_scores[i]))
-        guarded_best_idx = int(max(candidate_rank_pool, key=lambda i: selection_scores[i]))
-        pareto_pool = [i for i in pareto_feasible_indices if i in candidate_rank_pool] or candidate_rank_pool
-        pareto_best_idx = int(max(pareto_pool, key=lambda i: selection_scores[i]))
+        raw_adjusted_best_idx = int(max(acceptance_safe_rank_pool, key=lambda i: raw_adjusted_scores[i]))
+        protocol_quality_best_idx = int(max(acceptance_safe_rank_pool, key=lambda i: protocol_quality_scores[i]))
+        guarded_best_idx = int(max(acceptance_safe_rank_pool, key=lambda i: selection_scores[i]))
+        pareto_pool = [
+            i for i in pareto_feasible_indices
+            if i in acceptance_safe_rank_pool
+        ] or acceptance_safe_rank_pool
+        pareto_best_idx, pareto_scores_by_idx = self._select_pareto_best_index(
+            pareto_pool,
+            scores,
+            raw_adjusted_scores,
+            pop_snapshot,
+        )
+        pareto_best_score = float(pareto_scores_by_idx.get(pareto_best_idx, selection_scores[pareto_best_idx]))
 
         self._track_candidate(
             "best_raw_val",
@@ -3613,7 +4058,7 @@ class EvolutionOptimizer:
         self._track_candidate(
             "best_pareto",
             self.population[pareto_best_idx],
-            selection_scores[pareto_best_idx],
+            pareto_best_score,
             gen,
             pareto_best_idx,
             validation_score=scores[pareto_best_idx],
@@ -3625,7 +4070,7 @@ class EvolutionOptimizer:
             f"  >> Gen {gen} Best Raw={scores[raw_best_idx]:.4f} (Ind {raw_best_idx}) | "
             f"Best RawAdj={raw_adjusted_scores[raw_adjusted_best_idx]:.4f} (Ind {raw_adjusted_best_idx}) | "
             f"Best ProtocolQuality={protocol_quality_scores[protocol_quality_best_idx]:.4f} (Ind {protocol_quality_best_idx}) | "
-            f"Best Pareto={selection_scores[pareto_best_idx]:.4f} (Ind {pareto_best_idx})"
+            f"Best Pareto={pareto_best_score:.4f} (Ind {pareto_best_idx})"
         )
 
         pace_qwks = [
@@ -3664,7 +4109,7 @@ class EvolutionOptimizer:
             "best_raw_guarded": float(raw_adjusted_scores[raw_adjusted_best_idx]),
             "best_protocol_quality": float(protocol_quality_scores[protocol_quality_best_idx]),
             "best_pace_guarded": float(selection_scores[guarded_best_idx]),
-            "best_pareto": float(selection_scores[pareto_best_idx]),
+            "best_pareto": float(pareto_best_score),
             "best_qwk": float(scores[raw_best_idx]),
             "best_pace_qwk": max(pace_qwks) if pace_qwks else None,
             "best_anchor_geometry": max(anchor_scores) if anchor_scores else None,
@@ -3677,11 +4122,16 @@ class EvolutionOptimizer:
             "protocol_quality_best_idx": protocol_quality_best_idx,
             "guarded_best_idx": guarded_best_idx,
             "pareto_best_idx": pareto_best_idx,
+            "pareto_best_selection_val_qwk": float(scores[pareto_best_idx]),
+            "pareto_scores_by_idx": {str(k): float(v) for k, v in pareto_scores_by_idx.items()},
             "full_eval_indices": list(full_eval_indices),
             "full_eval_count": len(full_eval_indices),
+            "acceptance_safe_rank_pool": list(acceptance_safe_rank_pool),
             "staged_validation_enabled": bool(self.config.get("evolution", {}).get("staged_validation_enabled", False)),
             "pareto_feasible_count": len(pareto_feasible_indices),
             "raw_guard_triggered_count": len(raw_guard_triggered),
+            "mutation_acceptance_rejected_count": len(mutation_acceptance_rejected),
+            "mutation_acceptance_accepted_count": len(mutation_acceptance_accepted),
             "pace_evaluated_count": len(self.latest_pace_results),
         }
         if lineage_raw_deltas:
@@ -3701,9 +4151,14 @@ class EvolutionOptimizer:
                 "parent_anchor_scores": [ex.get("domain1_score") for ex in ind.static_exemplars],
                 "parent_raw_qwk": float(scores[idx]),
                 "parent_raw_adjusted_qwk": float(raw_adjusted_scores[idx]),
+                "parent_raw_mae": raw_metrics.get("mae"),
+                "parent_score_distribution_tv": raw_metrics.get("score_distribution_tv", raw_metrics.get("tv_distance")),
+                "parent_pred_bias": raw_metrics.get("pred_bias"),
+                "parent_pred_collapse_ratio": raw_metrics.get("pred_collapse_ratio"),
                 "parent_validation_stage": pop_snapshot[idx].get("validation_stage"),
                 "parent_validation_n": pop_snapshot[idx].get("validation_n"),
                 "parent_protocol_quality": float(selection_scores[idx]),
+                "parent_pareto_selection_score": pop_snapshot[idx].get("pareto_selection_score"),
                 "parent_protocol_quality_before_guard": pop_snapshot[idx].get("protocol_quality_before_guard"),
                 "parent_pace_probe_qwk": pace_result.get("pace_qwk") if pace_result else None,
                 "parent_anchor_geometry_score": pace_result.get("anchor_geometry_score") if pace_result else None,
@@ -3720,8 +4175,13 @@ class EvolutionOptimizer:
 
         # 2. Evolve Rubrics（基于 raw-guarded selection_scores 选 elite）
         n_elite = self.config['evolution']['n_elite_evolve']
+        elite_selection_scores = list(selection_scores)
+        if bool(self.config.get("evolution", {}).get("pareto_selection_enabled", False)):
+            for idx, value in pareto_scores_by_idx.items():
+                if 0 <= int(idx) < len(elite_selection_scores):
+                    elite_selection_scores[int(idx)] = float(value)
         elite_indices = self._select_elite_indices(
-            selection_scores,
+            elite_selection_scores,
             n_elite,
             candidate_indices=candidate_rank_pool,
         )
@@ -3729,6 +4189,8 @@ class EvolutionOptimizer:
 
         # 精英保留策略：保留 protocol_quality 最高的个体直接晋级
         best_old_elite = elites[0].clone()
+        if hasattr(best_old_elite, "parent_trace"):
+            delattr(best_old_elite, "parent_trace")
         new_pop = [best_old_elite] # 精英保留策略：直接晋级下一代
         
         print("  Evolving Rubrics for Elites (Using Real Reflection)...")
@@ -3761,7 +4223,12 @@ class EvolutionOptimizer:
             elite.evidence_feedback["mutation_policy"] = mutation_policy
             # 这里是修改原始 elite 对象的引用
             if evolve_instr:
-                real_feedback = elite.generate_real_feedback(self.val_data)
+                feedback_eval = self._refresh_mutation_feedback(elite, use_rerank=use_rerank)
+                if feedback_eval:
+                    parent_eval_trace_by_object[id(elite)]["mutation_feedback_stage"] = feedback_eval.get("validation_stage")
+                    parent_eval_trace_by_object[id(elite)]["mutation_feedback_n"] = feedback_eval.get("validation_n")
+                    parent_eval_trace_by_object[id(elite)]["mutation_feedback_fingerprint"] = feedback_eval.get("validation_fingerprint")
+                real_feedback = elite.generate_real_feedback(self.mutation_val_data)
                 print(f"    [Feedback] {real_feedback[:100]}...")
             else:
                 real_feedback = None
@@ -3822,7 +4289,7 @@ class EvolutionOptimizer:
             elif evolve_instr and (not atomic_ie or mutation_axis in {"I", "IE"}):
                 feedback_for_child = parent_trace.get("mutation_feedback")
                 if not feedback_for_child:
-                    feedback_for_child = child.generate_real_feedback(self.val_data)
+                    feedback_for_child = child.generate_real_feedback(self.mutation_val_data)
                 child.instruction_text = child.evolve_instruction(feedback_for_child, planned_policy)
             should_mutate_anchor = bool(evolve_exemplars)
             if atomic_ie and mutation_axis == "I":
@@ -3968,6 +4435,8 @@ class EvolutionOptimizer:
             "pareto_best_idx": pareto_best_idx,
             "pareto_feasible_indices": pareto_feasible_indices,
             "raw_guard_triggered_indices": raw_guard_triggered,
+            "mutation_acceptance_rejected_indices": mutation_acceptance_rejected,
+            "mutation_acceptance_accepted_indices": mutation_acceptance_accepted,
             "elite_indices": elite_indices,
         }
         self.history.append(curve_row)
@@ -4214,26 +4683,41 @@ def main(config_path="configs/default.yaml", fold=0, resume_path=None):
         f"{_score_band_distribution(test_set, config['data']['score_min'], config['data']['score_max'])}"
     )
 
-    # WISE-PACE: 将 val_set 进一步切分为 calib + fitness（仅 pace 启用时）
+    mutation_val_set, selection_val_set, validation_split_meta = _split_mutation_selection_val(
+        val_set,
+        config,
+        seed + 17,
+    )
+    if validation_split_meta.get("dual_validation_enabled"):
+        print(
+            "  [Dual Val] "
+            f"mutation={len(mutation_val_set)} selection={len(selection_val_set)} "
+            f"overlap={validation_split_meta.get('mutation_selection_overlap')} "
+            f"mode={validation_split_meta.get('split_mode')}"
+        )
+        print(f"  Score Dist Mutation Val:  {_score_distribution(mutation_val_set)}")
+        print(f"  Score Dist Selection Val: {_score_distribution(selection_val_set)}")
+
+    # WISE-PACE: mutation_val_set is split into calib + fitness when pace is enabled.
     if pace_enabled:
-        desired_calib = int(len(val_set) * pace_cfg.get('calib_split_ratio', 0.5))
+        desired_calib = int(len(mutation_val_set) * pace_cfg.get('calib_split_ratio', 0.5))
         n_calib = max(4, desired_calib)
-        if len(val_set) >= 8:
-            n_calib = min(n_calib, len(val_set) - 4)
+        if len(mutation_val_set) >= 8:
+            n_calib = min(n_calib, len(mutation_val_set) - 4)
         else:
-            n_calib = max(0, len(val_set) // 2)
-        calib_items = val_set[:n_calib]
-        fitness_items = val_set[n_calib:]
-        print(f"  [PACE] Val split: calib={len(calib_items)}, fitness={len(fitness_items)}")
-        # val_set 整体仍传给 EvolutionOptimizer 做 raw QWK（旧逻辑不变）
+            n_calib = max(0, len(mutation_val_set) // 2)
+        calib_items = mutation_val_set[:n_calib]
+        fitness_items = mutation_val_set[n_calib:]
+        print(f"  [PACE] Mutation-val split: calib={len(calib_items)}, fitness={len(fitness_items)}")
 
     # 3. 运行优化
     print("[Main] Initializing Optimizer...")
     optimizer = EvolutionOptimizer(
-        train_set, val_set, config,
+        train_set, selection_val_set, config,
         pace_evaluator=pace_evaluator,
         calib_items=calib_items,
         fitness_items=fitness_items,
+        mutation_val_data=mutation_val_set,
     )
     
     start_gen = 1
@@ -4423,9 +4907,11 @@ def main(config_path="configs/default.yaml", fold=0, resume_path=None):
         "final_primary_policy": config.get("evolution", {}).get("final_primary_candidate", "best_raw_guarded"),
         "selection_policy": (
             "Primary candidate is selected before test evaluation by a configurable validation-only policy. "
-            "The default policy is raw-first best_raw_guarded; PACE/Pareto candidates remain diagnostics. "
-            "PACE-calibrated test scores are diagnostics only; raw direct test QWK is the success metric."
+            "Dual validation can separate mutation feedback from selection validation. "
+            "PACE remains diagnostic/mutation guidance; PACE-calibrated test scores are diagnostics only. "
+            "Raw direct test QWK is the success metric."
         ),
+        "validation_split": validation_split_meta,
         "test_qwk": test_qwk,
         "primary_raw_test_qwk": test_qwk,
         "primary_validation_score": primary_validation_score,

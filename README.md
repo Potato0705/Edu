@@ -22,6 +22,7 @@ M: local target LLM, also used for hidden representation extraction
 - `M_score = M_hidden = M_meta = local Llama`。
 - `final_pace_calibrated` 默认保持 `false`。
 - selection 是 raw-first guarded selection。
+- mutation acceptance guard 已加入主配置：child protocol 只有在 validation-only 的 raw QWK / adjusted QWK / MAE / score distribution TV / high recall 不明显劣化时，才允许在选择中继续竞争。
 - PACE calibrated QWK 不作为主 selection reward，不作为最终 test 结果。
 - high-score / max-score audit、parent-child mutation audit、training curve、candidate comparison 已经落盘。
 - 新增 neural hidden evidence、dual-view anchor encoding、diagnostic-only PACE、staged validation、PACE-on-demand 和 protocol cache 基础设施。
@@ -139,6 +140,8 @@ general_error                -> general_reflection_mutation
 - parent / child signature
 - parent / child raw QWK
 - parent / child high/max recall
+- parent / child MAE 和 score_distribution_tv
+- mutation_acceptance_status / mutation_acceptance_reasons
 - mutation_type / requested_mutation_type / actual_mutation_type
 - instruction_changed / anchors_changed
 - dominant_error_type_used
@@ -152,6 +155,7 @@ general_error                -> general_reflection_mutation
 - `llm.max_new_tokens_reflection`
 - `llm.max_new_tokens_induction`
 - staged validation：mini / mid / full validation
+- mutation acceptance guard：用 parent-child validation deltas 阻止局部 QWK 改善但 MAE / 分布 / high recall 明显变差的 child 进入下一轮
 - PACE-on-demand trigger
 - protocol score cache
 - PACE result cache
@@ -311,6 +315,45 @@ python scripts/analysis/profile_asap_prompt.py --prompt 1 --fold 0 --config conf
 
 1. P1-P8 smoke 实跑，每个 prompt 只跑小规模，检查 score range 和 high-tail 风险是否泛化。
 2. raw-only vs WISE-PACE cost-aware gate 再做 2-3 个 seed，确认 `boundary_clarification_mutation` 的提升不是单次偶然。
-3. 加强 validation selection 的防过拟合约束，例如 MAE / score_distribution_tv / high recall 联合门槛，避免 val QWK 提升但 test 分布崩溃。
+3. 在已加入 mutation acceptance guard 后，优先检查 rejected / accepted child 的 audit 是否能解释 test 分数波动，再决定是否收紧阈值。
 
 只有当这些最小实验稳定后，再启动单个完整 full fold。
+
+## WISE-PACE v2 结构性收敛
+
+2026-05-09 之后，主线从“继续堆 high-tail 补丁”收敛为更清晰的验证-进化结构：
+
+1. `mutation_val` 只用于错误发现、PACE diagnostics、reflection feedback 和 mutation policy。
+2. `selection_val` 只用于候选协议选择、training curve 和最终 primary candidate 固定。
+3. `test` 仍然只在最后使用，不能进入 selection、mutation 或 PACE probe。
+4. PACE 继续保持 diagnostic / mutation guidance，不作为最终 test-time calibrator。
+5. `best_pareto` 成为 Phase 4 主候选：它仍基于 raw validation signals，但同时考虑 raw QWK、raw-adjusted QWK、MAE、score distribution TV、high-score recall 和 max-score recall。
+
+对应配置项：
+
+```yaml
+evolution:
+  final_primary_candidate: "best_pareto"
+  dual_validation_enabled: true
+  mutation_val_ratio: 0.50
+  pareto_selection_enabled: true
+  pareto_qwk_weight: 1.0
+  pareto_raw_adjusted_weight: 0.35
+  pareto_mae_weight: 0.06
+  pareto_tv_weight: 0.12
+  pareto_high_recall_weight: 0.08
+  pareto_max_recall_weight: 0.02
+```
+
+mutation acceptance 也改为 Pareto-aware：如果 child 的 raw QWK 有小幅下降，但 MAE、分布 TV、high recall 或 raw-adjusted QWK 有足够改善，不再机械拒绝；如果出现明显 MAE/TV/high recall 恶化或 raw QWK 硬性大幅下降，仍然拒绝。这样可以避免把所有改进都压回“只优化 QWK 单点”的旧路径。
+
+```yaml
+evolution:
+  mutation_acceptance_mode: "pareto"
+  mutation_acceptance_allow_tradeoff: true
+  mutation_acceptance_min_tradeoff_improvements: 2
+  mutation_acceptance_qwk_hard_drop: -0.08
+  mutation_acceptance_raw_adjusted_hard_drop: -0.08
+```
+
+这版结构的目标是让 WISE-PACE 的论文主张更干净：hidden evidence 不是校准器，而是帮助生成更好的 `I*` 和 `E*`；候选协议必须在独立的 selection validation 上胜出，才有资格进入 final test。

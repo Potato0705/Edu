@@ -34,6 +34,7 @@ from wise_aes import (
     choose_final_primary_label,
     compute_high_score_audit,
     mutation_axis_for_type,
+    _split_mutation_selection_val,
 )
 
 
@@ -226,6 +227,47 @@ def test_track_candidate_keeps_validation_and_selection_scores_separate():
     assert snap.fitness == pytest.approx(0.12)
 
 
+def test_pareto_selection_can_choose_more_balanced_candidate():
+    opt = EvolutionOptimizer.__new__(EvolutionOptimizer)
+    opt.config = {
+        "evolution": {
+            "pareto_qwk_weight": 1.0,
+            "pareto_raw_adjusted_weight": 0.35,
+            "pareto_mae_weight": 0.20,
+            "pareto_tv_weight": 0.20,
+            "pareto_high_recall_weight": 0.15,
+            "pareto_max_recall_weight": 0.0,
+        }
+    }
+    snapshots = [
+        {
+            "raw_prediction_metrics": {
+                "mae": 1.60,
+                "score_distribution_tv": 0.60,
+                "high_score_recall": 0.10,
+                "max_score_recall": 0.0,
+            }
+        },
+        {
+            "raw_prediction_metrics": {
+                "mae": 0.90,
+                "score_distribution_tv": 0.10,
+                "high_score_recall": 0.70,
+                "max_score_recall": 0.0,
+            }
+        },
+    ]
+    best_idx, scores = opt._select_pareto_best_index(
+        [0, 1],
+        raw_scores=[0.56, 0.53],
+        raw_adjusted_scores=[0.48, 0.52],
+        pop_snapshot=snapshots,
+    )
+    assert best_idx == 1
+    assert scores[1] > scores[0]
+    assert "pareto_selection_components" in snapshots[1]
+
+
 def test_mutation_effect_summary_uses_only_comparable_full_eval_rows():
     opt = EvolutionOptimizer.__new__(EvolutionOptimizer)
     rows = [
@@ -240,14 +282,22 @@ def test_mutation_effect_summary_uses_only_comparable_full_eval_rows():
             "delta_comparable": True,
             "delta_raw_qwk": -0.10,
             "delta_high_recall": 0.20,
+            "delta_raw_mae": 0.15,
+            "delta_score_distribution_tv": 0.10,
+            "mutation_acceptance_status": "rejected",
         },
     ]
     summary = opt._mutation_effect_summary(rows)
     assert summary[0]["n_children"] == 2
     assert summary[0]["n_children_full_eval"] == 1
     assert summary[0]["mean_delta_raw_qwk"] == pytest.approx(-0.10)
+    assert summary[0]["mean_delta_raw_mae"] == pytest.approx(0.15)
+    assert summary[0]["mean_delta_score_distribution_tv"] == pytest.approx(0.10)
     assert summary[0]["win_rate_vs_parent_raw_qwk"] == pytest.approx(0.0)
     assert summary[0]["win_rate_vs_parent_high_recall"] == pytest.approx(1.0)
+    assert summary[0]["accepted_children"] == 0
+    assert summary[0]["rejected_children"] == 1
+    assert summary[0]["acceptance_rate"] == pytest.approx(0.0)
 
 
 def test_pace_selection_default_is_diagnostic_only():
@@ -297,6 +347,157 @@ def test_raw_guard_ignores_pace_distribution_when_diagnostic_only():
     assert triggered == []
     assert feasible == [0]
     assert "pace_distribution_penalty_high" not in pop_snapshot[0]["constraint_reasons"]
+
+
+def test_mutation_acceptance_guard_rejects_unbalanced_child():
+    opt = EvolutionOptimizer.__new__(EvolutionOptimizer)
+    opt.config = {
+        "evolution": {
+            "mutation_acceptance_guard_enabled": True,
+            "mutation_acceptance_min_raw_delta": -0.005,
+            "mutation_acceptance_min_raw_adjusted_delta": -0.010,
+            "mutation_acceptance_max_mae_increase": 0.05,
+            "mutation_acceptance_max_tv_increase": 0.05,
+            "mutation_acceptance_min_high_recall_delta": -0.05,
+            "mutation_acceptance_reject_penalty": 0.03,
+            "mutation_acceptance_require_full_comparable": True,
+        }
+    }
+    pop_snapshot = [
+        {
+            "validation_stage": "full",
+            "raw_fitness": 0.49,
+            "raw_adjusted_fitness": 0.45,
+            "raw_mae": 1.20,
+            "raw_distribution_tv": 0.30,
+            "high_score_recall": 0.40,
+            "max_score_recall": 0.0,
+            "parent_trace": {
+                "parent_validation_stage": "full",
+                "parent_raw_qwk": 0.52,
+                "parent_raw_adjusted_qwk": 0.50,
+                "parent_raw_mae": 1.05,
+                "parent_score_distribution_tv": 0.20,
+                "parent_high_score_recall": 0.50,
+                "parent_max_score_recall": 0.0,
+                "parent_protocol_quality": 0.50,
+            },
+        }
+    ]
+    guarded, rejected, accepted = opt._apply_mutation_acceptance_guard([0.49], pop_snapshot)
+    assert rejected == [0]
+    assert accepted == []
+    assert guarded[0] == pytest.approx(0.47)
+    assert pop_snapshot[0]["mutation_acceptance_status"] == "rejected"
+    assert "raw_qwk_drop" in pop_snapshot[0]["mutation_acceptance_reasons"]
+    assert "mae_increase" in pop_snapshot[0]["mutation_acceptance_reasons"]
+
+
+def test_mutation_acceptance_guard_accepts_balanced_child():
+    opt = EvolutionOptimizer.__new__(EvolutionOptimizer)
+    opt.config = {
+        "evolution": {
+            "mutation_acceptance_guard_enabled": True,
+            "mutation_acceptance_min_raw_delta": -0.005,
+            "mutation_acceptance_min_raw_adjusted_delta": -0.010,
+            "mutation_acceptance_max_mae_increase": 0.05,
+            "mutation_acceptance_max_tv_increase": 0.05,
+            "mutation_acceptance_min_high_recall_delta": -0.05,
+            "mutation_acceptance_require_full_comparable": True,
+        }
+    }
+    pop_snapshot = [
+        {
+            "validation_stage": "full",
+            "raw_fitness": 0.53,
+            "raw_adjusted_fitness": 0.51,
+            "raw_mae": 1.04,
+            "raw_distribution_tv": 0.19,
+            "high_score_recall": 0.55,
+            "max_score_recall": 0.0,
+            "parent_trace": {
+                "parent_validation_stage": "full",
+                "parent_raw_qwk": 0.52,
+                "parent_raw_adjusted_qwk": 0.50,
+                "parent_raw_mae": 1.05,
+                "parent_score_distribution_tv": 0.20,
+                "parent_high_score_recall": 0.50,
+                "parent_max_score_recall": 0.0,
+                "parent_protocol_quality": 0.50,
+            },
+        }
+    ]
+    guarded, rejected, accepted = opt._apply_mutation_acceptance_guard([0.53], pop_snapshot)
+    assert rejected == []
+    assert accepted == [0]
+    assert guarded[0] == pytest.approx(0.53)
+    assert pop_snapshot[0]["mutation_acceptance_status"] == "accepted"
+
+
+def test_mutation_acceptance_guard_accepts_pareto_tradeoff_child():
+    opt = EvolutionOptimizer.__new__(EvolutionOptimizer)
+    opt.config = {
+        "evolution": {
+            "mutation_acceptance_guard_enabled": True,
+            "mutation_acceptance_mode": "pareto",
+            "mutation_acceptance_allow_tradeoff": True,
+            "mutation_acceptance_min_tradeoff_improvements": 2,
+            "mutation_acceptance_min_raw_delta": -0.005,
+            "mutation_acceptance_min_raw_adjusted_delta": -0.010,
+            "mutation_acceptance_max_mae_increase": 0.05,
+            "mutation_acceptance_max_tv_increase": 0.05,
+            "mutation_acceptance_min_high_recall_delta": -0.05,
+            "mutation_acceptance_qwk_hard_drop": -0.08,
+            "mutation_acceptance_require_full_comparable": True,
+        }
+    }
+    pop_snapshot = [
+        {
+            "validation_stage": "full",
+            "raw_fitness": 0.49,
+            "raw_adjusted_fitness": 0.51,
+            "raw_mae": 0.95,
+            "raw_distribution_tv": 0.12,
+            "high_score_recall": 0.60,
+            "max_score_recall": 0.0,
+            "parent_trace": {
+                "parent_validation_stage": "full",
+                "parent_raw_qwk": 0.52,
+                "parent_raw_adjusted_qwk": 0.50,
+                "parent_raw_mae": 1.05,
+                "parent_score_distribution_tv": 0.20,
+                "parent_high_score_recall": 0.50,
+                "parent_max_score_recall": 0.0,
+                "parent_protocol_quality": 0.50,
+            },
+        }
+    ]
+    guarded, rejected, accepted = opt._apply_mutation_acceptance_guard([0.49], pop_snapshot)
+    assert rejected == []
+    assert accepted == [0]
+    assert guarded[0] == pytest.approx(0.49)
+    assert pop_snapshot[0]["mutation_acceptance_status"] == "accepted_tradeoff"
+    assert "raw_qwk_drop" in pop_snapshot[0]["mutation_acceptance_reasons"]
+    assert pop_snapshot[0]["mutation_acceptance_tradeoff_improvements"] >= 2
+
+
+def test_acceptance_safe_rank_pool_excludes_rejected_child():
+    opt = EvolutionOptimizer.__new__(EvolutionOptimizer)
+    pop_snapshot = [
+        {"mutation_acceptance_status": "no_parent"},
+        {"mutation_acceptance_status": "rejected"},
+        {"mutation_acceptance_status": "accepted"},
+    ]
+    assert opt._acceptance_safe_candidate_indices(pop_snapshot, [0, 1, 2]) == [0, 2]
+
+
+def test_acceptance_safe_rank_pool_falls_back_if_all_rejected():
+    opt = EvolutionOptimizer.__new__(EvolutionOptimizer)
+    pop_snapshot = [
+        {"mutation_acceptance_status": "rejected"},
+        {"mutation_acceptance_status": "rejected"},
+    ]
+    assert opt._acceptance_safe_candidate_indices(pop_snapshot, [0, 1]) == [0, 1]
 
 
 def test_high_score_audit_toy_values():
@@ -456,6 +657,25 @@ def test_parent_child_audit_row_serializes(tmp_path):
     assert json.loads(rows[0]["changed_anchor_slots"]) == [1]
 
 
+def test_dual_validation_split_is_disjoint_and_stratified():
+    val_set = [
+        {"essay_id": i, "essay_text": f"essay {i}", "domain1_score": 2 + (i % 11)}
+        for i in range(44)
+    ]
+    cfg = {
+        "data": {"score_min": 2, "score_max": 12},
+        "evolution": {"dual_validation_enabled": True, "mutation_val_ratio": 0.5},
+    }
+    mutation_val, selection_val, meta = _split_mutation_selection_val(val_set, cfg, seed=123)
+    mutation_ids = {x["essay_id"] for x in mutation_val}
+    selection_ids = {x["essay_id"] for x in selection_val}
+    assert meta["dual_validation_enabled"] is True
+    assert mutation_ids.isdisjoint(selection_ids)
+    assert len(mutation_val) + len(selection_val) == len(val_set)
+    assert abs(len(mutation_val) - len(selection_val)) <= 1
+    assert meta["mutation_selection_overlap"] == 0
+
+
 @pytest.mark.parametrize(
     "path",
     [
@@ -467,6 +687,8 @@ def test_parent_child_audit_row_serializes(tmp_path):
         "configs/phase4_neural_text_anchor_smoke.yaml",
         "configs/phase4_neural_score_anchor_smoke.yaml",
         "configs/phase4_neural_dual_anchor_smoke.yaml",
+        "configs/phase4_z_anchor_only_smoke.yaml",
+        "configs/phase4_z_no_anchor_smoke.yaml",
         "configs/phase4_cost_aware_mid.yaml",
         "configs/phase4_raw_only_cost_aware_mid.yaml",
     ],

@@ -65,7 +65,7 @@ pace:
   include_raw_elite_buffer: 1
   raw_guard_enabled: true
   raw_guard_margin: 0.03
-  final_pace_calibrated: true
+  final_pace_calibrated: false
   calib_split_ratio: 0.5
   alpha: 0.70
   beta: 0.30

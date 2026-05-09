@@ -63,6 +63,22 @@ evolution:
   raw_require_max_score_when_present: true
   raw_max_score_recall_penalty_weight: 0.03
   max_score_contract_enabled: true
+  final_primary_candidate: 'best_pareto'
+  dual_validation_enabled: true
+  mutation_val_ratio: 0.50
+  pareto_selection_enabled: true
+  pareto_qwk_weight: 1.0
+  pareto_raw_adjusted_weight: 0.35
+  pareto_mae_weight: 0.06
+  pareto_tv_weight: 0.12
+  pareto_high_recall_weight: 0.08
+  pareto_max_recall_weight: 0.02
+  mutation_acceptance_guard_enabled: true
+  mutation_acceptance_mode: 'pareto'
+  mutation_acceptance_allow_tradeoff: true
+  mutation_acceptance_min_tradeoff_improvements: 2
+  mutation_acceptance_qwk_hard_drop: -0.08
+  mutation_acceptance_raw_adjusted_hard_drop: -0.08
 
 llm:
   local_backend_enabled: true

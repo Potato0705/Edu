@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 from pathlib import Path
+import sys
 
 import pytest
 import torch
 import yaml
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from pace.llm_backend import ScoringResult, resolve_llm_token_limits
 from pace.neural_evidence import NeuralEvidenceConfig, NeuralEvidenceEncoder

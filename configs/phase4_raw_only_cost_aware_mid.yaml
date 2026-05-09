@@ -75,7 +75,16 @@ evolution:
     max_score_contrastive_mutation: 1
     boundary_clarification_mutation: 1
     anchor_slot_mutation: 1
-  final_primary_candidate: 'best_raw_guarded'
+  final_primary_candidate: 'best_pareto'
+  dual_validation_enabled: true
+  mutation_val_ratio: 0.50
+  pareto_selection_enabled: true
+  pareto_qwk_weight: 1.0
+  pareto_raw_adjusted_weight: 0.35
+  pareto_mae_weight: 0.06
+  pareto_tv_weight: 0.12
+  pareto_high_recall_weight: 0.08
+  pareto_max_recall_weight: 0.02
   instruction_mutation_mode: 'conservative_patch'
   atomic_i_e_mutation_enabled: true
   staged_validation_enabled: true
@@ -85,6 +94,20 @@ evolution:
   full_val_always_include_elite: true
   mid_val_include_best_child: true
   full_val_include_best_child: true
+  mutation_acceptance_guard_enabled: true
+  mutation_acceptance_min_raw_delta: -0.005
+  mutation_acceptance_min_raw_adjusted_delta: -0.010
+  mutation_acceptance_max_mae_increase: 0.10
+  mutation_acceptance_max_tv_increase: 0.12
+  mutation_acceptance_min_high_recall_delta: -0.10
+  mutation_acceptance_min_max_recall_delta: -1.0
+  mutation_acceptance_reject_penalty: 0.03
+  mutation_acceptance_require_full_comparable: true
+  mutation_acceptance_mode: 'pareto'
+  mutation_acceptance_allow_tradeoff: true
+  mutation_acceptance_min_tradeoff_improvements: 2
+  mutation_acceptance_qwk_hard_drop: -0.08
+  mutation_acceptance_raw_adjusted_hard_drop: -0.08
 
 llm:
   local_backend_enabled: true

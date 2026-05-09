@@ -80,7 +80,7 @@ pace:
   max_protocol_quality_lift: 0.02
   pace_guidance_weight: 0.00
   anchor_guidance_weight: 0.05
-  final_pace_calibrated: true
+  final_pace_calibrated: false
   calib_split_ratio: 0.5
   alpha: 0.70
   beta: 0.30
