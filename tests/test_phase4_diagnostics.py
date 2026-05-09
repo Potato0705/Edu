@@ -863,6 +863,12 @@ def test_contrastive_anchor_pairs_are_score_range_generic():
         "configs/phase4_reflection_pe_mid.yaml",
         "configs/phase4_hidden_pe_mid.yaml",
         "configs/phase4_hidden_contrastive_mid.yaml",
+        "configs/phase4_gate3_raw_no_anchor_mid.yaml",
+        "configs/phase4_gate3_raw_absolute_mid.yaml",
+        "configs/phase4_gate3_raw_abs_contrastive_mid.yaml",
+        "configs/phase4_gate3_hidden_no_anchor_mid.yaml",
+        "configs/phase4_gate3_hidden_absolute_mid.yaml",
+        "configs/phase4_gate3_hidden_abs_contrastive_mid.yaml",
     ],
 )
 def test_phase4_configs_load(path):

@@ -1,0 +1,141 @@
+# Gate 3 RawError-only / absolute anchor ablation mid config.
+
+model:
+  name: models/Meta-Llama-3.1-8B-Instruct
+data:
+  asap_path: data/raw/training_set_rel3.tsv
+  essay_set: 1
+  score_min: 2
+  score_max: 12
+rag:
+  enabled: false
+  model_name: all-MiniLM-L6-v2
+  n_retrieved: 10
+  n_selected: 3
+  use_rerank_train: false
+  use_rerank_test: false
+  rubric_driven_retrieval: false
+induction:
+  enabled: true
+  n_high_samples: 3
+  n_low_samples: 3
+  official_criteria: Evaluate the essay based on content, organization, and language
+    use.
+evolution:
+  population_size: 3
+  n_generations: 2
+  n_static_exemplars: 4
+  contrastive_anchors_enabled: false
+  n_contrastive_anchor_pairs: 0
+  evolve_contrastive_anchors: false
+  diagnostic_source: raw_error
+  anchor_profile: boundary
+  anchor_stratum_strategy: score_band
+  anchor_boundary_mode: mid_and_high
+  anchor_high_exact_top: true
+  anchor_high_min_count: 5
+  anchor_high_top_preference_prob: 0.75
+  anchor_high_top_bonus: 0.25
+  anchor_high_preserve_top_prob: 0.85
+  anchor_low_exact_floor: false
+  anchor_mutation_strategy: evidence_representative
+  anchor_mutation_candidate_pool: 8
+  anchor_mutation_hidden_rerank: false
+  anchor_mutation_hidden_top_m: 3
+  use_evidence_feedback: false
+  use_evidence_anchor_slot: false
+  evidence_anchor_slot_prob: 0.0
+  n_elite_evolve: 1
+  elite_diversity_max_score_gap: 0.2
+  n_error_cases: 3
+  max_workers: 1
+  evolve_instruction: true
+  evolve_static_exemplars: true
+  raw_distribution_guard_enabled: true
+  raw_distribution_tv_threshold: 0.35
+  raw_distribution_penalty_weight: 0.15
+  raw_bias_threshold: 1.5
+  raw_bias_penalty_weight: 0.05
+  raw_collapse_penalty_weight: 0.1
+  raw_high_score_quantile: 0.75
+  raw_high_recall_floor: 0.3
+  raw_high_recall_penalty_weight: 0.12
+  raw_high_bias_floor: -1.0
+  raw_high_bias_penalty_weight: 0.04
+  raw_require_max_score_when_present: true
+  raw_max_score_recall_penalty_weight: 0.03
+  max_score_contract_enabled: true
+  max_score_contract_text: 'The maximum score is attainable. Do not reserve the maximum
+    score only for flawless essays. If the essay is comparable to or stronger than
+    the high-score anchor in content, organization, and language use, assign a score
+    near the top of the range, including the maximum score when appropriate.
+
+    '
+  mutation_diversity_enabled: true
+  mutation_type_quota:
+    high_tail_instruction_mutation: 1
+    max_score_contrastive_mutation: 1
+    boundary_clarification_mutation: 1
+    anchor_slot_mutation: 1
+  final_primary_candidate: best_pareto
+  dual_validation_enabled: true
+  mutation_val_ratio: 0.5
+  pareto_selection_enabled: true
+  pareto_qwk_weight: 1.0
+  pareto_raw_adjusted_weight: 0.35
+  pareto_mae_weight: 0.06
+  pareto_tv_weight: 0.12
+  pareto_high_recall_weight: 0.08
+  pareto_max_recall_weight: 0.02
+  instruction_mutation_mode: conservative_patch
+  atomic_i_e_mutation_enabled: true
+  staged_validation_enabled: true
+  mini_val_size: 32
+  mid_val_size: 96
+  full_val_top_k: 1
+  full_val_always_include_elite: true
+  mid_val_include_best_child: true
+  full_val_include_best_child: true
+  mutation_acceptance_guard_enabled: true
+  mutation_acceptance_min_raw_delta: -0.005
+  mutation_acceptance_min_raw_adjusted_delta: -0.01
+  mutation_acceptance_max_mae_increase: 0.1
+  mutation_acceptance_max_tv_increase: 0.12
+  mutation_acceptance_min_high_recall_delta: -0.1
+  mutation_acceptance_min_max_recall_delta: -1.0
+  mutation_acceptance_reject_penalty: 0.03
+  mutation_acceptance_require_full_comparable: true
+  mutation_acceptance_mode: pareto
+  mutation_acceptance_allow_tradeoff: true
+  mutation_acceptance_min_tradeoff_improvements: 2
+  mutation_acceptance_qwk_hard_drop: -0.08
+  mutation_acceptance_raw_adjusted_hard_drop: -0.08
+llm:
+  local_backend_enabled: true
+  temperature_scoring: 0.0
+  temperature_induce: 0.8
+  max_exemplar_length: 400
+  max_new_tokens_scoring: 192
+  max_new_tokens_reflection: 512
+  max_new_tokens_induction: 512
+  protocol_cache_enabled: true
+output:
+  verbose: false
+debug:
+  enabled: true
+  stratified: true
+  seed: 42
+  n_train: 240
+  n_val: 96
+  n_test: 64
+pace:
+  enabled: false
+  model_path: models/Meta-Llama-3.1-8B-Instruct
+  load_in_4bit: false
+  dtype: bfloat16
+  final_pace_calibrated: false
+  raw_guard_enabled: true
+  raw_guard_margin: 0.03
+  raw_adjusted_guard_margin: 0.04
+  selection_max_distribution_penalty: 0.15
+  score_collapse_threshold: 0.75
