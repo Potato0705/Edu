@@ -4493,7 +4493,7 @@ class EvolutionOptimizer:
             elite.evidence_feedback["mutation_policy"] = mutation_policy
             # 这里是修改原始 elite 对象的引用
             if evolve_instr:
-                feedback_eval = self._refresh_mutation_feedback(elite, use_rerank=use_rerank)
+                feedback_eval = self._refresh_mutation_feedback(elite, use_rerank=use_rerank_train)
                 if feedback_eval:
                     parent_eval_trace_by_object[id(elite)]["mutation_feedback_stage"] = feedback_eval.get("validation_stage")
                     parent_eval_trace_by_object[id(elite)]["mutation_feedback_n"] = feedback_eval.get("validation_n")
