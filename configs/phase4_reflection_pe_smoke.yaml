@@ -1,4 +1,6 @@
-# Phase 4 neural-hidden evidence smoke test, text-only anchor view.
+# Reflection-PE smoke baseline.
+# Same protocol budget and selection objective as Phase 4 smoke, but mutation
+# routing is generic LLM reflection over visible validation errors only.
 
 model:
   name: "models/Meta-Llama-3.1-8B-Instruct"
@@ -31,7 +33,7 @@ evolution:
   contrastive_anchors_enabled: true
   n_contrastive_anchor_pairs: 2
   evolve_contrastive_anchors: true
-  diagnostic_source: "hidden_evidence"
+  diagnostic_source: "llm_reflection"
   anchor_profile: "boundary"
   anchor_stratum_strategy: "score_band"
   anchor_boundary_mode: "mid_and_high"
@@ -43,11 +45,11 @@ evolution:
   anchor_low_exact_floor: false
   anchor_mutation_strategy: "evidence_representative"
   anchor_mutation_candidate_pool: 8
-  anchor_mutation_hidden_rerank: true
+  anchor_mutation_hidden_rerank: false
   anchor_mutation_hidden_top_m: 3
-  use_evidence_feedback: true
-  use_evidence_anchor_slot: true
-  evidence_anchor_slot_prob: 0.6
+  use_evidence_feedback: false
+  use_evidence_anchor_slot: false
+  evidence_anchor_slot_prob: 0.0
   n_elite_evolve: 1
   elite_diversity_max_score_gap: 0.20
   n_error_cases: 3
@@ -70,12 +72,8 @@ evolution:
   max_score_contract_enabled: true
   max_score_contract_text: |
     The maximum score is attainable. Do not reserve the maximum score only for flawless essays. If the essay is comparable to or stronger than the high-score anchor in content, organization, and language use, assign a score near the top of the range, including the maximum score when appropriate.
-  mutation_diversity_enabled: true
-  mutation_type_quota:
-    high_tail_instruction_mutation: 1
-    max_score_contrastive_mutation: 1
-    boundary_clarification_mutation: 1
-    anchor_slot_mutation: 1
+  mutation_diversity_enabled: false
+  mutation_type_quota: {}
   final_primary_candidate: 'best_pareto'
   dual_validation_enabled: true
   mutation_val_ratio: 0.50
@@ -130,76 +128,13 @@ debug:
   n_test: 16
 
 pace:
-  enabled: true
+  enabled: false
   model_path: "models/Meta-Llama-3.1-8B-Instruct"
   load_in_4bit: false
   dtype: "bfloat16"
-  top_k_pace: 1
-  evidence_mode: "neural_hidden"
-  pace_result_cache_enabled: true
-  diagnostic_only_skip_calibrator: true
-  diagnostic_sample_size: 16
-  trigger_mode: "top_k"
-  trigger_patience: 1
-  trigger_high_recall_floor: 0.5
-  trigger_raw_stagnation_delta: 0.01
-  include_raw_elite_buffer: 1
+  final_pace_calibrated: false
   raw_guard_enabled: true
   raw_guard_margin: 0.03
   raw_adjusted_guard_margin: 0.04
   selection_max_distribution_penalty: 0.15
-  max_anchor_geometry_bonus: 0.02
-  max_protocol_quality_lift: 0.02
-  pace_guidance_weight: 0.00
-  anchor_guidance_weight: 0.05
-  final_pace_calibrated: false
-  calib_split_ratio: 0.5
-  alpha: 0.60
-  beta: 0.25
-  gamma: 0.10
-  hidden_dim: 64
-  epochs: 5
-  lr: 0.001
-  batch_size: 16
-  lambda_qwk: 0.25
-  use_compact_evidence: false
-  use_enhanced_evidence: false
-  evidence_include_raw_score: false
-  neural_evidence:
-    proj_dim: 128
-    score_emb_dim: 32
-    output_dim: 128
-    dropout: 0.1
-    anchor_view: "text"
-    use_reasoning_hidden: true
-    use_score_distribution: false
-    use_raw_score_embedding: true
-    num_attention_heads: 2
-    attention_mode: 'cosine'
-    preserve_block_structure: true
-    projection_seed: 42
-  evidence_blocks_enabled:
-    raw: false
-    anchor: false
-    reasoning: false
-    objective: false
-    uncertainty: false
-    stability: false
-    enhanced_extra: false
-  anchor_softmax_temperature: 0.10
-  early_reject_enabled: true
-  early_reject_mini_set_size: 4
   score_collapse_threshold: 0.75
-  anchor_sep_threshold: 0.02
-  early_qwk_threshold: -0.05
-  cost_penalty_lambda: 0.02
-  overfit_guard_enabled: true
-  overfit_gap_threshold: 0.15
-  overfit_penalty_weight: 0.20
-  distribution_guard_enabled: true
-  distribution_tv_threshold: 0.25
-  distribution_penalty_weight: 0.20
-  collapse_penalty_weight: 0.15
-  max_score_overprediction_threshold: 3.0
-  max_score_penalty_weight: 0.03
-  evidence_diagnostics_top_n: 5

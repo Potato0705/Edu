@@ -357,3 +357,106 @@ evolution:
 ```
 
 这版结构的目标是让 WISE-PACE 的论文主张更干净：hidden evidence 不是校准器，而是帮助生成更好的 `I*` 和 `E*`；候选协议必须在独立的 selection validation 上胜出，才有资格进入 final test。
+
+## 论文级核心定位
+
+当前主线进一步收敛为 hidden-evidence-guided protocol evolution，而不是一个带后处理校准器的 AES 系统：
+
+```text
+Fixed LLM M
+Protocol P = (I, A_abs, A_ctr)
+
+I: scoring instruction / rubric
+A_abs: absolute score anchors
+A_ctr: contrastive boundary anchor pairs
+
+Final prediction:
+  y_hat = M_score(x | P)
+
+No test-time calibration.
+No learned final scorer.
+No extra deployment model.
+```
+
+方法三层结构：
+
+```text
+Layer 1: Protocol Scoring
+  用固定 LLM 在 P 下直接输出 raw score。
+
+Layer 2: Hidden Failure Diagnosis
+  在 scoring context 下提取 hidden evidence，离散化为 failure type。
+
+Layer 3: Diagnostic-Guided Protocol Evolution
+  根据 failure type 选择 mutation operator，生成 child protocol，并在 selection validation 上选择。
+```
+
+新增协议对象位于 `pace/protocol.py`：
+
+```text
+ProtocolCandidate
+AnchorBank
+EssayAnchor
+ContrastivePair
+DiagnosticType
+MutationOperator
+```
+
+`DiagnosticType` 目前统一为：
+
+```text
+HIGH_TAIL_UNDERSCORE
+LOW_TAIL_OVERSCORE
+SCORE_COMPRESSION
+BOUNDARY_AMBIGUITY
+ANCHOR_CONFUSION
+RUBRIC_UNDER_SPECIFICATION
+FORMAT_INSTABILITY
+NO_CLEAR_SIGNAL
+```
+
+这些类型会映射到固定 mutation family，保证论文里的 causal chain 可追踪：
+
+```text
+failure evidence
+-> diagnostic type
+-> mutation operator
+-> protocol diff
+-> validation behavior delta
+-> final raw test behavior
+```
+
+## Contrastive Boundary Anchors
+
+普通 anchors 仍作为全局 score-scale references，新增 `A_ctr` 表示边界对：
+
+```text
+A_k^-: lower-side anchor just below a score boundary
+A_k^+: upper-side anchor just above that boundary
+```
+
+prompt 中会出现独立的 `CONTRASTIVE BOUNDARY ANCHORS` section，用来帮助 LLM 判断目标作文应该落在边界哪一侧。这个设计直接针对 high-score recall、score compression 和 adjacent-boundary ambiguity。
+
+关键配置：
+
+```yaml
+evolution:
+  contrastive_anchors_enabled: true
+  n_contrastive_anchor_pairs: 2
+  evolve_contrastive_anchors: true
+```
+
+## 同预算 Baseline
+
+为了证明 hidden evidence 不是复杂装饰，当前新增两个 smoke baseline：
+
+```bash
+python wise_aes.py --config configs/phase4_raw_error_pe_smoke.yaml --fold 0
+python wise_aes.py --config configs/phase4_reflection_pe_smoke.yaml --fold 0
+```
+
+它们复用相同的 validation split、candidate budget 和 Pareto selection objective：
+
+- `RawError-PE`: 只用 raw output errors 做 diagnostic routing。
+- `Reflection-PE`: 只做 visible-error LLM reflection，不使用 hidden evidence routing。
+- `WISE-PACE / hidden-evidence PE`: 使用 hidden diagnostics + contrastive anchors 做 targeted mutation。

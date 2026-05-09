@@ -22,8 +22,16 @@ if "sentence_transformers" not in sys.modules:
     stub.SentenceTransformer = _DummySentenceTransformer
     sys.modules["sentence_transformers"] = stub
 
-from pace.llm_backend import ScoringResult
+from pace.llm_backend import ScoringResult, build_scoring_prompt
 from pace.pace_fitness import PaceFitnessConfig, PaceFitnessEvaluator
+from pace.protocol import (
+    AnchorBank,
+    DiagnosticType,
+    MutationOperator,
+    ProtocolCandidate,
+    canonical_diagnostic_type,
+    mutation_operator_for_diagnostic,
+)
 from wise_aes import (
     EvolutionOptimizer,
     ExperimentManager,
@@ -143,6 +151,40 @@ def test_max_score_contract_toggle_changes_scoring_instruction():
     ind_on = PromptIndividual("Rubric body", [], config=cfg_on)
     assert "Maximum-Score Attainable Contract" in ind_on.scoring_instruction_text()
     assert "maximum score is attainable" in ind_on.scoring_instruction_text().lower()
+
+
+def test_contrastive_anchor_prompt_and_signature():
+    cfg = {
+        "data": {"score_min": 2, "score_max": 12},
+        "evolution": {"max_score_contract_enabled": False},
+    }
+    pair = {
+        "boundary": "6_vs_7",
+        "lower_anchor": {"essay_id": 11, "score": 6, "essay_text": "lower essay"},
+        "upper_anchor": {"essay_id": 12, "score": 7, "essay_text": "upper essay"},
+        "rationale_diff": "upper gives clearer evidence",
+    }
+    ind = PromptIndividual(
+        "Rubric body",
+        [{"essay_id": 1, "essay_text": "anchor", "domain1_score": 2}],
+        config=cfg,
+        contrastive_anchors=[pair],
+    )
+    formatted = ind._format_contrastive_pairs(ind.contrastive_anchors)
+    assert "Boundary Pair" in formatted
+    assert "6_vs_7" in formatted
+    prompt = build_scoring_prompt(
+        instruction=ind.scoring_instruction_text(),
+        static_exemplars=ind.static_exemplars,
+        contrastive_anchors=ind.contrastive_anchors,
+        essay_text="target essay",
+        score_min=2,
+        score_max=12,
+    )
+    assert "CONTRASTIVE BOUNDARY ANCHORS" in prompt
+    assert "upper gives clearer evidence" in prompt
+    ind2 = PromptIndividual("Rubric body", ind.static_exemplars, config=cfg, contrastive_anchors=[])
+    assert ind.get_signature() != ind2.get_signature()
 
 
 def test_feedback_uses_actual_eval_items(monkeypatch):
@@ -540,6 +582,51 @@ def test_mutation_policy_mapping(dominant, expected):
     assert policy["mutation_axis"] == mutation_axis_for_type(expected)
 
 
+def test_protocol_candidate_and_diagnostic_taxonomy():
+    diag = canonical_diagnostic_type(
+        "under_score_high_hidden",
+        {"high_score_recall": 0.2},
+    )
+    assert diag == DiagnosticType.HIGH_TAIL_UNDERSCORE
+    assert mutation_operator_for_diagnostic(diag) == MutationOperator.HIGH_TAIL_INSTRUCTION
+    candidate = ProtocolCandidate(
+        id="p1",
+        parent_id=None,
+        instruction="rubric",
+        anchor_bank=AnchorBank(),
+        diagnostic_type=diag.value,
+        mutation_operator=MutationOperator.HIGH_TAIL_INSTRUCTION.value,
+    )
+    payload = candidate.to_dict()
+    assert payload["id"] == "p1"
+    assert payload["diagnostic_type"] == "HIGH_TAIL_UNDERSCORE"
+    assert "anchor_bank" in payload
+
+
+def test_reflection_baseline_forces_general_reflection_policy():
+    cfg = {
+        "data": {"score_min": 2, "score_max": 12},
+        "evolution": {
+            "diagnostic_source": "llm_reflection",
+            "raw_high_recall_floor": 0.30,
+        },
+    }
+    policy = choose_mutation_policy(
+        object(),
+        {
+            "dominant_error_type": "anchor_confusion",
+            "raw_prediction_metrics": {
+                "high_score_recall": 0.0,
+                "max_score_recall": 0.0,
+                "n_true_max_score": 2,
+            },
+        },
+        cfg,
+    )
+    assert policy["mutation_type"] == "general_reflection_mutation"
+    assert policy["diagnostic_source"] == "llm_reflection"
+
+
 def test_final_primary_policy_defaults_to_raw_guarded():
     candidates = {
         "best_raw_val": object(),
@@ -676,11 +763,45 @@ def test_dual_validation_split_is_disjoint_and_stratified():
     assert meta["mutation_selection_overlap"] == 0
 
 
+def test_contrastive_anchor_pairs_are_score_range_generic():
+    opt = EvolutionOptimizer.__new__(EvolutionOptimizer)
+    opt.config = {
+        "data": {"score_min": 0, "score_max": 60},
+        "evolution": {
+            "contrastive_anchors_enabled": True,
+            "n_contrastive_anchor_pairs": 2,
+        },
+    }
+    opt.train_data = [
+        {"essay_id": 1, "essay_text": "score twenty nine", "domain1_score": 29},
+        {"essay_id": 2, "essay_text": "score thirty", "domain1_score": 30},
+        {"essay_id": 3, "essay_text": "score forty nine", "domain1_score": 49},
+        {"essay_id": 4, "essay_text": "score fifty", "domain1_score": 50},
+        {"essay_id": 5, "essay_text": "score ten", "domain1_score": 10},
+    ]
+    opt.anchor_slot_specs = [
+        {"name": "boundary_29_30", "min": 29, "max": 30},
+        {"name": "boundary_49_50", "min": 49, "max": 50},
+    ]
+    pairs = opt._build_contrastive_anchor_pairs()
+    assert len(pairs) == 2
+    assert pairs[0]["boundary"] in {"29_vs_30", "49_vs_50"}
+    all_scores = {
+        pairs[0]["lower_anchor"]["score"],
+        pairs[0]["upper_anchor"]["score"],
+        pairs[1]["lower_anchor"]["score"],
+        pairs[1]["upper_anchor"]["score"],
+    }
+    assert 12 not in all_scores
+
+
 @pytest.mark.parametrize(
     "path",
     [
         "configs/phase4_raw_only_full_fold.yaml",
         "configs/phase4_raw_only_smoke.yaml",
+        "configs/phase4_raw_error_pe_smoke.yaml",
+        "configs/phase4_reflection_pe_smoke.yaml",
         "configs/phase4_smoke.yaml",
         "configs/phase4_neural_smoke.yaml",
         "configs/phase4_neural_no_anchor_smoke.yaml",

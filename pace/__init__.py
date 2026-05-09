@@ -6,3 +6,27 @@ imported unchanged.
 """
 
 __version__ = "0.1.0.dev0"
+
+from .protocol import (
+    AnchorBank,
+    ContrastivePair,
+    DiagnosticType,
+    EssayAnchor,
+    MutationOperator,
+    ProtocolCandidate,
+    canonical_diagnostic_type,
+    mutation_operator_for_diagnostic,
+    protocol_diff_summary,
+)
+
+__all__ = [
+    "AnchorBank",
+    "ContrastivePair",
+    "DiagnosticType",
+    "EssayAnchor",
+    "MutationOperator",
+    "ProtocolCandidate",
+    "canonical_diagnostic_type",
+    "mutation_operator_for_diagnostic",
+    "protocol_diff_summary",
+]

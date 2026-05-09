@@ -95,6 +95,28 @@ def format_exemplars(exs: Sequence[Dict]) -> str:
     )
 
 
+def format_contrastive_anchors(pairs: Optional[Sequence[Dict]]) -> str:
+    if not pairs:
+        return "(None)"
+    blocks = []
+    for idx, pair in enumerate(pairs):
+        lower = pair.get("lower_anchor", {}) or {}
+        upper = pair.get("upper_anchor", {}) or {}
+        boundary = pair.get("boundary") or f"{lower.get('score')}_vs_{upper.get('score')}"
+        rationale = pair.get("rationale_diff") or (
+            "Use this pair to decide which side of the boundary the target essay belongs on."
+        )
+        blocks.append(
+            f"### Boundary Pair {idx + 1}: {boundary}\n"
+            f"Lower-side anchor (Known Score: {lower.get('score')}):\n"
+            f"{str(lower.get('essay_text', ''))[:350]}...\n\n"
+            f"Upper-side anchor (Known Score: {upper.get('score')}):\n"
+            f"{str(upper.get('essay_text', ''))[:350]}...\n\n"
+            f"Boundary rationale: {rationale}"
+        )
+    return "\n\n".join(blocks)
+
+
 def build_scoring_prompt(
     *,
     instruction: str,
@@ -103,6 +125,7 @@ def build_scoring_prompt(
     score_min: int,
     score_max: int,
     dynamic_ex: str = "(None)",
+    contrastive_anchors: Optional[Sequence[Dict]] = None,
 ) -> str:
     """Construct the text that goes to either backend.
 
@@ -115,6 +138,7 @@ def build_scoring_prompt(
     return PromptIndividual.SCORING_TEMPLATE.format(
         instruction=instruction,
         static_ex=format_exemplars(static_exemplars),
+        contrastive_ex=format_contrastive_anchors(contrastive_anchors),
         dynamic_ex=dynamic_ex,
         essay=essay_text,
         score_min=score_min,
@@ -177,6 +201,7 @@ class ScoringRequest:
     score_min: int
     score_max: int
     dynamic_ex: str = "(None)"
+    contrastive_anchors: Optional[List[Dict]] = None
 
 
 @dataclass
@@ -237,6 +262,7 @@ class OpenRouterBackend:
             score_min=req.score_min,
             score_max=req.score_max,
             dynamic_ex=req.dynamic_ex,
+            contrastive_anchors=req.contrastive_anchors,
         )
         t0 = time.time()
         response = call_llm(
@@ -391,6 +417,7 @@ class LocalLlamaBackend:
             score_min=req.score_min,
             score_max=req.score_max,
             dynamic_ex=req.dynamic_ex,
+            contrastive_anchors=req.contrastive_anchors,
         )
         chat_prompt = self._apply_chat_template(prompt_text)
         prompt_tokens = self._count_tokens(chat_prompt)
@@ -852,5 +879,6 @@ __all__ = [
     "build_scoring_prompt",
     "build_representation_prompt",
     "format_exemplars",
+    "format_contrastive_anchors",
     "load_layer1_champion",
 ]

@@ -28,6 +28,10 @@ evolution:
   population_size: 2
   n_generations: 1
   n_static_exemplars: 4
+  contrastive_anchors_enabled: true
+  n_contrastive_anchor_pairs: 2
+  evolve_contrastive_anchors: true
+  diagnostic_source: "hidden_evidence"
   anchor_profile: "boundary"
   anchor_stratum_strategy: "score_band"
   anchor_boundary_mode: "mid_and_high"

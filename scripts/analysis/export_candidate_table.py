@@ -58,6 +58,7 @@ def main() -> int:
             "source_index": result.get("source_index"),
             "static_exemplar_ids": result.get("static_exemplar_ids"),
             "static_exemplar_scores": result.get("static_exemplar_scores"),
+            "contrastive_anchor_pairs": result.get("contrastive_anchor_pairs"),
             "high_score_recall": audit.get("high_score_recall"),
             "max_score_recall": audit.get("max_score_recall"),
             "score_distribution_tv": audit.get("score_distribution_tv"),

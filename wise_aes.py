@@ -84,9 +84,16 @@ PARENT_CHILD_AUDIT_FIELDS = [
     "changed_anchor_ids_before",
     "changed_anchor_ids_after",
     "dominant_error_type_used",
+    "diagnostic_type",
+    "diagnostic_source",
+    "evidence_summary",
     "recommended_mutation_used",
     "target_anchor_slot",
     "rubric_edit_focus",
+    "protocol_diff",
+    "parent_contrastive_boundaries",
+    "child_contrastive_boundaries",
+    "contrastive_anchors_changed",
     "mutation_acceptance_status",
     "mutation_acceptance_reasons",
     "mutation_acceptance_comparable",
@@ -123,6 +130,17 @@ MUTATION_EFFECT_SUMMARY_FIELDS = [
 try:
     from pace.llm_backend import LocalLlamaBackend, ScoringRequest
     from pace.pace_fitness import PaceFitnessConfig, PaceFitnessEvaluator
+    from pace.protocol import (
+        AnchorBank,
+        DiagnosticType,
+        EssayAnchor,
+        MutationOperator,
+        ProtocolCandidate,
+        canonical_diagnostic_type,
+        contrastive_pair_from_dict,
+        mutation_operator_for_diagnostic,
+        protocol_diff_summary,
+    )
     _PACE_AVAILABLE = True
 except ImportError:
     _PACE_AVAILABLE = False
@@ -473,6 +491,7 @@ class ExperimentManager:
                 "instruction": best_ind.instruction_text,
                 "static_exemplars": [ex['essay_id'] for ex in best_ind.static_exemplars],
                 "static_exemplar_scores": [ex['domain1_score'] for ex in best_ind.static_exemplars],
+                "contrastive_anchor_pairs": getattr(best_ind, "contrastive_anchors", []),
             }
         res = {
             **(best_payload or {}),
@@ -1133,8 +1152,10 @@ def choose_mutation_policy(
 ) -> Dict[str, Any]:
     """Rule-based first version of diagnostic-to-mutation routing."""
     diagnostics = dict(pace_diagnostics or {})
+    diagnostic_source = str(config.get("evolution", {}).get("diagnostic_source", "hidden_evidence"))
     dominant = str(diagnostics.get("dominant_error_type") or "")
     raw_metrics = diagnostics.get("raw_prediction_metrics") or {}
+    diagnostic_type = canonical_diagnostic_type(dominant, raw_metrics)
     high_floor = float(config.get("evolution", {}).get("raw_high_recall_floor", 0.30))
     high_recall = float(raw_metrics.get("high_score_recall", raw_metrics.get("high_recall", 1.0)) or 0.0)
     max_recall = float(raw_metrics.get("max_score_recall", 1.0) or 0.0)
@@ -1147,36 +1168,50 @@ def choose_mutation_policy(
     score_span = max(1, score_max - score_min)
     suggested_slot = diagnostics.get("suggested_anchor_mutation_slot")
 
-    mutation_type = "general_reflection_mutation"
-    if dominant == "anchor_confusion":
+    if diagnostic_source == "llm_reflection":
+        diagnostic_type = DiagnosticType.NO_CLEAR_SIGNAL
+        mutation_type = MutationOperator.GENERAL_REFLECTION.value
+    else:
+        mutation_type = mutation_operator_for_diagnostic(diagnostic_type).value
+
+    if diagnostic_source == "raw_error":
+        # RawError-PE uses the same validation split and operators, but routes
+        # only from output errors, not hidden-anchor diagnostics.
+        dominant = ""
+        diagnostic_type = canonical_diagnostic_type(None, raw_metrics)
+        mutation_type = mutation_operator_for_diagnostic(diagnostic_type).value
+
+    if diagnostic_source != "llm_reflection" and dominant == "anchor_confusion":
         mutation_type = "anchor_slot_mutation"
-    elif dominant == "raw_collapse" or collapse >= 0.70 or pred_span <= max(1, score_span // 4):
+    elif diagnostic_source != "llm_reflection" and (dominant == "raw_collapse" or collapse >= 0.70 or pred_span <= max(1, score_span // 4)):
         mutation_type = "score_distribution_mutation"
-    elif dominant == "boundary_ambiguity":
+    elif diagnostic_source != "llm_reflection" and dominant == "boundary_ambiguity":
         mutation_type = "boundary_clarification_mutation"
-    elif dominant == "reasoning_score_contradiction":
+    elif diagnostic_source != "llm_reflection" and dominant == "reasoning_score_contradiction":
         mutation_type = "score_mapping_mutation"
-    elif dominant == "over_score_low_hidden":
+    elif diagnostic_source != "llm_reflection" and dominant == "over_score_low_hidden":
         mutation_type = "negative_constraint_mutation"
         suggested_slot = 0 if suggested_slot is None else suggested_slot
-    elif dominant == "under_score_high_hidden":
+    elif diagnostic_source != "llm_reflection" and dominant == "under_score_high_hidden":
         mutation_type = "high_tail_instruction_mutation"
         if suggested_slot is None:
             suggested_slot = max(0, len(getattr(individual, "static_exemplars", []) or []) - 1)
-    elif n_true_max > 0 and max_recall < 1.0:
+    elif diagnostic_source != "llm_reflection" and n_true_max > 0 and max_recall < 1.0:
         mutation_type = "max_score_contrastive_mutation"
         if suggested_slot is None:
             suggested_slot = max(0, len(getattr(individual, "static_exemplars", []) or []) - 1)
-    elif high_recall < high_floor:
+    elif diagnostic_source != "llm_reflection" and high_recall < high_floor:
         mutation_type = "high_tail_instruction_mutation"
         if suggested_slot is None:
             suggested_slot = max(0, len(getattr(individual, "static_exemplars", []) or []) - 1)
-    elif dist_tv > float(config.get("evolution", {}).get("raw_distribution_tv_threshold", 0.35)):
+    elif diagnostic_source != "llm_reflection" and dist_tv > float(config.get("evolution", {}).get("raw_distribution_tv_threshold", 0.35)):
         mutation_type = "score_distribution_mutation"
 
     summary = diagnostics.get("pace_diagnostic_summary") or diagnostics.get("summary") or {}
     evidence_summary = {
         "dominant_error_type": dominant,
+        "diagnostic_type": diagnostic_type.value,
+        "diagnostic_source": diagnostic_source,
         "summary": summary,
         "high_score_recall": high_recall,
         "max_score_recall": max_recall,
@@ -1192,6 +1227,8 @@ def choose_mutation_policy(
         "actual_mutation_type": mutation_type,
         "mutation_axis": mutation_axis_for_type(mutation_type),
         "fallback_reason": "",
+        "diagnostic_type": diagnostic_type.value,
+        "diagnostic_source": diagnostic_source,
         "target_anchor_slot": suggested_slot,
         "rubric_edit_focus": focus,
         "evidence_summary_for_prompt": evidence_summary,
@@ -1310,6 +1347,7 @@ class PromptIndividual:
     
     last_pred_scores: List[int] = field(default_factory=list)
     last_eval_items: List[Dict[str, Any]] = field(default_factory=list)
+    contrastive_anchors: List[Dict[str, Any]] = field(default_factory=list)
 
     # Templates
     QUERY_GEN_RUBRIC_TEMPLATE = """Based on the SCORING RUBRIC below, extract 3-5 keywords from the STUDENT ESSAY.\nSCORING RUBRIC:\n{rubric}\nSTUDENT ESSAY:\n{essay}\nOUTPUT JSON LIST:"""
@@ -1348,6 +1386,9 @@ Step 3: Assign a final integer score between {score_min} and {score_max}.
 
 ## REFERENCE EXAMPLES (Anchors):
 {static_ex}
+
+## CONTRASTIVE BOUNDARY ANCHORS:
+{contrastive_ex}
 
 ## RETRIEVED SIMILAR EXAMPLES (Local Context):
 {dynamic_ex}
@@ -1414,8 +1455,20 @@ Output ONLY the Rubric text. Do not output explanations."""
             {"essay_id": str(ex["essay_id"]), "score": int(ex["domain1_score"])}
             for ex in self.static_exemplars
         ]
+        contrastive_payload = [
+            {
+                "boundary": str(pair.get("boundary")),
+                "lower": str((pair.get("lower_anchor") or {}).get("essay_id")),
+                "upper": str((pair.get("upper_anchor") or {}).get("essay_id")),
+            }
+            for pair in self.contrastive_anchors
+        ]
         content = json.dumps(
-            {"instruction": self.scoring_instruction_text(), "anchors": ex_payload},
+            {
+                "instruction": self.scoring_instruction_text(),
+                "anchors": ex_payload,
+                "contrastive_anchors": contrastive_payload,
+            },
             ensure_ascii=False,
             sort_keys=True,
         )
@@ -1498,6 +1551,12 @@ Output ONLY the Rubric text. Do not output explanations."""
                     + "|"
                     + "|".join(str(ex.get("essay_id")) for ex in self.static_exemplars)
                     + "|"
+                    + "|".join(
+                        f"{(p.get('lower_anchor') or {}).get('essay_id')}-"
+                        f"{(p.get('upper_anchor') or {}).get('essay_id')}"
+                        for p in self.contrastive_anchors
+                    )
+                    + "|"
                     + str(essay_id)
                     + "|"
                     + str(essay_text)
@@ -1525,6 +1584,7 @@ Output ONLY the Rubric text. Do not output explanations."""
                 essay_text=essay_text,
                 instruction=self.scoring_instruction_text(),
                 static_exemplars=self.static_exemplars,
+                contrastive_anchors=self.contrastive_anchors,
                 score_min=self.config['data']['score_min'],
                 score_max=self.config['data']['score_max'],
                 dynamic_ex="(None)",
@@ -1564,6 +1624,7 @@ Output ONLY the Rubric text. Do not output explanations."""
         base_prompt = self.SCORING_TEMPLATE.format(
             instruction=self.scoring_instruction_text(),
             static_ex=self._format_list(self.static_exemplars),
+            contrastive_ex=self._format_contrastive_pairs(self.contrastive_anchors),
             dynamic_ex=self._format_list(dynamic_exemplars) if dynamic_exemplars else "(None)",
             essay=essay_text,
             score_min=self.config['data']['score_min'],
@@ -1643,6 +1704,27 @@ Output ONLY the Rubric text. Do not output explanations."""
             )
         return "\n\n".join(blocks)
 
+    def _format_contrastive_pairs(self, pairs):
+        if not pairs:
+            return "(None)"
+        blocks = []
+        for idx, pair in enumerate(pairs):
+            lower = pair.get("lower_anchor", {}) or {}
+            upper = pair.get("upper_anchor", {}) or {}
+            boundary = pair.get("boundary") or f"{lower.get('score')}_vs_{upper.get('score')}"
+            rationale = pair.get("rationale_diff") or (
+                "Use this pair to decide which side of the boundary the target essay belongs on."
+            )
+            blocks.append(
+                f"### Boundary Pair {idx + 1}: {boundary}\n"
+                f"Lower-side anchor (Known Score: {lower.get('score')}):\n"
+                f"{str(lower.get('essay_text', ''))[:350]}...\n\n"
+                f"Upper-side anchor (Known Score: {upper.get('score')}):\n"
+                f"{str(upper.get('essay_text', ''))[:350]}...\n\n"
+                f"Boundary rationale: {rationale}"
+            )
+        return "\n\n".join(blocks)
+
     def evaluate(self, val_set: List[Dict], vector_store: SimpleVectorStore, enable_rerank: bool = False, fitness_cache=None) -> float:
         # [Optimization] 1. 检查缓存
         sig = self.get_signature()
@@ -1707,11 +1789,12 @@ Output ONLY the Rubric text. Do not output explanations."""
 
     def clone(self):
         cloned = PromptIndividual(
-            self.instruction_text,
-            self.static_exemplars.copy(),
-            self.fitness,
-            self.config,
-            dict(self.evidence_feedback),
+            instruction_text=self.instruction_text,
+            static_exemplars=self.static_exemplars.copy(),
+            fitness=self.fitness,
+            config=self.config,
+            evidence_feedback=dict(self.evidence_feedback),
+            contrastive_anchors=json.loads(json.dumps(self.contrastive_anchors, ensure_ascii=False)),
         )
         cloned.last_pred_scores = list(self.last_pred_scores)
         cloned.last_eval_items = list(self.last_eval_items)
@@ -1925,13 +2008,39 @@ OUTPUT ONLY THE NEW RUBRIC TEXT."""
         return _normalize_score_rubric(new_text, self.config)
     
     def to_dict(self):
+        anchor_bank = AnchorBank(
+            absolute_anchors=[EssayAnchor.from_example(ex) for ex in self.static_exemplars],
+            contrastive_pairs=[contrastive_pair_from_dict(pair) for pair in self.contrastive_anchors],
+        )
+        protocol_candidate = ProtocolCandidate(
+            id=self.get_signature(),
+            parent_id=getattr(self, "parent_trace", {}).get("parent_signature") if hasattr(self, "parent_trace") else None,
+            instruction=self.instruction_text,
+            anchor_bank=anchor_bank,
+            generation_method=getattr(self, "parent_trace", {}).get("generation_method", "evolution") if hasattr(self, "parent_trace") else "initial",
+            diagnostic_source=getattr(self, "parent_trace", {}).get("diagnostic_source", "") if hasattr(self, "parent_trace") else "",
+            diagnostic_type=getattr(self, "parent_trace", {}).get("diagnostic_type", "NO_CLEAR_SIGNAL") if hasattr(self, "parent_trace") else "NO_CLEAR_SIGNAL",
+            mutation_operator=getattr(self, "parent_trace", {}).get("mutation_type", "general_reflection_mutation") if hasattr(self, "parent_trace") else "initial",
+            evidence_summary=getattr(self, "parent_trace", {}).get("evidence_summary", {}) if hasattr(self, "parent_trace") else {},
+        )
+        contrastive_pair_ids = [
+            [
+                (pair.get("lower_anchor") or {}).get("essay_id"),
+                (pair.get("upper_anchor") or {}).get("essay_id"),
+            ]
+            for pair in self.contrastive_anchors
+        ]
         return {
             "fitness": self.fitness,
             "instruction_preview": self.instruction_text[:200] + "...",
             "full_instruction": self.instruction_text,
             "effective_scoring_instruction": self.scoring_instruction_text(),
             "static_exemplar_ids": [ex['essay_id'] for ex in self.static_exemplars],
-            "static_exemplar_scores": [ex['domain1_score'] for ex in self.static_exemplars]
+            "static_exemplar_scores": [ex['domain1_score'] for ex in self.static_exemplars],
+            "contrastive_anchor_pairs": self.contrastive_anchors,
+            "contrastive_anchor_boundaries": [pair.get("boundary") for pair in self.contrastive_anchors],
+            "contrastive_anchor_pair_ids": contrastive_pair_ids,
+            "protocol_candidate": protocol_candidate.to_dict(),
         }
 
 # ============================================================================
@@ -2277,6 +2386,126 @@ class EvolutionOptimizer:
         if top_score is None:
             return []
         return [x for x in pool if int(x['domain1_score']) == top_score]
+
+    def _protocol_anchor_fingerprint(self, individual: PromptIndividual) -> Tuple[Tuple[Any, ...], Tuple[Any, ...]]:
+        abs_ids = tuple(ex.get("essay_id") for ex in individual.static_exemplars)
+        ctr_ids = tuple(
+            (
+                (pair.get("lower_anchor") or {}).get("essay_id"),
+                (pair.get("upper_anchor") or {}).get("essay_id"),
+            )
+            for pair in getattr(individual, "contrastive_anchors", []) or []
+        )
+        return abs_ids, ctr_ids
+
+    def _boundary_pair_specs(self) -> List[Tuple[int, int]]:
+        specs: List[Tuple[int, int]] = []
+        for spec in getattr(self, "anchor_slot_specs", []) or []:
+            match = re.match(r"boundary_(\d+)_(\d+)", str(spec.get("name", "")))
+            if match:
+                lo, hi = int(match.group(1)), int(match.group(2))
+                if lo < hi:
+                    specs.append((lo, hi))
+        if specs:
+            return specs
+        scores = sorted({int(x["domain1_score"]) for x in self.train_data})
+        if len(scores) < 2:
+            return []
+        s_min = int(self.config["data"]["score_min"])
+        s_max = int(self.config["data"]["score_max"])
+        mid = (s_min + s_max) / 2.0
+        pairs = [(a, b) for a, b in zip(scores[:-1], scores[1:]) if a < b]
+        return sorted(
+            pairs,
+            key=lambda p: (
+                -abs(((p[0] + p[1]) / 2.0) - mid),
+                p[1],
+            ),
+            reverse=True,
+        )[:2]
+
+    def _pick_anchor_for_score(
+        self,
+        target_score: int,
+        *,
+        exclude_ids: Optional[set] = None,
+    ) -> Optional[Dict[str, Any]]:
+        exclude_ids = set(exclude_ids or set())
+        exact = [
+            x for x in self.train_data
+            if int(x["domain1_score"]) == int(target_score) and x.get("essay_id") not in exclude_ids
+        ]
+        candidates = exact or [
+            x for x in self.train_data
+            if x.get("essay_id") not in exclude_ids
+        ]
+        if not candidates:
+            return None
+        candidates = sorted(
+            candidates,
+            key=lambda x: (
+                abs(int(x["domain1_score"]) - int(target_score)),
+                len(str(x.get("essay_text", ""))),
+                int(x.get("essay_id", 0)),
+            ),
+        )
+        min_dist = abs(int(candidates[0]["domain1_score"]) - int(target_score))
+        near = [x for x in candidates if abs(int(x["domain1_score"]) - int(target_score)) == min_dist]
+        return random.choice(near)
+
+    def _build_contrastive_anchor_pairs(
+        self,
+        *,
+        exclude_ids: Optional[set] = None,
+        n_pairs: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        evo_cfg = self.config.get("evolution", {})
+        if not bool(evo_cfg.get("contrastive_anchors_enabled", False)):
+            return []
+        n_pairs = int(n_pairs if n_pairs is not None else evo_cfg.get("n_contrastive_anchor_pairs", 2))
+        if n_pairs <= 0:
+            return []
+        used_ids = set(exclude_ids or set())
+        out: List[Dict[str, Any]] = []
+        for lower_score, upper_score in self._boundary_pair_specs():
+            if len(out) >= n_pairs:
+                break
+            lower = self._pick_anchor_for_score(lower_score, exclude_ids=used_ids)
+            if lower is None:
+                continue
+            used_ids.add(lower.get("essay_id"))
+            upper = self._pick_anchor_for_score(upper_score, exclude_ids=used_ids)
+            if upper is None:
+                used_ids.discard(lower.get("essay_id"))
+                continue
+            used_ids.add(upper.get("essay_id"))
+            lower_score_actual = int(lower["domain1_score"])
+            upper_score_actual = int(upper["domain1_score"])
+            if lower_score_actual > upper_score_actual:
+                lower, upper = upper, lower
+                lower_score_actual, upper_score_actual = upper_score_actual, lower_score_actual
+            boundary = f"{lower_score_actual}_vs_{upper_score_actual}"
+            out.append({
+                "boundary": boundary,
+                "lower_anchor": {
+                    "essay_id": lower.get("essay_id"),
+                    "score": lower_score_actual,
+                    "essay_text": lower.get("essay_text", ""),
+                    "role": "contrastive_lower",
+                },
+                "upper_anchor": {
+                    "essay_id": upper.get("essay_id"),
+                    "score": upper_score_actual,
+                    "essay_text": upper.get("essay_text", ""),
+                    "role": "contrastive_upper",
+                },
+                "rationale_diff": (
+                    f"The upper anchor should justify score {upper_score_actual} rather than "
+                    f"{lower_score_actual}; use the pair to decide which side of this boundary "
+                    "the target essay belongs on."
+                ),
+            })
+        return out
 
     def _choose_from_pool_with_high_preference(
         self,
@@ -2997,6 +3226,11 @@ class EvolutionOptimizer:
         parent_mae = parent_trace.get("parent_raw_mae")
         child_tv = child_snapshot.get("raw_distribution_tv")
         parent_tv = parent_trace.get("parent_score_distribution_tv")
+        child_protocol_snapshot = child.to_dict()
+        protocol_diff = protocol_diff_summary(
+            parent_trace.get("parent_protocol_snapshot"),
+            child_protocol_snapshot,
+        )
         return {
             "generation": generation,
             "child_index": child_index,
@@ -3063,9 +3297,22 @@ class EvolutionOptimizer:
             "changed_anchor_ids_before": parent_trace.get("changed_anchor_ids_before"),
             "changed_anchor_ids_after": parent_trace.get("changed_anchor_ids_after"),
             "dominant_error_type_used": parent_trace.get("dominant_error_type_used"),
+            "diagnostic_type": parent_trace.get("diagnostic_type"),
+            "diagnostic_source": parent_trace.get("diagnostic_source"),
+            "evidence_summary": parent_trace.get("evidence_summary"),
             "recommended_mutation_used": parent_trace.get("recommended_mutation_used"),
             "target_anchor_slot": parent_trace.get("target_anchor_slot"),
             "rubric_edit_focus": parent_trace.get("rubric_edit_focus"),
+            "protocol_diff": protocol_diff,
+            "parent_contrastive_boundaries": parent_trace.get("parent_contrastive_boundaries"),
+            "child_contrastive_boundaries": child_snapshot.get(
+                "contrastive_anchor_boundaries",
+                parent_trace.get("child_contrastive_boundaries"),
+            ),
+            "contrastive_anchors_changed": parent_trace.get(
+                "contrastive_anchors_changed",
+                protocol_diff.get("contrastive_anchors_changed"),
+            ),
             "mutation_acceptance_status": child_snapshot.get("mutation_acceptance_status"),
             "mutation_acceptance_reasons": child_snapshot.get("mutation_acceptance_reasons"),
             "mutation_acceptance_comparable": child_snapshot.get("mutation_acceptance_comparable"),
@@ -3457,7 +3704,7 @@ class EvolutionOptimizer:
 
         for idx in ranked:
             ind = self.population[idx]
-            anchor_fp = tuple(ex['essay_id'] for ex in ind.static_exemplars)
+            anchor_fp = self._protocol_anchor_fingerprint(ind)
             instruction_fp = hashlib.md5(ind.instruction_text.encode("utf-8")).hexdigest()
             if not selected:
                 selected.append(idx)
@@ -3683,7 +3930,16 @@ class EvolutionOptimizer:
         print(f"[Init] Pop size: {self.config['evolution']['population_size']}, Stratified Sampling Enabled.")
         for _ in range(self.config['evolution']['population_size']):
             static_ex = self.get_stratified_exemplars(n_static)
-            self.population.append(PromptIndividual(base_instruction, static_ex, config=self.config))
+            static_ids = {ex.get("essay_id") for ex in static_ex}
+            contrastive_pairs = self._build_contrastive_anchor_pairs(exclude_ids=static_ids)
+            self.population.append(
+                PromptIndividual(
+                    base_instruction,
+                    static_ex,
+                    config=self.config,
+                    contrastive_anchors=contrastive_pairs,
+                )
+            )
 
     def evolve_one_generation(self, gen):
         gen_start_time = time.time()
@@ -4149,6 +4405,17 @@ class EvolutionOptimizer:
                 "parent_signature": ind.get_signature(),
                 "parent_anchor_ids": [ex.get("essay_id") for ex in ind.static_exemplars],
                 "parent_anchor_scores": [ex.get("domain1_score") for ex in ind.static_exemplars],
+                "parent_contrastive_boundaries": [
+                    pair.get("boundary") for pair in getattr(ind, "contrastive_anchors", []) or []
+                ],
+                "parent_contrastive_pair_ids": [
+                    [
+                        (pair.get("lower_anchor") or {}).get("essay_id"),
+                        (pair.get("upper_anchor") or {}).get("essay_id"),
+                    ]
+                    for pair in getattr(ind, "contrastive_anchors", []) or []
+                ],
+                "parent_protocol_snapshot": ind.to_dict(),
                 "parent_raw_qwk": float(scores[idx]),
                 "parent_raw_adjusted_qwk": float(raw_adjusted_scores[idx]),
                 "parent_raw_mae": raw_metrics.get("mae"),
@@ -4217,6 +4484,9 @@ class EvolutionOptimizer:
                 "target_anchor_slot": mutation_policy.get("target_anchor_slot"),
                 "rubric_edit_focus": mutation_policy.get("rubric_edit_focus"),
                 "dominant_error_type_used": pace_diag.get("dominant_error_type"),
+                "diagnostic_type": mutation_policy.get("diagnostic_type"),
+                "diagnostic_source": mutation_policy.get("diagnostic_source"),
+                "evidence_summary": mutation_policy.get("evidence_summary_for_prompt", {}),
                 "recommended_mutation_used": True,
             })
             elite.evidence_feedback = self._evidence_feedback_for(elite)
@@ -4236,7 +4506,7 @@ class EvolutionOptimizer:
             mutated_parents.append(elite)
             
         # 补齐种群：从 mutated_parents 中克隆并变异 exemplars
-        existing_fingerprints = {tuple(ex['essay_id'] for ex in ind.static_exemplars) for ind in new_pop}
+        existing_fingerprints = {self._protocol_anchor_fingerprint(ind) for ind in new_pop}
         
         # [NEW] Check config for exemplar evolution
         evolve_exemplars = self.config['evolution'].get('evolve_static_exemplars', True)
@@ -4278,6 +4548,12 @@ class EvolutionOptimizer:
                     "fallback_reason": planned_policy.get("fallback_reason", ""),
                     "target_anchor_slot": planned_policy.get("target_anchor_slot", parent_trace.get("target_anchor_slot")),
                     "rubric_edit_focus": planned_policy.get("rubric_edit_focus", parent_trace.get("rubric_edit_focus")),
+                    "diagnostic_type": planned_policy.get("diagnostic_type", parent_trace.get("diagnostic_type")),
+                    "diagnostic_source": planned_policy.get("diagnostic_source", parent_trace.get("diagnostic_source")),
+                    "evidence_summary": planned_policy.get(
+                        "evidence_summary_for_prompt",
+                        parent_trace.get("evidence_summary", {}),
+                    ),
                     "recommended_mutation_used": True,
                 })
                 child.evidence_feedback["mutation_policy"] = planned_policy
@@ -4306,6 +4582,15 @@ class EvolutionOptimizer:
                 "changed_anchor_slots": [],
                 "changed_anchor_ids_before": [],
                 "changed_anchor_ids_after": [],
+                "contrastive_anchors_changed": False,
+                "parent_contrastive_boundaries": [
+                    pair.get("boundary") for pair in getattr(parent, "contrastive_anchors", []) or []
+                ],
+                "child_contrastive_boundaries": [
+                    pair.get("boundary") for pair in getattr(child, "contrastive_anchors", []) or []
+                ],
+                "changed_contrastive_pair_ids_before": [],
+                "changed_contrastive_pair_ids_after": [],
             })
             
             if should_mutate_anchor:
@@ -4403,10 +4688,49 @@ class EvolutionOptimizer:
                         f"strategy={replacement_meta.get('anchor_mutation_strategy')}"
                     )
                     
-                    fp = tuple(ex['essay_id'] for ex in child.static_exemplars)
+                    fp = self._protocol_anchor_fingerprint(child)
                     if fp not in existing_fingerprints:
                         existing_fingerprints.add(fp)
                         break 
+
+            contrastive_mutation_types = {
+                "boundary_clarification_mutation",
+                "max_score_contrastive_mutation",
+                "score_distribution_mutation",
+                "anchor_slot_mutation",
+            }
+            if (
+                should_mutate_anchor
+                and bool(self.config.get("evolution", {}).get("contrastive_anchors_enabled", False))
+                and bool(self.config.get("evolution", {}).get("evolve_contrastive_anchors", True))
+                and str(parent_trace.get("mutation_type")) in contrastive_mutation_types
+            ):
+                old_pairs = json.loads(json.dumps(getattr(child, "contrastive_anchors", []) or [], ensure_ascii=False))
+                exclude_ids = {ex.get("essay_id") for ex in child.static_exemplars}
+                new_pairs = self._build_contrastive_anchor_pairs(exclude_ids=exclude_ids)
+                if new_pairs and new_pairs != old_pairs:
+                    child.contrastive_anchors = new_pairs
+                    parent_trace["contrastive_anchors_changed"] = True
+                    parent_trace["parent_contrastive_boundaries"] = [
+                        pair.get("boundary") for pair in old_pairs
+                    ]
+                    parent_trace["child_contrastive_boundaries"] = [
+                        pair.get("boundary") for pair in new_pairs
+                    ]
+                    parent_trace["changed_contrastive_pair_ids_before"] = [
+                        [
+                            (pair.get("lower_anchor") or {}).get("essay_id"),
+                            (pair.get("upper_anchor") or {}).get("essay_id"),
+                        ]
+                        for pair in old_pairs
+                    ]
+                    parent_trace["changed_contrastive_pair_ids_after"] = [
+                        [
+                            (pair.get("lower_anchor") or {}).get("essay_id"),
+                            (pair.get("upper_anchor") or {}).get("essay_id"),
+                        ]
+                        for pair in new_pairs
+                    ]
             
             child.parent_trace = parent_trace
             new_pop.append(child)
@@ -4491,7 +4815,14 @@ class EvolutionOptimizer:
                     print(f"  [Warning] Exemplar ID {eid} not found in Train Set! Using random replacement.")
                     exemplars.append(random.choice(self.train_data))
             
-            ind = PromptIndividual(rubric, exemplars, fitness, self.config)
+            contrastive_pairs = list(p.get("contrastive_anchor_pairs", []) or [])
+            ind = PromptIndividual(
+                rubric,
+                exemplars,
+                fitness,
+                self.config,
+                contrastive_anchors=contrastive_pairs,
+            )
             # 恢复 last_pred_scores (如果在 json 里没存，那第一代 reflection 可能会受影响，但这是可接受的损失)
             # 目前 gen.json 确实没存 last_pred_scores，所以第一代变异可能效果打折，但之后会恢复正常。
             self.population.append(ind)
@@ -4858,6 +5189,8 @@ def main(config_path="configs/default.yaml", fold=0, resume_path=None):
             "instruction": candidate.instruction_text,
             "static_exemplar_ids": [ex['essay_id'] for ex in candidate.static_exemplars],
             "static_exemplar_scores": [ex['domain1_score'] for ex in candidate.static_exemplars],
+            "contrastive_anchor_pairs": getattr(candidate, "contrastive_anchors", []),
+            "protocol_candidate": candidate.to_dict().get("protocol_candidate"),
         }
         seen_signatures[signature] = label
 

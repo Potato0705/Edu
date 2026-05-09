@@ -370,6 +370,7 @@ class PaceFitnessEvaluator:
         items: List[Dict],
         instruction: str,
         static_exemplars: List[Dict],
+        contrastive_anchors: Optional[List[Dict]] = None,
     ) -> List[ScoringResult]:
         """用本地模型逐篇评分，返回 y_raw + scoring-context hidden state。"""
         results = []
@@ -382,6 +383,7 @@ class PaceFitnessEvaluator:
                 score_min=self.score_min,
                 score_max=self.score_max,
                 dynamic_ex="(None)",  # PACE 模式下关闭 RAG，保持 prompt 确定性
+                contrastive_anchors=contrastive_anchors,
             )
             result = self.backend.score(req)
             result.hidden = self.backend.encode_scoring_context(
@@ -554,6 +556,7 @@ class PaceFitnessEvaluator:
             else protocol.instruction_text
         )  # type: ignore[attr-defined]
         static_exemplars = protocol.static_exemplars  # type: ignore[attr-defined]
+        contrastive_anchors = getattr(protocol, "contrastive_anchors", [])
         usage_before = self.backend.usage_snapshot()
 
         # 1. Anchor hidden states
@@ -582,7 +585,7 @@ class PaceFitnessEvaluator:
             if n_diag > 0 and n_diag < len(diag_items):
                 diag_items = self._select_mini_items(diag_items, n_diag)
             t0 = time.time()
-            diag_results = self.score_essays(diag_items, instruction, static_exemplars)
+            diag_results = self.score_essays(diag_items, instruction, static_exemplars, contrastive_anchors)
             diag_sec = time.time() - t0
             return self._compute_diagnostic_only_probe(
                 items=diag_items,
@@ -609,7 +612,7 @@ class PaceFitnessEvaluator:
             t0 = time.time()
             n_mini = min(self.config.early_reject_mini_set_size, len(fitness_items))
             mini_items = self._select_mini_items(fitness_items, n_mini)
-            early_results = self.score_essays(mini_items, instruction, static_exemplars)
+            early_results = self.score_essays(mini_items, instruction, static_exemplars, contrastive_anchors)
             early_result_by_id = {
                 item["essay_id"]: result for item, result in zip(mini_items, early_results)
             }
@@ -646,7 +649,7 @@ class PaceFitnessEvaluator:
 
         # 2. Score calib essays
         t0 = time.time()
-        calib_results = self.score_essays(calib_items, instruction, static_exemplars)
+        calib_results = self.score_essays(calib_items, instruction, static_exemplars, contrastive_anchors)
         calib_sec = time.time() - t0
 
         # 3. Build evidence vectors for calib set
@@ -702,7 +705,7 @@ class PaceFitnessEvaluator:
             remaining_items = [
                 item for item in fitness_items if item["essay_id"] not in early_result_by_id
             ]
-            remaining_results = self.score_essays(remaining_items, instruction, static_exemplars)
+            remaining_results = self.score_essays(remaining_items, instruction, static_exemplars, contrastive_anchors)
             result_by_id = dict(early_result_by_id)
             result_by_id.update(
                 {item["essay_id"]: result for item, result in zip(remaining_items, remaining_results)}
@@ -710,7 +713,7 @@ class PaceFitnessEvaluator:
             fitness_results = [result_by_id[item["essay_id"]] for item in fitness_items]
             fitness_sec = early_sec + (time.time() - t0)
         else:
-            fitness_results = self.score_essays(fitness_items, instruction, static_exemplars)
+            fitness_results = self.score_essays(fitness_items, instruction, static_exemplars, contrastive_anchors)
             fitness_sec = time.time() - t0
 
         # 6. Build evidence vectors for fitness set
@@ -878,6 +881,7 @@ class PaceFitnessEvaluator:
             else protocol.instruction_text
         )  # type: ignore[attr-defined]
         static_exemplars = protocol.static_exemplars  # type: ignore[attr-defined]
+        contrastive_anchors = getattr(protocol, "contrastive_anchors", [])
         usage_before = self.backend.usage_snapshot()
         total_start = time.time()
 
@@ -901,7 +905,7 @@ class PaceFitnessEvaluator:
             return self._fallback_result(extra=self._usage_payload(usage_before))
 
         t0 = time.time()
-        calib_results = self.score_essays(calib_items, instruction, static_exemplars)
+        calib_results = self.score_essays(calib_items, instruction, static_exemplars, contrastive_anchors)
         calib_sec = time.time() - t0
 
         z_calib_list = []
@@ -946,7 +950,7 @@ class PaceFitnessEvaluator:
         train_sec = time.time() - t0
 
         t0 = time.time()
-        eval_results = self.score_essays(eval_items, instruction, static_exemplars)
+        eval_results = self.score_essays(eval_items, instruction, static_exemplars, contrastive_anchors)
         eval_sec = time.time() - t0
 
         z_eval_list = []
