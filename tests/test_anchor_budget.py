@@ -174,3 +174,21 @@ def test_anchor_budget_config_loads_and_dry_run_lists_phase1_plan():
     assert ["no_anchor", None] in payload["plan"]
     assert ["representation_guided_k_anchor", 3] in payload["plan"]
     assert ["full_static_anchor", None] in payload["plan"]
+
+
+def test_phase2_dry_run_uses_only_k9_and_expected_prompts():
+    proc = subprocess.run(
+        [sys.executable, "scripts/run_anchor_budget_phase2.py", "--dry-run"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    payload = json.loads(proc.stdout)
+    prompts = {item["prompt"] for item in payload["plan"]}
+    assert prompts == {1, 2, 7, 8}
+    for item in payload["plan"]:
+        cmd = item["command"]
+        assert "--ks" in cmd
+        assert cmd[cmd.index("--ks") + 1] == "9"
+        assert "full_static_anchor" in cmd
+        assert "stratified_k_anchor" not in cmd

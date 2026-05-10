@@ -14,8 +14,8 @@ induction:
     sentence control, and effective language.
 anchor_budget:
   phase: 2
-  best_k: null
-  k_values: []
+  best_k: 9
+  k_values: [9]
   methods:
     - no_anchor
     - static_k_anchor
