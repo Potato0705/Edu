@@ -1,0 +1,74 @@
+# Phase 1 for the new mainline:
+# Representation-Guided Budgeted Anchor Protocol Repair.
+# This is not a WISE-PACE evolution run. It evaluates fixed anchor protocols
+# under the same local LLM, split, rubric, parser, and raw final scoring.
+
+model:
+  name: models/Meta-Llama-3.1-8B-Instruct
+
+data:
+  asap_path: data/raw/training_set_rel3.tsv
+  essay_set: 1
+  score_min: 2
+  score_max: 12
+
+induction:
+  enabled: false
+  official_criteria: >
+    Evaluate the essay holistically based on content, organization, and language
+    use. Reward clear position, relevant development, coherent organization,
+    sentence control, and effective language. Penalize thin development,
+    weak organization, severe language problems, and off-topic responses.
+
+anchor_budget:
+  methods:
+    - no_anchor
+    - static_k_anchor
+    - stratified_k_anchor
+    - retrieval_k_anchor
+    - representation_guided_k_anchor
+    - full_static_anchor
+  k_values: [3, 6, 9]
+  full_static_per_score: 3
+  representation:
+    # Mainline setting: Llama scoring-context representations. Unit tests can
+    # still exercise the tfidf fallback without loading a model.
+    mode: local_hidden
+    max_candidates_per_score: 8
+    max_val_representations: 32
+    token_cost_penalty: 0.02
+
+llm:
+  local_backend_enabled: true
+  temperature_scoring: 0.0
+  max_new_tokens_scoring: 192
+  max_new_tokens_reflection: 512
+  max_new_tokens_induction: 512
+  protocol_cache_enabled: true
+
+output:
+  root: logs/anchor_budget
+  verbose: false
+
+debug:
+  enabled: true
+  stratified: true
+  seed: 42
+  n_train: 240
+  n_val: 96
+  n_test: 64
+
+pace:
+  enabled: false
+  model_path: models/Meta-Llama-3.1-8B-Instruct
+  load_in_4bit: false
+  dtype: bfloat16
+  final_pace_calibrated: false
+
+evolution:
+  max_score_contract_enabled: true
+  max_score_contract_text: |
+    The maximum score is attainable. Do not reserve the maximum score only for flawless essays. If the essay is comparable to or stronger than the high-score anchor in content, organization, and language use, assign a score near the top of the range, including the maximum score when appropriate.
+
+rag:
+  enabled: false
