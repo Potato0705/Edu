@@ -108,6 +108,11 @@ PARENT_CHILD_AUDIT_FIELDS = [
     "mutation_acceptance_mode",
     "mutation_acceptance_tradeoff_improvements",
     "mutation_acceptance_tradeoff_metrics",
+    "hidden_repair_score",
+    "raw_mutation_type",
+    "hidden_priority_changed_decision",
+    "selected_by_raw_or_hidden",
+    "final_rerank_score",
 ]
 
 MUTATION_EFFECT_SUMMARY_FIELDS = [
@@ -292,6 +297,17 @@ class ExperimentManager:
                 "diagnostic_type": candidate.get("diagnostic_type") or protocol_candidate.get("diagnostic_type") or parent_trace.get("diagnostic_type"),
                 "mutation_operator": candidate.get("mutation_type") or protocol_candidate.get("mutation_operator") or parent_trace.get("mutation_type"),
                 "mutation_prompt": candidate.get("mutation_prompt") or parent_trace.get("mutation_feedback"),
+                "hidden_repair_score": candidate.get("hidden_repair_score") or parent_trace.get("hidden_repair_score"),
+                "raw_selection_score": candidate.get("selection_fitness"),
+                "final_rerank_score": candidate.get("final_rerank_score") or parent_trace.get("final_rerank_score"),
+                "whether_hidden_changed_decision": bool(
+                    candidate.get("hidden_priority_changed_decision")
+                    or parent_trace.get("hidden_priority_changed_decision")
+                ),
+                "selected_by_raw_or_hidden": (
+                    candidate.get("selected_by_raw_or_hidden")
+                    or parent_trace.get("selected_by_raw_or_hidden")
+                ),
                 "evidence_summary": candidate.get("evidence_summary") or protocol_candidate.get("evidence_summary") or parent_trace.get("evidence_summary"),
                 "protocol_diff": candidate.get("protocol_diff") or protocol_candidate.get("protocol_diff") or parent_trace.get("protocol_diff"),
                 "absolute_anchor_ids": candidate.get("static_exemplar_ids"),
@@ -1235,6 +1251,7 @@ def choose_mutation_policy(
     score_max = int(config["data"]["score_max"])
     score_span = max(1, score_max - score_min)
     suggested_slot = diagnostics.get("suggested_anchor_mutation_slot")
+    summary = diagnostics.get("pace_diagnostic_summary") or diagnostics.get("summary") or {}
 
     if diagnostic_source == "llm_reflection":
         diagnostic_type = DiagnosticType.NO_CLEAR_SIGNAL
@@ -1249,6 +1266,7 @@ def choose_mutation_policy(
         diagnostic_type = canonical_diagnostic_type(None, raw_metrics)
         mutation_type = mutation_operator_for_diagnostic(diagnostic_type).value
 
+    raw_mutation_type = mutation_type
     if diagnostic_source != "llm_reflection" and dominant == "anchor_confusion":
         mutation_type = "anchor_slot_mutation"
     elif diagnostic_source != "llm_reflection" and (dominant == "raw_collapse" or collapse >= 0.70 or pred_span <= max(1, score_span // 4)):
@@ -1275,7 +1293,48 @@ def choose_mutation_policy(
     elif diagnostic_source != "llm_reflection" and dist_tv > float(config.get("evolution", {}).get("raw_distribution_tv_threshold", 0.35)):
         mutation_type = "score_distribution_mutation"
 
-    summary = diagnostics.get("pace_diagnostic_summary") or diagnostics.get("summary") or {}
+    def summary_count(*names: str) -> float:
+        total = 0.0
+        if isinstance(summary, dict):
+            for name in names:
+                try:
+                    total += float(summary.get(name, 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    pass
+        return total
+
+    high_trigger_floor = float(config.get("pace", {}).get("trigger_high_recall_floor", high_floor))
+    high_bias = float(raw_metrics.get("high_pred_bias", raw_metrics.get("high_score_bias", 0.0)) or 0.0)
+    under_high = summary_count("under_score_high_hidden", "high_tail_under_score")
+    boundary = summary_count("boundary_ambiguity")
+    anchor_confusion = summary_count("anchor_confusion")
+    hidden_repair_score = (
+        max(0.0, high_trigger_floor - high_recall)
+        + max(0.0, -high_bias) / max(1.0, float(score_span))
+        + under_high / max(1.0, under_high + boundary + anchor_confusion)
+        - 0.15 * collapse
+        - 0.10 * max(0.0, dist_tv - float(config.get("evolution", {}).get("raw_distribution_tv_threshold", 0.35)))
+    )
+    hidden_priority_changed = False
+    if (
+        diagnostic_source == "hidden_evidence"
+        and bool(config.get("evolution", {}).get("hidden_mutation_priority_enabled", False))
+    ):
+        threshold = float(config.get("evolution", {}).get("hidden_mutation_priority_threshold", 0.15))
+        eligible_current = {
+            "boundary_clarification_mutation",
+            "score_distribution_mutation",
+            "general_reflection_mutation",
+        }
+        if hidden_repair_score >= threshold and mutation_type in eligible_current:
+            if n_true_max > 0 and max_recall < 1.0:
+                mutation_type = "max_score_contrastive_mutation"
+            else:
+                mutation_type = "high_tail_instruction_mutation"
+            hidden_priority_changed = mutation_type != raw_mutation_type
+            if hidden_priority_changed and suggested_slot is None:
+                suggested_slot = max(0, len(getattr(individual, "static_exemplars", []) or []) - 1)
+
     evidence_summary = {
         "dominant_error_type": dominant,
         "diagnostic_type": diagnostic_type.value,
@@ -1287,6 +1346,9 @@ def choose_mutation_policy(
         "score_distribution_tv": dist_tv,
         "pred_collapse_ratio": collapse,
         "suggested_anchor_mutation_slot": suggested_slot,
+        "hidden_repair_score": hidden_repair_score,
+        "raw_mutation_type": raw_mutation_type,
+        "hidden_priority_changed_decision": hidden_priority_changed,
     }
     focus = build_mutation_task_instructions(mutation_type, config, evidence_summary)
     return {
@@ -1295,6 +1357,11 @@ def choose_mutation_policy(
         "actual_mutation_type": mutation_type,
         "mutation_axis": mutation_axis_for_type(mutation_type),
         "fallback_reason": "",
+        "raw_mutation_type": raw_mutation_type,
+        "hidden_repair_score": hidden_repair_score,
+        "hidden_priority_changed_decision": hidden_priority_changed,
+        "selected_by_raw_or_hidden": "hidden_priority" if hidden_priority_changed else "raw_or_default",
+        "final_rerank_score": hidden_repair_score,
         "diagnostic_type": diagnostic_type.value,
         "diagnostic_source": diagnostic_source,
         "target_anchor_slot": suggested_slot,
@@ -3359,6 +3426,11 @@ class EvolutionOptimizer:
             "actual_mutation_type": parent_trace.get("actual_mutation_type"),
             "fallback_reason": parent_trace.get("fallback_reason"),
             "mutation_axis": parent_trace.get("mutation_axis"),
+            "hidden_repair_score": parent_trace.get("hidden_repair_score"),
+            "raw_mutation_type": parent_trace.get("raw_mutation_type"),
+            "hidden_priority_changed_decision": parent_trace.get("hidden_priority_changed_decision"),
+            "selected_by_raw_or_hidden": parent_trace.get("selected_by_raw_or_hidden"),
+            "final_rerank_score": parent_trace.get("final_rerank_score"),
             "instruction_changed": parent_trace.get("instruction_changed"),
             "anchors_changed": parent_trace.get("anchors_changed"),
             "changed_anchor_slots": parent_trace.get("changed_anchor_slots"),
@@ -4555,6 +4627,11 @@ class EvolutionOptimizer:
                 "diagnostic_type": mutation_policy.get("diagnostic_type"),
                 "diagnostic_source": mutation_policy.get("diagnostic_source"),
                 "evidence_summary": mutation_policy.get("evidence_summary_for_prompt", {}),
+                "hidden_repair_score": mutation_policy.get("hidden_repair_score"),
+                "raw_mutation_type": mutation_policy.get("raw_mutation_type"),
+                "hidden_priority_changed_decision": mutation_policy.get("hidden_priority_changed_decision"),
+                "selected_by_raw_or_hidden": mutation_policy.get("selected_by_raw_or_hidden"),
+                "final_rerank_score": mutation_policy.get("final_rerank_score"),
                 "recommended_mutation_used": True,
             })
             elite.evidence_feedback = self._evidence_feedback_for(elite)

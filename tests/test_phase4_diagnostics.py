@@ -582,6 +582,43 @@ def test_mutation_policy_mapping(dominant, expected):
     assert policy["mutation_axis"] == mutation_axis_for_type(expected)
 
 
+def test_hidden_mutation_priority_overrides_boundary_to_high_tail():
+    dummy = type("Dummy", (), {"static_exemplars": [{"essay_id": 1}, {"essay_id": 2}]})()
+    cfg = {
+        "data": {"score_min": 2, "score_max": 12},
+        "pace": {"trigger_high_recall_floor": 0.5},
+        "evolution": {
+            "diagnostic_source": "hidden_evidence",
+            "raw_high_recall_floor": 0.3,
+            "hidden_mutation_priority_enabled": True,
+            "hidden_mutation_priority_threshold": 0.1,
+        },
+    }
+    policy = choose_mutation_policy(
+        dummy,
+        {
+            "dominant_error_type": "boundary_ambiguity",
+            "pace_diagnostic_summary": {
+                "under_score_high_hidden": 8,
+                "boundary_ambiguity": 2,
+            },
+            "raw_prediction_metrics": {
+                "high_score_recall": 0.31,
+                "max_score_recall": 1.0,
+                "high_pred_bias": -1.2,
+                "score_distribution_tv": 0.4,
+                "pred_collapse_ratio": 0.2,
+            },
+        },
+        cfg,
+    )
+    assert policy["raw_mutation_type"] == "boundary_clarification_mutation"
+    assert policy["mutation_type"] == "high_tail_instruction_mutation"
+    assert policy["hidden_priority_changed_decision"] is True
+    assert policy["selected_by_raw_or_hidden"] == "hidden_priority"
+    assert policy["hidden_repair_score"] > 0.1
+
+
 def test_protocol_candidate_and_diagnostic_taxonomy():
     diag = canonical_diagnostic_type(
         "under_score_high_hidden",
@@ -869,6 +906,8 @@ def test_contrastive_anchor_pairs_are_score_range_generic():
         "configs/phase4_gate3_hidden_no_anchor_mid.yaml",
         "configs/phase4_gate3_hidden_absolute_mid.yaml",
         "configs/phase4_gate3_hidden_abs_contrastive_mid.yaml",
+        "configs/phase4_gate3_rescue_raw_absolute_mid.yaml",
+        "configs/phase4_gate3_rescue_hidden_absolute_mid.yaml",
     ],
 )
 def test_phase4_configs_load(path):
