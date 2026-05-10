@@ -1,0 +1,57 @@
+# Phase 2 template only. Do not run until Phase 1 selects best_k.
+model:
+  name: models/Meta-Llama-3.1-8B-Instruct
+data:
+  asap_path: data/raw/training_set_rel3.tsv
+  essay_set: 8
+  score_min: 10
+  score_max: 60
+induction:
+  enabled: false
+  official_criteria: >
+    Evaluate the essay holistically based on content, organization, and language
+    use. Reward clear position, relevant development, coherent organization,
+    sentence control, and effective language.
+anchor_budget:
+  phase: 2
+  best_k: null
+  k_values: []
+  methods:
+    - no_anchor
+    - static_k_anchor
+    - retrieval_k_anchor
+    - representation_guided_k_anchor
+    - full_static_anchor
+  full_static_per_score: 3
+  representation:
+    mode: local_hidden
+    max_candidates_per_score: 8
+    max_val_representations: 32
+    token_cost_penalty: 0.02
+llm:
+  local_backend_enabled: true
+  temperature_scoring: 0.0
+  max_new_tokens_scoring: 192
+  protocol_cache_enabled: true
+output:
+  root: logs/anchor_budget_phase2
+  verbose: false
+debug:
+  enabled: true
+  stratified: true
+  seed: 42
+  n_train: 240
+  n_val: 96
+  n_test: 64
+pace:
+  enabled: false
+  model_path: models/Meta-Llama-3.1-8B-Instruct
+  load_in_4bit: false
+  dtype: bfloat16
+  final_pace_calibrated: false
+evolution:
+  max_score_contract_enabled: true
+  max_score_contract_text: |
+    The maximum score is attainable. Do not reserve the maximum score only for flawless essays. If the essay is comparable to or stronger than the high-score anchor in content, organization, and language use, assign a score near the top of the range, including the maximum score when appropriate.
+rag:
+  enabled: false
