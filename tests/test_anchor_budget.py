@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import torch
 import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -87,6 +88,49 @@ def test_representation_guided_tfidf_changes_anchor_choice(tmp_path):
     assert len(trace) == 4
     assert all("selection_parts" in row for row in trace)
     assert all(a.selection_reason.startswith("representation_guided:tfidf") for a in anchors)
+
+
+def test_representation_guided_local_hidden_uses_same_val_sample_for_high_indices(tmp_path):
+    class FakeBackend:
+        def encode_scoring_context(self, **kwargs):
+            text = kwargs.get("essay_text", "")
+            score = float(kwargs.get("known_score") or (12 if "excellent" in text else 2))
+            return torch.tensor([score, len(text) % 7, 1.0], dtype=torch.float32)
+
+    items = _toy_items()
+    # More than max_val_representations, with high-score items after the cutoff.
+    val = [
+        {"essay_id": 2000 + i, "essay_text": f"validation low {i}", "domain1_score": 2}
+        for i in range(6)
+    ] + [
+        {"essay_id": 3000 + i, "essay_text": f"excellent high validation {i}", "domain1_score": 12}
+        for i in range(6)
+    ]
+    cfg = {
+        "data": {"score_min": 2, "score_max": 12},
+        "anchor_budget": {
+            "representation": {
+                "mode": "local_hidden",
+                "max_candidates_per_score": 2,
+                "max_val_representations": 4,
+                "token_cost_penalty": 0.0,
+            }
+        },
+    }
+    anchors, trace = representation_guided_anchors(
+        items,
+        val,
+        3,
+        2,
+        12,
+        cfg,
+        "Rubric",
+        backend=FakeBackend(),
+        out_dir=tmp_path,
+    )
+    assert len(anchors) == 3
+    assert len(trace) == 3
+    assert all(row["representation_mode"] == "local_hidden" for row in trace)
 
 
 def test_phase1_decision_requires_representation_change():

@@ -426,8 +426,10 @@ def representation_guided_anchors(
     if not candidate_items:
         return [], []
 
+    val_for_representation = list(val)
     if mode == "local_hidden" and backend is not None:
-        val_sample = val[: int(rep_cfg.get("max_val_representations", 32))]
+        val_sample = list(val[: int(rep_cfg.get("max_val_representations", 32))])
+        val_for_representation = val_sample
         val_embs = []
         for item in val_sample:
             val_embs.append(
@@ -461,13 +463,20 @@ def representation_guided_anchors(
         cand_mat = mat[: len(candidate_items)]
         val_mat = mat[len(candidate_items):]
 
-    high_threshold = _adaptive_high_score_threshold({"data": {"score_min": score_min, "score_max": score_max}}, [x["domain1_score"] for x in val])
+    high_threshold = _adaptive_high_score_threshold(
+        {"data": {"score_min": score_min, "score_max": score_max}},
+        [x["domain1_score"] for x in val],
+    )
     selected: List[int] = []
     trace: List[Dict[str, Any]] = []
     selected_scores: set[int] = set()
     selected_bands: set[str] = set()
     centroid = val_mat.mean(axis=0)
-    high_val = [i for i, item in enumerate(val) if int(item["domain1_score"]) >= high_threshold]
+    high_val = [
+        i
+        for i, item in enumerate(val_for_representation)
+        if int(item["domain1_score"]) >= high_threshold
+    ]
     high_centroid = val_mat[high_val].mean(axis=0) if high_val else centroid
 
     for step in range(min(k, len(candidate_items))):
@@ -623,6 +632,75 @@ def write_csv(path: Path, rows: Sequence[Dict[str, Any]]) -> None:
             writer.writerow(row)
 
 
+def run_name_for(method: str, k: Optional[int]) -> str:
+    return f"{method}_k{k}" if k is not None else method
+
+
+REQUIRED_RUN_FILES = [
+    "anchor_bank.json",
+    "anchor_metrics.json",
+    "anchor_selection_trace.jsonl",
+    "predictions.csv",
+    "prediction_distribution.csv",
+    "score_boundary_metrics.json",
+    "summary.md",
+]
+
+
+def is_run_complete(run_dir: Path, method: str) -> bool:
+    required = list(REQUIRED_RUN_FILES)
+    if method == "representation_guided_k_anchor":
+        required.extend(["representation_anchor_scores.csv", "representation_selection_trace.jsonl"])
+    return all((run_dir / name).exists() for name in required)
+
+
+def load_existing_run_summary(run_dir: Path, method: str, k: Optional[int]) -> Dict[str, Any]:
+    metrics = read_json(run_dir / "score_boundary_metrics.json")
+    anchor_bank = read_json(run_dir / "anchor_bank.json")
+    anchor_metrics = read_json(run_dir / "anchor_metrics.json")
+    predictions = []
+    pred_path = run_dir / "predictions.csv"
+    if pred_path.exists():
+        with open(pred_path, encoding="utf-8", newline="") as f:
+            predictions = list(csv.DictReader(f))
+    total_tokens = sum(
+        int(float(row.get("prompt_tokens", 0) or 0))
+        + int(float(row.get("completion_tokens", 0) or 0))
+        for row in predictions
+    )
+    val_metrics = metrics.get("val", {})
+    test_metrics = metrics.get("test", {})
+    return {
+        "method": method,
+        "k": int(k or anchor_metrics.get("anchor_count", anchor_bank.get("k", 0)) or 0),
+        "exp_dir": str(run_dir),
+        "val_qwk": float(val_metrics.get("qwk", 0.0) or 0.0),
+        "test_qwk": float(test_metrics.get("qwk", 0.0) or 0.0),
+        "mae": float(test_metrics.get("mae", 0.0) or 0.0),
+        "high_recall": float(test_metrics.get("high_recall", 0.0) or 0.0),
+        "max_recall": float(test_metrics.get("max_recall", 0.0) or 0.0),
+        "SCI": float(test_metrics.get("score_compression_index", 0.0) or 0.0),
+        "range_coverage": float(test_metrics.get("range_coverage", 0.0) or 0.0),
+        "score_TV": float(test_metrics.get("score_tv", 0.0) or 0.0),
+        "tokens": int(total_tokens),
+        "runtime_sec": 0.0,
+        "anchor_count": int(anchor_metrics.get("anchor_count", anchor_bank.get("k", 0)) or 0),
+        "anchor_token_cost": int(anchor_bank.get("token_cost", 0) or 0),
+        "representation_changed_anchor_choice": bool(
+            anchor_bank.get("representation_changed_anchor_choice", False)
+        ),
+        "representation_features_used": anchor_bank.get("representation_features_used", []),
+        "resumed_from_existing_outputs": True,
+    }
+
+
+def read_json(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        return {}
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
 def score_items(
     backend: LocalLlamaBackend,
     items: Sequence[Dict],
@@ -676,7 +754,7 @@ def run_one(
 ) -> Dict[str, Any]:
     score_min = int(config["data"]["score_min"])
     score_max = int(config["data"]["score_max"])
-    run_name = f"{method}_k{k}" if k is not None else method
+    run_name = run_name_for(method, k)
     out_dir = root_out / run_name
     out_dir.mkdir(parents=True, exist_ok=True)
     with open(out_dir / "config.yaml", "w", encoding="utf-8") as f:
@@ -769,7 +847,9 @@ def run_one(
         "anchor_token_cost": bank.token_cost,
         "representation_changed_anchor_choice": rep_changed,
         "representation_features_used": features,
+        "resumed_from_existing_outputs": False,
     }
+    write_json(out_dir / "run_summary.json", summary)
     md = [
         "# Summary\n\n",
         "## Goal\nBudgeted anchor protocol baseline for raw LLM essay scoring.\n\n",
@@ -794,6 +874,8 @@ def main() -> None:
     parser.add_argument("--fold", type=int, default=0)
     parser.add_argument("--methods", nargs="*", default=None)
     parser.add_argument("--ks", nargs="*", type=int, default=None)
+    parser.add_argument("--output-root", default=None, help="Reuse an existing experiment root and resume incomplete runs.")
+    parser.add_argument("--no-resume-existing", action="store_true", help="Recompute runs even if required outputs already exist.")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
@@ -806,8 +888,11 @@ def main() -> None:
     instruction = instruction_from_config(config)
     methods = args.methods or list(config.get("anchor_budget", {}).get("methods", []))
     ks = args.ks or list(config.get("anchor_budget", {}).get("k_values", [3, 6, 9]))
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
-    out_root = Path(config.get("output", {}).get("root", "logs/anchor_budget")) / f"phase1_p{config['data']['essay_set']}_fold{args.fold}_{timestamp}"
+    if args.output_root:
+        out_root = Path(args.output_root)
+    else:
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        out_root = Path(config.get("output", {}).get("root", "logs/anchor_budget")) / f"phase1_p{config['data']['essay_set']}_fold{args.fold}_{timestamp}"
     out_root.mkdir(parents=True, exist_ok=True)
     write_json(out_root / "config.yaml.json", config)
     with open(out_root / "config.yaml", "w", encoding="utf-8") as f:
@@ -832,6 +917,11 @@ def main() -> None:
     )
     summaries = []
     for method, k in plan:
+        run_dir = out_root / run_name_for(method, k)
+        if not args.no_resume_existing and is_run_complete(run_dir, method):
+            print(f"[AnchorBudget] Reusing completed {method} k={k} from {run_dir}")
+            summaries.append(load_existing_run_summary(run_dir, method, k))
+            continue
         print(f"[AnchorBudget] Running {method} k={k}")
         summaries.append(
             run_one(
