@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from scripts.run_anchor_budget_experiment import (  # noqa: E402
     deterministic_score_covered,
+    load_asap_split,
     phase1_decision,
     representation_guided_anchors,
     score_boundary_metrics,
@@ -230,3 +231,48 @@ def test_phase2_dry_run_uses_only_k9_and_expected_prompts():
         assert cmd[cmd.index("--ks") + 1] == "9"
         assert "full_static_anchor" in cmd
         assert "stratified_k_anchor" not in cmd
+
+
+def test_fixed_split_manifest_overrides_debug_seed(tmp_path):
+    data_path = tmp_path / "toy.tsv"
+    rows = ["essay_id\tessay_set\tessay\tdomain1_score"]
+    for i in range(1, 13):
+        rows.append(f"{i}\t1\tEssay {i}\t{2 + (i % 3)}")
+    data_path.write_text("\n".join(rows), encoding="latin-1")
+    manifest = {
+        "prompt_id": 1,
+        "essay_set": 1,
+        "train_ids": [1, 2, 3, 4],
+        "val_ids": [5, 6],
+        "test_ids": [7, 8],
+        "anchor_pool_ids": [1, 2, 3, 4],
+        "score_range": [2, 4],
+    }
+    manifest_path = tmp_path / "split.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    cfg = {
+        "data": {
+            "asap_path": str(data_path),
+            "essay_set": 1,
+            "score_min": 2,
+            "score_max": 4,
+        },
+        "debug": {
+            "enabled": True,
+            "stratified": False,
+            "seed": 999,
+            "n_train": 4,
+            "n_val": 2,
+            "n_test": 2,
+        },
+    }
+    train, val, test = load_asap_split(cfg, 0, split_manifest=manifest_path)
+    assert [x["essay_id"] for x in train] == manifest["train_ids"]
+    assert [x["essay_id"] for x in val] == manifest["val_ids"]
+    assert [x["essay_id"] for x in test] == manifest["test_ids"]
+    cfg["debug"]["seed"] = 12345
+    train2, val2, test2 = load_asap_split(cfg, 0, split_manifest=manifest_path)
+    assert [x["essay_id"] for x in train2] == manifest["train_ids"]
+    assert [x["essay_id"] for x in val2] == manifest["val_ids"]
+    assert [x["essay_id"] for x in test2] == manifest["test_ids"]
+    assert not (set(manifest["anchor_pool_ids"]) & set(manifest["test_ids"]))

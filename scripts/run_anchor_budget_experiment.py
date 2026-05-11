@@ -163,11 +163,15 @@ def load_config(path: Path) -> Dict[str, Any]:
         return yaml.safe_load(f)
 
 
-def load_asap_split(config: Dict[str, Any], fold: int) -> Tuple[List[Dict], List[Dict], List[Dict]]:
+def id_list_hash(ids: Sequence[int]) -> str:
+    return hashlib.md5(",".join(map(str, ids)).encode("utf-8")).hexdigest()[:16]
+
+
+def load_asap_data(config: Dict[str, Any]) -> List[Dict]:
     data_cfg = config["data"]
     df = pd.read_csv(data_cfg["asap_path"], sep="\t", encoding="latin-1")
     df = df[df["essay_set"] == int(data_cfg["essay_set"])]
-    all_data = [
+    return [
         {
             "essay_id": int(row["essay_id"]),
             "essay_text": str(row["essay"]),
@@ -175,6 +179,62 @@ def load_asap_split(config: Dict[str, Any], fold: int) -> Tuple[List[Dict], List
         }
         for _, row in df.iterrows()
     ]
+
+
+def load_split_manifest(path: Path) -> Dict[str, Any]:
+    with open(path, encoding="utf-8") as f:
+        manifest = json.load(f)
+    for key in ["train_ids", "val_ids", "test_ids"]:
+        if key not in manifest:
+            raise ValueError(f"Split manifest missing required key: {key}")
+        manifest[key] = [int(x) for x in manifest[key]]
+    manifest["anchor_pool_ids"] = [int(x) for x in manifest.get("anchor_pool_ids", manifest["train_ids"])]
+    return manifest
+
+
+def split_by_manifest(config: Dict[str, Any], manifest: Dict[str, Any]) -> Tuple[List[Dict], List[Dict], List[Dict]]:
+    all_data = load_asap_data(config)
+    by_id = {int(x["essay_id"]): x for x in all_data}
+    missing = []
+    splits = []
+    for key in ["train_ids", "val_ids", "test_ids"]:
+        rows = []
+        for essay_id in manifest[key]:
+            item = by_id.get(int(essay_id))
+            if item is None:
+                missing.append(int(essay_id))
+            else:
+                rows.append(item)
+        splits.append(rows)
+    if missing:
+        raise ValueError(f"Split manifest contains essay IDs not found in configured ASAP prompt: {missing[:10]}")
+    test_ids = set(manifest["test_ids"])
+    leaked = sorted(set(manifest.get("anchor_pool_ids", manifest["train_ids"])) & test_ids)
+    if leaked:
+        raise ValueError(f"Split manifest anchor_pool_ids overlap test_ids: {leaked[:10]}")
+    return splits[0], splits[1], splits[2]
+
+
+def split_hash_summary(train: Sequence[Dict], val: Sequence[Dict], test: Sequence[Dict]) -> Dict[str, Any]:
+    train_ids = [int(x["essay_id"]) for x in train]
+    val_ids = [int(x["essay_id"]) for x in val]
+    test_ids = [int(x["essay_id"]) for x in test]
+    return {
+        "train_n": len(train_ids),
+        "val_n": len(val_ids),
+        "test_n": len(test_ids),
+        "train_ids_hash": id_list_hash(train_ids),
+        "val_ids_hash": id_list_hash(val_ids),
+        "test_ids_hash": id_list_hash(test_ids),
+        "anchor_pool_ids_hash": id_list_hash(train_ids),
+    }
+
+
+def load_asap_split(config: Dict[str, Any], fold: int, split_manifest: Optional[Path] = None) -> Tuple[List[Dict], List[Dict], List[Dict]]:
+    if split_manifest is not None:
+        return split_by_manifest(config, load_split_manifest(split_manifest))
+    all_data = load_asap_data(config)
+    data_cfg = config["data"]
     score_min = int(data_cfg["score_min"])
     score_max = int(data_cfg["score_max"])
     dbg = config.get("debug", {})
@@ -1083,6 +1143,7 @@ def main() -> None:
     parser.add_argument("--methods", nargs="*", default=None)
     parser.add_argument("--ks", nargs="*", type=int, default=None)
     parser.add_argument("--output-root", default=None, help="Reuse an existing experiment root and resume incomplete runs.")
+    parser.add_argument("--split_manifest", default=None, help="Use fixed train/val/test essay IDs from a split manifest JSON.")
     parser.add_argument("--no-resume-existing", action="store_true", help="Recompute runs even if required outputs already exist.")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
@@ -1092,7 +1153,14 @@ def main() -> None:
     seed = int(config.get("debug", {}).get("seed", 42 + args.fold))
     random.seed(seed)
     np.random.seed(seed)
-    train, val, test = load_asap_split(config, args.fold)
+    split_manifest_path = Path(args.split_manifest) if args.split_manifest else None
+    train, val, test = load_asap_split(config, args.fold, split_manifest=split_manifest_path)
+    split_hashes = split_hash_summary(train, val, test)
+    if split_manifest_path is not None:
+        config["fixed_split_manifest"] = {
+            "path": str(split_manifest_path),
+            **split_hashes,
+        }
     instruction = instruction_from_config(config)
     methods = args.methods or list(config.get("anchor_budget", {}).get("methods", []))
     ks = args.ks or list(config.get("anchor_budget", {}).get("k_values", [3, 6, 9]))
@@ -1114,7 +1182,7 @@ def main() -> None:
             for k in ks:
                 plan.append((method, int(k)))
     if args.dry_run:
-        print(json.dumps({"output_root": str(out_root), "plan": plan}, ensure_ascii=False, indent=2))
+        print(json.dumps({"output_root": str(out_root), "plan": plan, "split": split_hashes}, ensure_ascii=False, indent=2))
         return
 
     backend = LocalLlamaBackend(
@@ -1223,6 +1291,10 @@ def render_phase1_summary(config: Dict[str, Any], fold: int, out_root: Path, row
         f"- prompt / essay set: {config['data']['essay_set']}\n",
         f"- fold: {fold}\n",
         f"- seed: {config.get('debug', {}).get('seed')}\n",
+        f"- split_manifest: `{config.get('fixed_split_manifest', {}).get('path', '')}`\n",
+        f"- train_ids_hash: `{config.get('fixed_split_manifest', {}).get('train_ids_hash', '')}`\n",
+        f"- val_ids_hash: `{config.get('fixed_split_manifest', {}).get('val_ids_hash', '')}`\n",
+        f"- test_ids_hash: `{config.get('fixed_split_manifest', {}).get('test_ids_hash', '')}`\n",
         f"- methods: {config.get('anchor_budget', {}).get('methods')}\n",
         f"- k values: {config.get('anchor_budget', {}).get('k_values')}\n",
         "- anchor pool: train split only\n",
