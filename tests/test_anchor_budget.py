@@ -16,6 +16,7 @@ from scripts.run_anchor_budget_experiment import (  # noqa: E402
     phase1_decision,
     representation_guided_anchors,
     score_boundary_metrics,
+    stratified_rep_guided_anchors,
     stratified_anchors,
 )
 
@@ -131,6 +132,43 @@ def test_representation_guided_local_hidden_uses_same_val_sample_for_high_indice
     assert len(anchors) == 3
     assert len(trace) == 3
     assert all(row["representation_mode"] == "local_hidden" for row in trace)
+
+
+def test_stratified_rep_guided_enforces_score_band_quota(tmp_path):
+    items = _toy_items()
+    val = [
+        {"essay_id": 1001, "essay_text": "excellent evidence organization language sophisticated", "domain1_score": 12},
+        {"essay_id": 1002, "essay_text": "middle organized evidence", "domain1_score": 7},
+        {"essay_id": 1003, "essay_text": "weak vague limited", "domain1_score": 2},
+    ]
+    cfg = {
+        "data": {"score_min": 2, "score_max": 12},
+        "anchor_budget": {
+            "representation": {
+                "mode": "tfidf",
+                "max_candidates_per_score": 3,
+                "token_cost_penalty": 0.0,
+            }
+        },
+    }
+    anchors, trace = stratified_rep_guided_anchors(
+        items,
+        val,
+        9,
+        2,
+        12,
+        cfg,
+        "Rubric",
+        backend=None,
+        out_dir=tmp_path,
+    )
+    assert len(anchors) == 9
+    assert len(trace) == 9
+    bands = [row["requested_band"] for row in trace]
+    assert bands.count("low") == 3
+    assert bands.count("mid") == 3
+    assert bands.count("high") == 3
+    assert all(a.selection_reason.startswith("stratified_rep_guided:") for a in anchors)
 
 
 def test_phase1_decision_requires_representation_change():

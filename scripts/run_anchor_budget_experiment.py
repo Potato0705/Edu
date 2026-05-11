@@ -549,6 +549,208 @@ def representation_guided_anchors(
     return anchors, trace
 
 
+def _representation_candidate_scores(
+    train: Sequence[Dict],
+    val: Sequence[Dict],
+    score_min: int,
+    score_max: int,
+    config: Dict[str, Any],
+    instruction: str,
+    backend: Optional[LocalLlamaBackend],
+) -> Tuple[List[Dict], List[Dict[str, Any]], str, List[str]]:
+    rep_cfg = config.get("anchor_budget", {}).get("representation", {})
+    mode = str(rep_cfg.get("mode", "tfidf"))
+    max_candidates_per_score = int(rep_cfg.get("max_candidates_per_score", 8))
+    token_penalty = float(rep_cfg.get("token_cost_penalty", 0.02))
+    score_values = sorted({int(x["domain1_score"]) for x in train})
+    candidate_items = []
+    for score in score_values:
+        pool = [x for x in train if int(x["domain1_score"]) == score]
+        pool = sorted(pool, key=lambda x: (token_len(x["essay_text"]), int(x["essay_id"])))
+        candidate_items.extend(pool[:max_candidates_per_score])
+    if not candidate_items:
+        return [], [], mode, []
+
+    val_for_representation = list(val)
+    if mode == "local_hidden" and backend is not None:
+        val_sample = list(val[: int(rep_cfg.get("max_val_representations", 32))])
+        val_for_representation = val_sample
+        val_embs = []
+        for item in val_sample:
+            val_embs.append(
+                backend.encode_scoring_context(
+                    instruction=instruction,
+                    static_exemplars=[],
+                    essay_text=item["essay_text"],
+                    score_min=score_min,
+                    score_max=score_max,
+                    representation_target="Encode the validation essay for anchor coverage.",
+                ).numpy()
+            )
+        cand_embs = []
+        for item in candidate_items:
+            cand_embs.append(
+                backend.encode_scoring_context(
+                    instruction=instruction,
+                    static_exemplars=[],
+                    essay_text=item["essay_text"],
+                    score_min=score_min,
+                    score_max=score_max,
+                    known_score=int(item["domain1_score"]),
+                    representation_target="Encode this candidate reference essay for anchor selection.",
+                ).numpy()
+            )
+        val_mat = np.vstack(val_embs) if val_embs else np.zeros((1, len(cand_embs[0])))
+        cand_mat = np.vstack(cand_embs)
+    else:
+        all_items = list(candidate_items) + list(val)
+        mat, _ = tfidf_vectors(all_items)
+        cand_mat = mat[: len(candidate_items)]
+        val_mat = mat[len(candidate_items):]
+
+    high_threshold = _adaptive_high_score_threshold(
+        {"data": {"score_min": score_min, "score_max": score_max}},
+        [x["domain1_score"] for x in val],
+    )
+    centroid = val_mat.mean(axis=0)
+    high_val = [
+        i
+        for i, item in enumerate(val_for_representation)
+        if int(item["domain1_score"]) >= high_threshold
+    ]
+    high_centroid = val_mat[high_val].mean(axis=0) if high_val else centroid
+    scored = []
+    for idx, item in enumerate(candidate_items):
+        score = int(item["domain1_score"])
+        band = band_for(score, score_min, score_max)
+        vec = cand_mat[idx]
+        val_cov = float(np.dot(vec, centroid))
+        high_cov = float(np.dot(vec, high_centroid)) if score >= high_threshold else 0.0
+        length_pen = token_penalty * (token_len(item["essay_text"]) / 400.0)
+        total = val_cov + 0.5 * high_cov - length_pen
+        scored.append(
+            {
+                "candidate_index": idx,
+                "item": item,
+                "essay_id": int(item["essay_id"]),
+                "gold_score": score,
+                "band": band,
+                "selection_score": float(total),
+                "selection_parts": {
+                    "validation_hidden_coverage_score": val_cov,
+                    "high_tail_coverage_score": high_cov,
+                    "token_cost_penalty": length_pen,
+                },
+                "representation_mode": mode,
+            }
+        )
+    scored.sort(key=lambda x: (-float(x["selection_score"]), int(x["gold_score"]), int(x["essay_id"])))
+    return candidate_items, scored, mode, ["validation_representation_coverage", "high_tail_coverage", mode]
+
+
+def _band_quota(k: int, available_bands: Sequence[str]) -> Dict[str, int]:
+    bands = [b for b in ["low", "mid", "high"] if b in set(available_bands)]
+    if not bands or k <= 0:
+        return {}
+    base = k // len(bands)
+    rem = k % len(bands)
+    quotas = {band: base for band in bands}
+    for band in bands[:rem]:
+        quotas[band] += 1
+    return quotas
+
+
+def stratified_rep_guided_anchors(
+    train: Sequence[Dict],
+    val: Sequence[Dict],
+    k: int,
+    score_min: int,
+    score_max: int,
+    config: Dict[str, Any],
+    instruction: str,
+    backend: Optional[LocalLlamaBackend],
+    out_dir: Path,
+) -> Tuple[List[AnchorRecord], List[Dict[str, Any]]]:
+    _, scored, mode, _ = _representation_candidate_scores(
+        train, val, score_min, score_max, config, instruction, backend
+    )
+    if not scored or k <= 0:
+        return [], []
+    by_band: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for row in scored:
+        by_band[str(row["band"])].append(row)
+    quotas = _band_quota(k, [band for band, rows in by_band.items() if rows])
+    selected: List[Dict[str, Any]] = []
+    used_ids: set[int] = set()
+    trace: List[Dict[str, Any]] = []
+
+    for band in ["low", "mid", "high"]:
+        quota = quotas.get(band, 0)
+        for row in by_band.get(band, [])[:quota]:
+            if int(row["essay_id"]) in used_ids:
+                continue
+            selected.append(row)
+            used_ids.add(int(row["essay_id"]))
+            trace.append(
+                {
+                    "step": len(trace) + 1,
+                    "essay_id": int(row["essay_id"]),
+                    "gold_score": int(row["gold_score"]),
+                    "score_band": band,
+                    "requested_band": band,
+                    "band_quota": quota,
+                    "fallback_reason": "",
+                    "selection_score": float(row["selection_score"]),
+                    "selection_parts": row["selection_parts"],
+                    "representation_mode": mode,
+                }
+            )
+            if len(selected) >= k:
+                break
+        if len(selected) >= k:
+            break
+
+    if len(selected) < k:
+        for row in scored:
+            if int(row["essay_id"]) in used_ids:
+                continue
+            selected.append(row)
+            used_ids.add(int(row["essay_id"]))
+            trace.append(
+                {
+                    "step": len(trace) + 1,
+                    "essay_id": int(row["essay_id"]),
+                    "gold_score": int(row["gold_score"]),
+                    "score_band": row["band"],
+                    "requested_band": "fallback_any_band",
+                    "band_quota": quotas,
+                    "fallback_reason": "quota underfilled because one or more score bands lacked available candidates",
+                    "selection_score": float(row["selection_score"]),
+                    "selection_parts": row["selection_parts"],
+                    "representation_mode": mode,
+                }
+            )
+            if len(selected) >= k:
+                break
+
+    anchors = []
+    for row in selected[:k]:
+        item = row["item"]
+        anchors.append(
+            AnchorRecord(
+                essay_id=int(item["essay_id"]),
+                gold_score=int(item["domain1_score"]),
+                prompt_id=0,
+                token_length=token_len(item["essay_text"]),
+                source_split="train",
+                selection_score=float(row["selection_score"]),
+                selection_reason=f"stratified_rep_guided:{mode}",
+                essay_text=item["essay_text"],
+            )
+        )
+    return anchors, trace
+
+
 def full_static_anchors(train: Sequence[Dict], score_min: int, score_max: int, per_score: int) -> List[AnchorRecord]:
     selected = []
     for score in range(score_min, score_max + 1):
@@ -602,6 +804,12 @@ def build_anchor_bank(
         rep_ids = [x.essay_id for x in anchors]
         mode = str(config.get("anchor_budget", {}).get("representation", {}).get("mode", "tfidf"))
         return anchors, trace, rep_ids != static_ids, ["score_coverage", "validation_representation_coverage", "high_tail_coverage", "diversity", mode]
+    if method == "stratified_rep_guided_k_anchor":
+        anchors, trace = stratified_rep_guided_anchors(train, val, int(k or 0), score_min, score_max, config, instruction, backend, out_dir)
+        stratified_ids = [x.essay_id for x in stratified_anchors(train, int(k or 0), score_min, score_max, seed)]
+        rep_ids = [x.essay_id for x in anchors]
+        mode = str(config.get("anchor_budget", {}).get("representation", {}).get("mode", "tfidf"))
+        return anchors, trace, rep_ids != stratified_ids, ["score_band_quota", "validation_representation_coverage", "high_tail_coverage", mode]
     if method == "full_static_anchor":
         per_score = int(config.get("anchor_budget", {}).get("full_static_per_score", 3))
         anchors = full_static_anchors(train, score_min, score_max, per_score)
@@ -649,7 +857,7 @@ REQUIRED_RUN_FILES = [
 
 def is_run_complete(run_dir: Path, method: str) -> bool:
     required = list(REQUIRED_RUN_FILES)
-    if method == "representation_guided_k_anchor":
+    if method in {"representation_guided_k_anchor", "stratified_rep_guided_k_anchor"}:
         required.extend(["representation_anchor_scores.csv", "representation_selection_trace.jsonl"])
     return all((run_dir / name).exists() for name in required)
 
@@ -764,7 +972,7 @@ def run_one(
     )
     trace_path = out_dir / "anchor_selection_trace.jsonl"
     write_jsonl(trace_path, trace)
-    if method == "representation_guided_k_anchor":
+    if method in {"representation_guided_k_anchor", "stratified_rep_guided_k_anchor"}:
         write_jsonl(out_dir / "representation_selection_trace.jsonl", trace)
         write_csv(out_dir / "representation_anchor_scores.csv", trace)
     bank = AnchorBank(
