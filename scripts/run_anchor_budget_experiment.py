@@ -720,6 +720,286 @@ def _band_quota(k: int, available_bands: Sequence[str]) -> Dict[str, int]:
     return quotas
 
 
+def _minmax_normalize(values: Sequence[float]) -> List[float]:
+    if not values:
+        return []
+    lo = min(values)
+    hi = max(values)
+    if abs(hi - lo) < 1e-12:
+        return [1.0 for _ in values]
+    return [(float(v) - lo) / (hi - lo) for v in values]
+
+
+def _lexical_retrieval_rows(train: Sequence[Dict], val: Sequence[Dict]) -> List[Dict[str, Any]]:
+    val_terms = Counter()
+    for item in val:
+        val_terms.update(tokenize_simple(item["essay_text"]))
+    rows = []
+    for item in train:
+        terms = tokenize_simple(item["essay_text"])
+        overlap = sum(val_terms[t] for t in terms)
+        length_pen = 0.0005 * token_len(item["essay_text"])
+        rows.append(
+            {
+                "item": item,
+                "essay_id": int(item["essay_id"]),
+                "gold_score": int(item["domain1_score"]),
+                "retrieval_score": float(overlap - length_pen),
+            }
+        )
+    rows.sort(key=lambda x: (-float(x["retrieval_score"]), int(x["gold_score"]), int(x["essay_id"])))
+    return rows
+
+
+def _text_jaccard(a: str, b: str) -> float:
+    toks_a = tokenize_simple(a)
+    toks_b = tokenize_simple(b)
+    if not toks_a and not toks_b:
+        return 0.0
+    return len(toks_a & toks_b) / max(1, len(toks_a | toks_b))
+
+
+def retrieval_grounded_stratified_rep_anchors(
+    train: Sequence[Dict],
+    val: Sequence[Dict],
+    k: int,
+    score_min: int,
+    score_max: int,
+    config: Dict[str, Any],
+    instruction: str,
+    backend: Optional[LocalLlamaBackend],
+    out_dir: Path,
+) -> Tuple[List[AnchorRecord], List[Dict[str, Any]]]:
+    rg_cfg = config.get("anchor_budget", {}).get("retrieval_grounded_rep", {})
+    rep_cfg = config.get("anchor_budget", {}).get("representation", {})
+    mode = str(rep_cfg.get("mode", "tfidf"))
+    per_band_top_n = max(1, int(rg_cfg.get("per_band_top_n", 5)))
+    retrieval_weight = float(rg_cfg.get("retrieval_weight", 0.6))
+    representation_weight = float(rg_cfg.get("representation_weight", 0.4))
+    coverage_bonus = float(rg_cfg.get("coverage_bonus", 0.1))
+    redundancy_weight = float(rg_cfg.get("redundancy_weight", 0.2))
+    token_weight = float(rg_cfg.get("token_weight", rep_cfg.get("token_cost_penalty", 0.02)))
+    fallback_epsilon = float(rg_cfg.get("fallback_epsilon", 0.03))
+
+    if k <= 0 or not train:
+        return [], []
+
+    retrieval_rows = _lexical_retrieval_rows(train, val)
+    by_band: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for global_rank, row in enumerate(retrieval_rows, start=1):
+        band = band_for(int(row["gold_score"]), score_min, score_max)
+        row = dict(row)
+        row["band"] = band
+        row["retrieval_global_rank"] = global_rank
+        by_band[band].append(row)
+
+    retrieval_candidates: List[Dict[str, Any]] = []
+    for band in ["low", "mid", "high"]:
+        for rank, row in enumerate(by_band.get(band, [])[:per_band_top_n], start=1):
+            row = dict(row)
+            row["retrieval_rank"] = rank
+            retrieval_candidates.append(row)
+    if not retrieval_candidates:
+        return [], []
+
+    candidate_items = [row["item"] for row in retrieval_candidates]
+    if mode == "local_hidden" and backend is not None:
+        val_sample = list(val[: int(rep_cfg.get("max_val_representations", 32))])
+        val_embs = [
+            backend.encode_scoring_context(
+                instruction=instruction,
+                static_exemplars=[],
+                essay_text=item["essay_text"],
+                score_min=score_min,
+                score_max=score_max,
+                representation_target="Encode the validation essay for anchor coverage.",
+            ).numpy()
+            for item in val_sample
+        ]
+        cand_embs = [
+            backend.encode_scoring_context(
+                instruction=instruction,
+                static_exemplars=[],
+                essay_text=item["essay_text"],
+                score_min=score_min,
+                score_max=score_max,
+                known_score=int(item["domain1_score"]),
+                representation_target="Encode this retrieval candidate reference essay for anchor selection.",
+            ).numpy()
+            for item in candidate_items
+        ]
+        cand_mat = np.vstack(cand_embs)
+        val_mat = np.vstack(val_embs) if val_embs else np.zeros((1, cand_mat.shape[1]))
+    else:
+        all_items = list(candidate_items) + list(val)
+        mat, _ = tfidf_vectors(all_items)
+        cand_mat = mat[: len(candidate_items)]
+        val_mat = mat[len(candidate_items):]
+
+    centroid = val_mat.mean(axis=0)
+    rep_scores = [float(np.dot(cand_mat[i], centroid)) for i in range(len(retrieval_candidates))]
+    for idx, row in enumerate(retrieval_candidates):
+        row["candidate_index"] = idx
+        row["representation_score"] = rep_scores[idx]
+        row["retrieval_candidate_ids_in_band"] = [
+            int(x["essay_id"]) for x in by_band.get(str(row["band"]), [])[:per_band_top_n]
+        ]
+
+    for band in ["low", "mid", "high"]:
+        rows = [row for row in retrieval_candidates if row["band"] == band]
+        retrieval_norms = _minmax_normalize([float(row["retrieval_score"]) for row in rows])
+        rep_norms = _minmax_normalize([float(row["representation_score"]) for row in rows])
+        for row, retrieval_norm, rep_norm in zip(rows, retrieval_norms, rep_norms):
+            row["normalized_retrieval_score"] = float(retrieval_norm)
+            row["normalized_representation_score"] = float(rep_norm)
+
+    quotas = _band_quota(k, [band for band, rows in by_band.items() if rows])
+    selected: List[Dict[str, Any]] = []
+    used_ids: set[int] = set()
+    trace: List[Dict[str, Any]] = []
+
+    for band in ["low", "mid", "high"]:
+        quota = quotas.get(band, 0)
+        for _ in range(quota):
+            pool = [
+                row for row in retrieval_candidates
+                if row["band"] == band and int(row["essay_id"]) not in used_ids
+            ]
+            if not pool:
+                break
+
+            top_retrieval = sorted(
+                pool,
+                key=lambda x: (int(x["retrieval_rank"]), -float(x["retrieval_score"]), int(x["essay_id"])),
+            )[0]
+            scored_pool = []
+            for row in pool:
+                redundancy = 0.0
+                if selected:
+                    redundancy = max(
+                        _text_jaccard(str(row["item"]["essay_text"]), str(prev["item"]["essay_text"]))
+                        for prev in selected
+                    )
+                token_penalty = token_weight * (token_len(row["item"]["essay_text"]) / 400.0)
+                band_coverage_bonus = coverage_bonus if not any(x["band"] == band for x in selected) else 0.0
+                combined = (
+                    retrieval_weight * float(row.get("normalized_retrieval_score", 0.0))
+                    + representation_weight * float(row.get("normalized_representation_score", 0.0))
+                    + band_coverage_bonus
+                    - redundancy_weight * redundancy
+                    - token_penalty
+                )
+                scored = dict(row)
+                scored["redundancy_score"] = float(redundancy)
+                scored["token_cost_penalty"] = float(token_penalty)
+                scored["coverage_bonus"] = float(band_coverage_bonus)
+                scored["combined_score"] = float(combined)
+                scored_pool.append(scored)
+
+            best_combined = sorted(
+                scored_pool,
+                key=lambda x: (-float(x["combined_score"]), int(x["retrieval_rank"]), int(x["essay_id"])),
+            )[0]
+            top_retrieval_scored = next(x for x in scored_pool if int(x["essay_id"]) == int(top_retrieval["essay_id"]))
+            use_retrieval_fallback = False
+            selected_reason = "retrieval_grounded_rep: representation rerank within retrieval top-n"
+            if int(best_combined["essay_id"]) != int(top_retrieval_scored["essay_id"]):
+                margin = float(best_combined["combined_score"]) - float(top_retrieval_scored["combined_score"])
+                if margin <= fallback_epsilon:
+                    best_combined = top_retrieval_scored
+                    use_retrieval_fallback = True
+                    selected_reason = "retrieval_grounded_rep: fallback to retrieval top because rerank margin was small"
+
+            selected.append(best_combined)
+            used_ids.add(int(best_combined["essay_id"]))
+            trace.append(
+                {
+                    "step": len(trace) + 1,
+                    "anchor_id": int(best_combined["essay_id"]),
+                    "essay_id": int(best_combined["essay_id"]),
+                    "score": int(best_combined["gold_score"]),
+                    "gold_score": int(best_combined["gold_score"]),
+                    "band": band,
+                    "score_band": band,
+                    "requested_band": band,
+                    "band_quota": quota,
+                    "retrieval_rank": int(best_combined["retrieval_rank"]),
+                    "retrieval_score": float(best_combined["retrieval_score"]),
+                    "representation_score": float(best_combined["representation_score"]),
+                    "combined_score": float(best_combined["combined_score"]),
+                    "redundancy_score": float(best_combined["redundancy_score"]),
+                    "token_length": token_len(best_combined["item"]["essay_text"]),
+                    "selected_reason": selected_reason,
+                    "whether_selected_by_rep_rerank": int(best_combined["retrieval_rank"]) != 1,
+                    "whether_fallback_to_retrieval": use_retrieval_fallback,
+                    "retrieval_candidate_ids_in_band": best_combined["retrieval_candidate_ids_in_band"],
+                    "selection_parts": {
+                        "normalized_retrieval_score": float(best_combined.get("normalized_retrieval_score", 0.0)),
+                        "normalized_representation_score": float(best_combined.get("normalized_representation_score", 0.0)),
+                        "coverage_bonus": float(best_combined["coverage_bonus"]),
+                        "redundancy_penalty": float(best_combined["redundancy_score"]),
+                        "token_cost_penalty": float(best_combined["token_cost_penalty"]),
+                    },
+                    "representation_mode": mode,
+                    "fallback_reason": "small_rerank_margin" if use_retrieval_fallback else "",
+                }
+            )
+            if len(selected) >= k:
+                break
+        if len(selected) >= k:
+            break
+
+    if len(selected) < min(k, len(retrieval_candidates)):
+        for row in retrieval_candidates:
+            if int(row["essay_id"]) in used_ids:
+                continue
+            selected.append(row)
+            used_ids.add(int(row["essay_id"]))
+            trace.append(
+                {
+                    "step": len(trace) + 1,
+                    "anchor_id": int(row["essay_id"]),
+                    "essay_id": int(row["essay_id"]),
+                    "score": int(row["gold_score"]),
+                    "gold_score": int(row["gold_score"]),
+                    "band": row["band"],
+                    "score_band": row["band"],
+                    "requested_band": "fallback_any_band",
+                    "band_quota": quotas,
+                    "retrieval_rank": int(row["retrieval_rank"]),
+                    "retrieval_score": float(row["retrieval_score"]),
+                    "representation_score": float(row["representation_score"]),
+                    "combined_score": float(row.get("combined_score", row["retrieval_score"])),
+                    "redundancy_score": 0.0,
+                    "token_length": token_len(row["item"]["essay_text"]),
+                    "selected_reason": "retrieval_grounded_rep: fallback fill after quota underflow",
+                    "whether_selected_by_rep_rerank": False,
+                    "whether_fallback_to_retrieval": True,
+                    "retrieval_candidate_ids_in_band": row["retrieval_candidate_ids_in_band"],
+                    "selection_parts": {},
+                    "representation_mode": mode,
+                    "fallback_reason": "quota underfilled because one or more score bands lacked retrieval candidates",
+                }
+            )
+            if len(selected) >= k:
+                break
+
+    anchors = [
+        AnchorRecord(
+            essay_id=int(row["item"]["essay_id"]),
+            gold_score=int(row["item"]["domain1_score"]),
+            prompt_id=0,
+            token_length=token_len(row["item"]["essay_text"]),
+            source_split="train",
+            selection_score=float(row.get("combined_score", row.get("retrieval_score", 0.0))),
+            selection_reason=f"retrieval_grounded_stratified_rep:{mode}",
+            essay_text=row["item"]["essay_text"],
+        )
+        for row in selected[:k]
+    ]
+    return anchors, trace
+
+
 def stratified_rep_guided_anchors(
     train: Sequence[Dict],
     val: Sequence[Dict],
@@ -870,6 +1150,20 @@ def build_anchor_bank(
         rep_ids = [x.essay_id for x in anchors]
         mode = str(config.get("anchor_budget", {}).get("representation", {}).get("mode", "tfidf"))
         return anchors, trace, rep_ids != stratified_ids, ["score_band_quota", "validation_representation_coverage", "high_tail_coverage", mode]
+    if method == "retrieval_grounded_stratified_rep_k_anchor":
+        anchors, trace = retrieval_grounded_stratified_rep_anchors(
+            train, val, int(k or 0), score_min, score_max, config, instruction, backend, out_dir
+        )
+        retrieval_ids = [x.essay_id for x in retrieval_anchors(train, val, int(k or 0), score_min, score_max)]
+        rep_ids = [x.essay_id for x in anchors]
+        mode = str(config.get("anchor_budget", {}).get("representation", {}).get("mode", "tfidf"))
+        return anchors, trace, rep_ids != retrieval_ids, [
+            "score_band_quota",
+            "retrieval_top_n",
+            "representation_rerank",
+            "redundancy_penalty",
+            mode,
+        ]
     if method == "full_static_anchor":
         per_score = int(config.get("anchor_budget", {}).get("full_static_per_score", 3))
         anchors = full_static_anchors(train, score_min, score_max, per_score)
@@ -917,7 +1211,7 @@ REQUIRED_RUN_FILES = [
 
 def is_run_complete(run_dir: Path, method: str) -> bool:
     required = list(REQUIRED_RUN_FILES)
-    if method in {"representation_guided_k_anchor", "stratified_rep_guided_k_anchor"}:
+    if method in {"representation_guided_k_anchor", "stratified_rep_guided_k_anchor", "retrieval_grounded_stratified_rep_k_anchor"}:
         required.extend(["representation_anchor_scores.csv", "representation_selection_trace.jsonl"])
     return all((run_dir / name).exists() for name in required)
 
@@ -1032,7 +1326,7 @@ def run_one(
     )
     trace_path = out_dir / "anchor_selection_trace.jsonl"
     write_jsonl(trace_path, trace)
-    if method in {"representation_guided_k_anchor", "stratified_rep_guided_k_anchor"}:
+    if method in {"representation_guided_k_anchor", "stratified_rep_guided_k_anchor", "retrieval_grounded_stratified_rep_k_anchor"}:
         write_jsonl(out_dir / "representation_selection_trace.jsonl", trace)
         write_csv(out_dir / "representation_anchor_scores.csv", trace)
     bank = AnchorBank(
