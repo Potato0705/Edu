@@ -16,6 +16,7 @@ from scripts.run_anchor_budget_experiment import (  # noqa: E402
     load_asap_split,
     phase1_decision,
     representation_guided_anchors,
+    retrieval_grounded_no_rep_anchors,
     retrieval_grounded_stratified_rep_anchors,
     retrieval_grounded_stratified_rep_anchors_v21,
     score_boundary_metrics,
@@ -432,6 +433,70 @@ def test_retrieval_grounded_v21_logging_fields_exist(tmp_path):
         "replacement_index",
         "max_rep_replacements",
         "margin_to_retrieval_top",
+        "redundancy_score",
+        "token_length",
+    }
+    assert required <= set(trace[0])
+
+
+def test_retrieval_grounded_no_rep_disables_representation_backend_and_rerank(tmp_path):
+    class FailingBackend:
+        def encode_scoring_context(self, **kwargs):
+            raise AssertionError("no-rep selector must not encode representation")
+
+    items = _toy_items()
+    val = [
+        {"essay_id": 1001, "essay_text": "excellent evidence organization language sophisticated", "domain1_score": 12},
+        {"essay_id": 1002, "essay_text": "middle organized evidence", "domain1_score": 7},
+        {"essay_id": 1003, "essay_text": "weak vague limited", "domain1_score": 2},
+    ]
+    cfg = {
+        "anchor_budget": {
+            "representation": {"mode": "local_hidden"},
+            "retrieval_grounded_no_rep": {"per_band_top_n": 3},
+        }
+    }
+    anchors, trace = retrieval_grounded_no_rep_anchors(
+        items, val, 9, 2, 12, cfg, "Rubric", backend=FailingBackend(), out_dir=tmp_path
+    )
+    assert len(anchors) == 9
+    assert all(row["method_has_representation"] is False for row in trace)
+    assert all(row["representation_score"] == 0.0 for row in trace)
+    assert not any(row["selected_by_rep_rerank"] for row in trace)
+
+
+def test_retrieval_grounded_no_rep_preserves_band_quota_and_logging(tmp_path):
+    items = _toy_items()
+    val = [
+        {"essay_id": 1001, "essay_text": "excellent evidence organization language sophisticated", "domain1_score": 12},
+        {"essay_id": 1002, "essay_text": "middle organized evidence", "domain1_score": 7},
+        {"essay_id": 1003, "essay_text": "weak vague limited", "domain1_score": 2},
+    ]
+    cfg = {
+        "anchor_budget": {
+            "representation": {"mode": "tfidf"},
+            "retrieval_grounded_no_rep": {"per_band_top_n": 3},
+        }
+    }
+    anchors, trace = retrieval_grounded_no_rep_anchors(
+        items, val, 9, 2, 12, cfg, "Rubric", backend=None, out_dir=tmp_path
+    )
+    bands = [row["requested_band"] for row in trace]
+    assert bands.count("low") == 3
+    assert bands.count("mid") == 3
+    assert bands.count("high") == 3
+    assert all(a.selection_reason.startswith("retrieval_grounded_no_rep") for a in anchors)
+    required = {
+        "anchor_id",
+        "score",
+        "band",
+        "retrieval_rank",
+        "retrieval_score",
+        "representation_score",
+        "combined_score",
+        "fallback_to_retrieval",
+        "fallback_reason",
+        "method_has_representation",
         "redundancy_score",
         "token_length",
     }
