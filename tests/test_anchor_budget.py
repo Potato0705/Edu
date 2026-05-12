@@ -17,6 +17,7 @@ from scripts.run_anchor_budget_experiment import (  # noqa: E402
     phase1_decision,
     representation_guided_anchors,
     retrieval_grounded_stratified_rep_anchors,
+    retrieval_grounded_stratified_rep_anchors_v21,
     score_boundary_metrics,
     stratified_rep_guided_anchors,
     stratified_anchors,
@@ -283,6 +284,156 @@ def test_retrieval_grounded_rep_logging_fields_exist(tmp_path):
         "selected_reason",
         "whether_selected_by_rep_rerank",
         "whether_fallback_to_retrieval",
+    }
+    assert required <= set(trace[0])
+
+
+def test_retrieval_grounded_v21_weights_are_configurable(tmp_path):
+    items = _toy_items()
+    val = [
+        {"essay_id": 1001, "essay_text": "excellent evidence organization language sophisticated", "domain1_score": 12},
+        {"essay_id": 1002, "essay_text": "middle organized evidence", "domain1_score": 7},
+        {"essay_id": 1003, "essay_text": "weak vague limited", "domain1_score": 2},
+    ]
+    cfg = {
+        "anchor_budget": {
+            "representation": {"mode": "tfidf", "token_cost_penalty": 0.0},
+            "retrieval_grounded_rep_v21": {
+                "per_band_top_n": 3,
+                "retrieval_weight": 0.9,
+                "representation_weight": 0.1,
+            },
+        }
+    }
+    _, trace = retrieval_grounded_stratified_rep_anchors_v21(
+        items, val, 3, 2, 12, cfg, "Rubric", backend=None, out_dir=tmp_path
+    )
+    assert trace[0]["retrieval_weight"] == pytest.approx(0.9)
+    assert trace[0]["representation_weight"] == pytest.approx(0.1)
+
+
+def test_retrieval_grounded_v21_fallback_margin_blocks_small_rep_gain(tmp_path):
+    class FakeBackend:
+        def encode_scoring_context(self, **kwargs):
+            text = kwargs.get("essay_text", "")
+            if "repbest" in text:
+                return torch.tensor([1.0, 0.0], dtype=torch.float32)
+            return torch.tensor([0.0, 1.0], dtype=torch.float32)
+
+    items = [
+        {"essay_id": 1, "essay_text": "retrieval anchor low", "domain1_score": 2},
+        {"essay_id": 2, "essay_text": "repbest anchor low", "domain1_score": 2},
+    ]
+    val = [{"essay_id": 1001, "essay_text": "retrieval repbest validation", "domain1_score": 2}]
+    cfg = {
+        "anchor_budget": {
+            "representation": {"mode": "local_hidden", "token_cost_penalty": 0.0},
+            "retrieval_grounded_rep_v21": {
+                "per_band_top_n": 2,
+                "retrieval_weight": 0.0,
+                "representation_weight": 1.0,
+                "fallback_margin": 999.0,
+                "max_rep_replacements": 3,
+            },
+        }
+    }
+    _, trace = retrieval_grounded_stratified_rep_anchors_v21(
+        items, val, 1, 2, 12, cfg, "Rubric", backend=FakeBackend(), out_dir=tmp_path
+    )
+    assert trace[0]["retrieval_rank"] == 1
+    assert trace[0]["fallback_to_retrieval"] is True
+    assert trace[0]["fallback_reason"] == "small_rerank_margin"
+
+
+def test_retrieval_grounded_v21_max_rep_replacements_is_enforced(tmp_path):
+    class FakeBackend:
+        def encode_scoring_context(self, **kwargs):
+            text = kwargs.get("essay_text", "")
+            if "repbest" in text:
+                return torch.tensor([1.0, 0.0], dtype=torch.float32)
+            return torch.tensor([0.0, 1.0], dtype=torch.float32)
+
+    items = [
+        {"essay_id": 1, "essay_text": "retrieval low a", "domain1_score": 2},
+        {"essay_id": 2, "essay_text": "repbest low b", "domain1_score": 2},
+        {"essay_id": 3, "essay_text": "retrieval mid a", "domain1_score": 7},
+        {"essay_id": 4, "essay_text": "repbest mid b", "domain1_score": 7},
+        {"essay_id": 5, "essay_text": "retrieval high a", "domain1_score": 12},
+        {"essay_id": 6, "essay_text": "repbest high b", "domain1_score": 12},
+    ]
+    val = [{"essay_id": 1001, "essay_text": "retrieval repbest validation", "domain1_score": 7}]
+    cfg = {
+        "anchor_budget": {
+            "representation": {"mode": "local_hidden", "token_cost_penalty": 0.0},
+            "retrieval_grounded_rep_v21": {
+                "per_band_top_n": 2,
+                "retrieval_weight": 0.0,
+                "representation_weight": 1.0,
+                "fallback_margin": -1.0,
+                "max_rep_replacements": 1,
+            },
+        }
+    }
+    _, trace = retrieval_grounded_stratified_rep_anchors_v21(
+        items, val, 3, 2, 12, cfg, "Rubric", backend=FakeBackend(), out_dir=tmp_path
+    )
+    assert sum(bool(row["selected_by_rep_rerank"]) for row in trace) <= 1
+    assert all(row["max_rep_replacements"] == 1 for row in trace)
+    assert any(row["fallback_reason"] == "max_rep_replacements_reached" for row in trace)
+
+
+def test_retrieval_grounded_v21_band_quota_and_no_test_leakage(tmp_path):
+    items = _toy_items()
+    test_ids = {9001, 9002}
+    val = [
+        {"essay_id": 1001, "essay_text": "excellent evidence organization language sophisticated", "domain1_score": 12},
+        {"essay_id": 1002, "essay_text": "middle organized evidence", "domain1_score": 7},
+        {"essay_id": 1003, "essay_text": "weak vague limited", "domain1_score": 2},
+    ]
+    cfg = {
+        "anchor_budget": {
+            "representation": {"mode": "tfidf", "token_cost_penalty": 0.0},
+            "retrieval_grounded_rep_v21": {"per_band_top_n": 3},
+        }
+    }
+    anchors, trace = retrieval_grounded_stratified_rep_anchors_v21(
+        items, val, 9, 2, 12, cfg, "Rubric", backend=None, out_dir=tmp_path
+    )
+    assert len(anchors) == 9
+    bands = [row["requested_band"] for row in trace]
+    assert bands.count("low") == 3
+    assert bands.count("mid") == 3
+    assert bands.count("high") == 3
+    assert not ({a.essay_id for a in anchors} & test_ids)
+
+
+def test_retrieval_grounded_v21_logging_fields_exist(tmp_path):
+    items = _toy_items()
+    val = [
+        {"essay_id": 1001, "essay_text": "excellent evidence organization language sophisticated", "domain1_score": 12},
+        {"essay_id": 1002, "essay_text": "middle organized evidence", "domain1_score": 7},
+        {"essay_id": 1003, "essay_text": "weak vague limited", "domain1_score": 2},
+    ]
+    cfg = {"anchor_budget": {"representation": {"mode": "tfidf"}}}
+    _, trace = retrieval_grounded_stratified_rep_anchors_v21(
+        items, val, 3, 2, 12, cfg, "Rubric", backend=None, out_dir=tmp_path
+    )
+    required = {
+        "anchor_id",
+        "score",
+        "band",
+        "retrieval_rank",
+        "retrieval_score",
+        "representation_score",
+        "combined_score",
+        "selected_by_rep_rerank",
+        "fallback_to_retrieval",
+        "fallback_reason",
+        "replacement_index",
+        "max_rep_replacements",
+        "margin_to_retrieval_top",
+        "redundancy_score",
+        "token_length",
     }
     assert required <= set(trace[0])
 

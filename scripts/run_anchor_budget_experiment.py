@@ -769,17 +769,35 @@ def retrieval_grounded_stratified_rep_anchors(
     instruction: str,
     backend: Optional[LocalLlamaBackend],
     out_dir: Path,
+    variant: str = "v2",
 ) -> Tuple[List[AnchorRecord], List[Dict[str, Any]]]:
-    rg_cfg = config.get("anchor_budget", {}).get("retrieval_grounded_rep", {})
+    if variant == "v21":
+        rg_cfg = config.get("anchor_budget", {}).get(
+            "retrieval_grounded_rep_v21",
+            config.get("anchor_budget", {}).get("retrieval_grounded_rep", {}),
+        )
+        default_retrieval_weight = 0.8
+        default_representation_weight = 0.2
+        default_fallback_margin = 0.05
+        default_max_rep_replacements = min(3, max(0, k))
+        reason_prefix = "retrieval_grounded_rep_v21"
+    else:
+        rg_cfg = config.get("anchor_budget", {}).get("retrieval_grounded_rep", {})
+        default_retrieval_weight = 0.6
+        default_representation_weight = 0.4
+        default_fallback_margin = 0.03
+        default_max_rep_replacements = max(0, k)
+        reason_prefix = "retrieval_grounded_rep"
     rep_cfg = config.get("anchor_budget", {}).get("representation", {})
     mode = str(rep_cfg.get("mode", "tfidf"))
     per_band_top_n = max(1, int(rg_cfg.get("per_band_top_n", 5)))
-    retrieval_weight = float(rg_cfg.get("retrieval_weight", 0.6))
-    representation_weight = float(rg_cfg.get("representation_weight", 0.4))
+    retrieval_weight = float(rg_cfg.get("retrieval_weight", default_retrieval_weight))
+    representation_weight = float(rg_cfg.get("representation_weight", default_representation_weight))
     coverage_bonus = float(rg_cfg.get("coverage_bonus", 0.1))
     redundancy_weight = float(rg_cfg.get("redundancy_weight", 0.2))
     token_weight = float(rg_cfg.get("token_weight", rep_cfg.get("token_cost_penalty", 0.02)))
-    fallback_epsilon = float(rg_cfg.get("fallback_epsilon", 0.03))
+    fallback_margin = float(rg_cfg.get("fallback_margin", rg_cfg.get("fallback_epsilon", default_fallback_margin)))
+    max_rep_replacements = max(0, int(rg_cfg.get("max_rep_replacements", default_max_rep_replacements)))
 
     if k <= 0 or not train:
         return [], []
@@ -857,6 +875,7 @@ def retrieval_grounded_stratified_rep_anchors(
     selected: List[Dict[str, Any]] = []
     used_ids: set[int] = set()
     trace: List[Dict[str, Any]] = []
+    rep_replacements_used = 0
 
     for band in ["low", "mid", "high"]:
         quota = quotas.get(band, 0)
@@ -902,13 +921,30 @@ def retrieval_grounded_stratified_rep_anchors(
             )[0]
             top_retrieval_scored = next(x for x in scored_pool if int(x["essay_id"]) == int(top_retrieval["essay_id"]))
             use_retrieval_fallback = False
-            selected_reason = "retrieval_grounded_rep: representation rerank within retrieval top-n"
+            fallback_reason = ""
+            margin_to_retrieval_top = float(best_combined["combined_score"]) - float(top_retrieval_scored["combined_score"])
+            selected_by_rep = int(best_combined["essay_id"]) != int(top_retrieval_scored["essay_id"])
+            replacement_index = 0
+            selected_reason = f"{reason_prefix}: retrieval-first selection"
             if int(best_combined["essay_id"]) != int(top_retrieval_scored["essay_id"]):
-                margin = float(best_combined["combined_score"]) - float(top_retrieval_scored["combined_score"])
-                if margin <= fallback_epsilon:
+                if margin_to_retrieval_top <= fallback_margin:
                     best_combined = top_retrieval_scored
                     use_retrieval_fallback = True
-                    selected_reason = "retrieval_grounded_rep: fallback to retrieval top because rerank margin was small"
+                    selected_by_rep = False
+                    fallback_reason = "small_rerank_margin"
+                    replacement_index = 0
+                    selected_reason = f"{reason_prefix}: fallback to retrieval top because rerank margin was small"
+                elif rep_replacements_used >= max_rep_replacements:
+                    best_combined = top_retrieval_scored
+                    use_retrieval_fallback = True
+                    selected_by_rep = False
+                    fallback_reason = "max_rep_replacements_reached"
+                    replacement_index = 0
+                    selected_reason = f"{reason_prefix}: fallback to retrieval top because replacement cap was reached"
+                else:
+                    rep_replacements_used += 1
+                    replacement_index = rep_replacements_used
+                    selected_reason = f"{reason_prefix}: representation rerank within retrieval top-n"
 
             selected.append(best_combined)
             used_ids.add(int(best_combined["essay_id"]))
@@ -930,8 +966,18 @@ def retrieval_grounded_stratified_rep_anchors(
                     "redundancy_score": float(best_combined["redundancy_score"]),
                     "token_length": token_len(best_combined["item"]["essay_text"]),
                     "selected_reason": selected_reason,
-                    "whether_selected_by_rep_rerank": int(best_combined["retrieval_rank"]) != 1,
+                    "selected_by_rep_rerank": selected_by_rep,
+                    "whether_selected_by_rep_rerank": selected_by_rep,
+                    "fallback_to_retrieval": use_retrieval_fallback,
                     "whether_fallback_to_retrieval": use_retrieval_fallback,
+                    "fallback_reason": fallback_reason,
+                    "replacement_index": replacement_index,
+                    "num_rep_replacements": rep_replacements_used,
+                    "max_rep_replacements": max_rep_replacements,
+                    "margin_to_retrieval_top": margin_to_retrieval_top,
+                    "fallback_margin": fallback_margin,
+                    "retrieval_weight": retrieval_weight,
+                    "representation_weight": representation_weight,
                     "retrieval_candidate_ids_in_band": best_combined["retrieval_candidate_ids_in_band"],
                     "selection_parts": {
                         "normalized_retrieval_score": float(best_combined.get("normalized_retrieval_score", 0.0)),
@@ -941,7 +987,6 @@ def retrieval_grounded_stratified_rep_anchors(
                         "token_cost_penalty": float(best_combined["token_cost_penalty"]),
                     },
                     "representation_mode": mode,
-                    "fallback_reason": "small_rerank_margin" if use_retrieval_fallback else "",
                 }
             )
             if len(selected) >= k:
@@ -972,9 +1017,18 @@ def retrieval_grounded_stratified_rep_anchors(
                     "combined_score": float(row.get("combined_score", row["retrieval_score"])),
                     "redundancy_score": 0.0,
                     "token_length": token_len(row["item"]["essay_text"]),
-                    "selected_reason": "retrieval_grounded_rep: fallback fill after quota underflow",
+                    "selected_reason": f"{reason_prefix}: fallback fill after quota underflow",
+                    "selected_by_rep_rerank": False,
                     "whether_selected_by_rep_rerank": False,
+                    "fallback_to_retrieval": True,
                     "whether_fallback_to_retrieval": True,
+                    "replacement_index": 0,
+                    "num_rep_replacements": rep_replacements_used,
+                    "max_rep_replacements": max_rep_replacements,
+                    "margin_to_retrieval_top": 0.0,
+                    "fallback_margin": fallback_margin,
+                    "retrieval_weight": retrieval_weight,
+                    "representation_weight": representation_weight,
                     "retrieval_candidate_ids_in_band": row["retrieval_candidate_ids_in_band"],
                     "selection_parts": {},
                     "representation_mode": mode,
@@ -992,12 +1046,28 @@ def retrieval_grounded_stratified_rep_anchors(
             token_length=token_len(row["item"]["essay_text"]),
             source_split="train",
             selection_score=float(row.get("combined_score", row.get("retrieval_score", 0.0))),
-            selection_reason=f"retrieval_grounded_stratified_rep:{mode}",
+            selection_reason=f"{reason_prefix}_stratified:{mode}",
             essay_text=row["item"]["essay_text"],
         )
         for row in selected[:k]
     ]
     return anchors, trace
+
+
+def retrieval_grounded_stratified_rep_anchors_v21(
+    train: Sequence[Dict],
+    val: Sequence[Dict],
+    k: int,
+    score_min: int,
+    score_max: int,
+    config: Dict[str, Any],
+    instruction: str,
+    backend: Optional[LocalLlamaBackend],
+    out_dir: Path,
+) -> Tuple[List[AnchorRecord], List[Dict[str, Any]]]:
+    return retrieval_grounded_stratified_rep_anchors(
+        train, val, k, score_min, score_max, config, instruction, backend, out_dir, variant="v21"
+    )
 
 
 def stratified_rep_guided_anchors(
@@ -1164,6 +1234,21 @@ def build_anchor_bank(
             "redundancy_penalty",
             mode,
         ]
+    if method == "retrieval_grounded_stratified_rep_k_anchor_v21":
+        anchors, trace = retrieval_grounded_stratified_rep_anchors_v21(
+            train, val, int(k or 0), score_min, score_max, config, instruction, backend, out_dir
+        )
+        retrieval_ids = [x.essay_id for x in retrieval_anchors(train, val, int(k or 0), score_min, score_max)]
+        rep_ids = [x.essay_id for x in anchors]
+        mode = str(config.get("anchor_budget", {}).get("representation", {}).get("mode", "tfidf"))
+        return anchors, trace, rep_ids != retrieval_ids, [
+            "score_band_quota",
+            "retrieval_top_n",
+            "conservative_representation_rerank",
+            "replacement_cap",
+            "redundancy_penalty",
+            mode,
+        ]
     if method == "full_static_anchor":
         per_score = int(config.get("anchor_budget", {}).get("full_static_per_score", 3))
         anchors = full_static_anchors(train, score_min, score_max, per_score)
@@ -1211,7 +1296,12 @@ REQUIRED_RUN_FILES = [
 
 def is_run_complete(run_dir: Path, method: str) -> bool:
     required = list(REQUIRED_RUN_FILES)
-    if method in {"representation_guided_k_anchor", "stratified_rep_guided_k_anchor", "retrieval_grounded_stratified_rep_k_anchor"}:
+    if method in {
+        "representation_guided_k_anchor",
+        "stratified_rep_guided_k_anchor",
+        "retrieval_grounded_stratified_rep_k_anchor",
+        "retrieval_grounded_stratified_rep_k_anchor_v21",
+    }:
         required.extend(["representation_anchor_scores.csv", "representation_selection_trace.jsonl"])
     return all((run_dir / name).exists() for name in required)
 
@@ -1326,7 +1416,12 @@ def run_one(
     )
     trace_path = out_dir / "anchor_selection_trace.jsonl"
     write_jsonl(trace_path, trace)
-    if method in {"representation_guided_k_anchor", "stratified_rep_guided_k_anchor", "retrieval_grounded_stratified_rep_k_anchor"}:
+    if method in {
+        "representation_guided_k_anchor",
+        "stratified_rep_guided_k_anchor",
+        "retrieval_grounded_stratified_rep_k_anchor",
+        "retrieval_grounded_stratified_rep_k_anchor_v21",
+    }:
         write_jsonl(out_dir / "representation_selection_trace.jsonl", trace)
         write_csv(out_dir / "representation_anchor_scores.csv", trace)
     bank = AnchorBank(
