@@ -26,6 +26,15 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from pace.llm_backend import LocalLlamaBackend, ScoringRequest  # noqa: E402
+from scripts.bapr_repair import (  # noqa: E402
+    compute_failure_profile,
+    generate_repaired_children,
+    guarded_select_repaired_bank,
+    metrics_with_anchor_stats,
+    rank_repair_operators,
+    split_val_diag_sel,
+    stable_hash as bapr_stable_hash,
+)
 from wise_aes import (  # noqa: E402
     PromptIndividual,
     _adaptive_high_score_threshold,
@@ -1351,6 +1360,18 @@ REQUIRED_RUN_FILES = [
 
 def is_run_complete(run_dir: Path, method: str) -> bool:
     required = list(REQUIRED_RUN_FILES)
+    if method == "bapr_repair_k_anchor":
+        required.extend(
+            [
+                "bapr_failure_profile.json",
+                "bapr_repair_candidates.jsonl",
+                "bapr_guarded_selection.csv",
+                "bapr_parent_anchor_bank.json",
+                "bapr_parent_metrics.json",
+                "bapr_final_anchor_bank.json",
+                "bapr_repair_trace.jsonl",
+            ]
+        )
     if method in {
         "representation_guided_k_anchor",
         "stratified_rep_guided_k_anchor",
@@ -1410,13 +1431,31 @@ def read_json(path: Path) -> Dict[str, Any]:
 
 
 def score_items(
-    backend: LocalLlamaBackend,
+    backend: Optional[LocalLlamaBackend],
     items: Sequence[Dict],
     instruction: str,
     anchors: Sequence[AnchorRecord],
     score_min: int,
     score_max: int,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+    if backend is None:
+        rows = []
+        for item in items:
+            gold = int(item["domain1_score"])
+            # Deterministic fake scorer for smoke tests. It exercises IO and repair
+            # control flow without loading or calling the LLM.
+            pred = max(score_min, min(score_max, gold))
+            rows.append(
+                {
+                    "essay_id": int(item["essay_id"]),
+                    "gold_score": gold,
+                    "pred_score": pred,
+                    "raw_text": '{"final_score": %d, "fake_scoring": true}' % pred,
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                }
+            )
+        return rows, {"prompt_tokens": 0, "completion_tokens": 0, "representation_tokens": 0}
     before = backend.usage_snapshot()
     prompt_anchors = [a.to_prompt_example() for a in anchors]
     rows = []
@@ -1446,6 +1485,281 @@ def score_items(
     return rows, backend.usage_delta(before)
 
 
+def anchor_record_to_bapr(anchor: AnchorRecord) -> Dict[str, Any]:
+    return {
+        "essay_id": int(anchor.essay_id),
+        "gold_score": int(anchor.gold_score),
+        "prompt_id": int(anchor.prompt_id),
+        "token_length": int(anchor.token_length),
+        "source_split": anchor.source_split,
+        "selection_score": float(anchor.selection_score),
+        "selection_reason": anchor.selection_reason,
+        "essay_text": anchor.essay_text,
+    }
+
+
+def bapr_to_anchor_record(row: Dict[str, Any]) -> AnchorRecord:
+    return AnchorRecord(
+        essay_id=int(row["essay_id"]),
+        gold_score=int(row["gold_score"]),
+        prompt_id=int(row.get("prompt_id", 0)),
+        token_length=int(row.get("token_length", token_len(row.get("essay_text", "")))),
+        source_split=str(row.get("source_split", "train")),
+        selection_score=float(row.get("selection_score", 0.0)),
+        selection_reason=str(row.get("selection_reason", "bapr")),
+        essay_text=str(row.get("essay_text", "")),
+    )
+
+
+def bapr_anchor_bank_payload(
+    *,
+    method: str,
+    k: int,
+    anchors: Sequence[Dict[str, Any]],
+    score_min: int,
+    score_max: int,
+    prompt_id: int,
+    split_hashes: Dict[str, Any],
+    operator: str,
+    parent_anchor_bank_id: str,
+    trace_path: Path,
+) -> Dict[str, Any]:
+    anchor_ids = [int(a["essay_id"]) for a in anchors]
+    payload = {
+        "anchor_bank_id": bapr_stable_hash(
+            {
+                "method": method,
+                "prompt_id": prompt_id,
+                "split_hashes": split_hashes,
+                "k": k,
+                "ordered_anchor_ids": anchor_ids,
+                "operator": operator,
+                "parent_anchor_bank_id": parent_anchor_bank_id,
+            }
+        ),
+        "method": method,
+        "k": int(k),
+        "anchor_ids": anchor_ids,
+        "anchor_scores": [int(a["gold_score"]) for a in anchors],
+        "score_coverage": score_coverage([bapr_to_anchor_record(a) for a in anchors], score_min, score_max),
+        "token_cost": sum(int(a.get("token_length", token_len(a.get("essay_text", "")))) for a in anchors),
+        "score_range": [score_min, score_max],
+        "selection_trace_path": str(trace_path),
+        "operator": operator,
+        "parent_anchor_bank_id": parent_anchor_bank_id,
+    }
+    return payload
+
+
+def run_bapr_one(
+    *,
+    method: str,
+    k: int,
+    config: Dict[str, Any],
+    fold: int,
+    seed: int,
+    train: Sequence[Dict],
+    val: Sequence[Dict],
+    test: Sequence[Dict],
+    instruction: str,
+    backend: Optional[LocalLlamaBackend],
+    root_out: Path,
+    split_hashes: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    score_min = int(config["data"]["score_min"])
+    score_max = int(config["data"]["score_max"])
+    prompt_id = int(config["data"]["essay_set"])
+    run_name = run_name_for(method, k)
+    out_dir = root_out / run_name
+    out_dir.mkdir(parents=True, exist_ok=True)
+    with open(out_dir / "config.yaml", "w", encoding="utf-8") as f:
+        yaml.safe_dump(config, f, sort_keys=False, allow_unicode=True)
+
+    val_diag, val_sel, split_meta = split_val_diag_sel(
+        val,
+        score_min,
+        score_max,
+        float(config.get("bapr", {}).get("val_diag_ratio", 0.5)),
+    )
+    write_json(out_dir / "bapr_val_split.json", split_meta)
+    forbidden_ids = {int(x["essay_id"]) for x in val_diag} | {int(x["essay_id"]) for x in val_sel} | {int(x["essay_id"]) for x in test}
+
+    parent_records, parent_trace = retrieval_grounded_stratified_rep_anchors_v21(
+        train, val_diag, int(k), score_min, score_max, config, instruction, backend, out_dir
+    )
+    parent_anchors = [anchor_record_to_bapr(a) for a in parent_records]
+    parent_trace_path = out_dir / "anchor_selection_trace.jsonl"
+    write_jsonl(parent_trace_path, parent_trace)
+    parent_bank = bapr_anchor_bank_payload(
+        method="BAPR-A0",
+        k=int(k),
+        anchors=parent_anchors,
+        score_min=score_min,
+        score_max=score_max,
+        prompt_id=prompt_id,
+        split_hashes={**(split_hashes or {}), **split_meta},
+        operator="PARENT",
+        parent_anchor_bank_id="",
+        trace_path=parent_trace_path,
+    )
+    write_json(out_dir / "bapr_parent_anchor_bank.json", parent_bank)
+
+    diag_rows, diag_usage = score_items(backend, val_diag, instruction, parent_records, score_min, score_max)
+    failure_profile = compute_failure_profile(
+        [r["gold_score"] for r in diag_rows],
+        [r["pred_score"] for r in diag_rows],
+        parent_anchors,
+        score_min,
+        score_max,
+        parent_trace,
+    )
+    write_json(out_dir / "bapr_failure_profile.json", failure_profile)
+    ranked = rank_repair_operators(failure_profile)
+    children, repair_trace = generate_repaired_children(
+        parent_anchors,
+        train,
+        val_diag,
+        failure_profile,
+        ranked,
+        score_min,
+        score_max,
+        int(k),
+        forbidden_ids=forbidden_ids,
+        max_children=int(config.get("bapr", {}).get("max_children", 3)),
+    )
+    write_jsonl(out_dir / "bapr_repair_trace.jsonl", repair_trace)
+    write_jsonl(out_dir / "bapr_repair_candidates.jsonl", children)
+
+    parent_sel_rows, parent_sel_usage = score_items(backend, val_sel, instruction, parent_records, score_min, score_max)
+    parent_metrics = metrics_with_anchor_stats(
+        [r["gold_score"] for r in parent_sel_rows],
+        [r["pred_score"] for r in parent_sel_rows],
+        parent_anchors,
+        score_min,
+        score_max,
+    )
+    write_json(out_dir / "bapr_parent_metrics.json", parent_metrics)
+    child_metrics_list = []
+    for child in children:
+        child_records = [bapr_to_anchor_record(a) for a in child["anchors"]]
+        rows, _ = score_items(backend, val_sel, instruction, child_records, score_min, score_max)
+        metrics = metrics_with_anchor_stats(
+            [r["gold_score"] for r in rows],
+            [r["pred_score"] for r in rows],
+            child["anchors"],
+            score_min,
+            score_max,
+        )
+        child_metrics_list.append(metrics)
+
+    guard = guarded_select_repaired_bank(parent_metrics, child_metrics_list, parent_bank, children, config)
+    write_csv(out_dir / "bapr_guarded_selection.csv", guard["selection_rows"])
+    selected_bank = guard["selected_anchor_bank"]
+    final_anchors = parent_anchors if selected_bank.get("candidate_id") is None else selected_bank.get("anchors", parent_anchors)
+    if selected_bank.get("anchor_ids") == parent_bank["anchor_ids"]:
+        final_anchors = parent_anchors
+    final_records = [bapr_to_anchor_record(a) for a in final_anchors]
+    final_trace_path = out_dir / "bapr_repair_trace.jsonl"
+    final_bank = bapr_anchor_bank_payload(
+        method="BAPR-A*",
+        k=int(k),
+        anchors=final_anchors,
+        score_min=score_min,
+        score_max=score_max,
+        prompt_id=prompt_id,
+        split_hashes={**(split_hashes or {}), **split_meta},
+        operator=str(selected_bank.get("operator", "PARENT")),
+        parent_anchor_bank_id=parent_bank["anchor_bank_id"],
+        trace_path=final_trace_path,
+    )
+    final_bank["selected_reason"] = guard["selected_reason"]
+    write_json(out_dir / "bapr_final_anchor_bank.json", final_bank)
+
+    write_json(out_dir / "anchor_bank.json", final_bank)
+    write_json(
+        out_dir / "anchor_metrics.json",
+        {
+            **final_bank,
+            "anchor_count": len(final_records),
+            "average_anchor_length": float(np.mean([a.token_length for a in final_records])) if final_records else 0.0,
+            "selected_anchors": [asdict(a) for a in final_records],
+            "anchor_replacement_count": sum(1 for a, b in zip(parent_bank["anchor_ids"], final_bank["anchor_ids"]) if a != b),
+        },
+    )
+
+    t0 = time.time()
+    final_sel_rows, final_sel_usage = score_items(backend, val_sel, instruction, final_records, score_min, score_max)
+    test_rows, test_usage = score_items(backend, test, instruction, final_records, score_min, score_max)
+    runtime = time.time() - t0
+    pred_rows = [{"split": "val_diag_parent", **row} for row in diag_rows]
+    pred_rows.extend({"split": "val_sel_final", **row} for row in final_sel_rows)
+    pred_rows.extend({"split": "test", **row} for row in test_rows)
+    write_csv(out_dir / "predictions.csv", pred_rows)
+    write_csv(out_dir / "test_predictions.csv", [row for row in pred_rows if row["split"] == "test"])
+
+    val_metrics = guard["selected_metrics"]
+    test_metrics = score_boundary_metrics(
+        [r["gold_score"] for r in test_rows],
+        [r["pred_score"] for r in test_rows],
+        score_min,
+        score_max,
+    )
+    write_json(out_dir / "score_boundary_metrics.json", {"val": val_metrics, "test": test_metrics})
+    dist_rows = []
+    for split, metrics in [("val_sel", val_metrics), ("test", test_metrics)]:
+        for score in range(score_min, score_max + 1):
+            dist_rows.append(
+                {
+                    "split": split,
+                    "score": score,
+                    "gold_count": metrics["gold_distribution"].get(str(score), 0) if "gold_distribution" in metrics else None,
+                    "pred_count": metrics["prediction_distribution"].get(str(score), 0) if "prediction_distribution" in metrics else None,
+                    "per_score_recall": None,
+                }
+            )
+    write_csv(out_dir / "prediction_distribution.csv", dist_rows)
+    usage = {
+        key: int(
+            diag_usage.get(key, 0)
+            + parent_sel_usage.get(key, 0)
+            + final_sel_usage.get(key, 0)
+            + test_usage.get(key, 0)
+        )
+        for key in set(diag_usage) | set(parent_sel_usage) | set(final_sel_usage) | set(test_usage)
+    }
+    total_tokens = int(usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0) + usage.get("representation_tokens", 0))
+    summary = {
+        "method": method,
+        "k": int(k),
+        "exp_dir": str(out_dir),
+        "val_qwk": float(val_metrics.get("qwk", 0.0) or 0.0),
+        "test_qwk": test_metrics["qwk"],
+        "mae": test_metrics["mae"],
+        "high_recall": test_metrics["high_recall"],
+        "max_recall": test_metrics["max_recall"],
+        "SCI": test_metrics["score_compression_index"],
+        "range_coverage": test_metrics["range_coverage"],
+        "score_TV": test_metrics["score_tv"],
+        "tokens": total_tokens,
+        "runtime_sec": runtime,
+        "anchor_count": len(final_records),
+        "anchor_token_cost": final_bank["token_cost"],
+        "representation_changed_anchor_choice": final_bank["anchor_ids"] != parent_bank["anchor_ids"],
+        "representation_features_used": ["bapr_repair", "score_boundary_diagnostics"],
+        "bapr_selected_reason": guard["selected_reason"],
+        "resumed_from_existing_outputs": False,
+    }
+    write_json(out_dir / "run_summary.json", summary)
+    (out_dir / "summary.md").write_text(
+        "# Summary\n\n"
+        "## Goal\nBAPR one-step anchor-bank repair under fixed instruction and fixed raw LLM scoring.\n\n"
+        f"## Results\n- selected reason: {guard['selected_reason']}\n"
+        f"- val_sel QWK: {summary['val_qwk']:.4f}\n- raw test QWK: {summary['test_qwk']:.4f}\n",
+        encoding="utf-8",
+    )
+    return summary
+
+
 def run_one(
     *,
     method: str,
@@ -1457,9 +1771,28 @@ def run_one(
     val: Sequence[Dict],
     test: Sequence[Dict],
     instruction: str,
-    backend: LocalLlamaBackend,
+    backend: Optional[LocalLlamaBackend],
     root_out: Path,
+    split_hashes: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
+    if method == "bapr_repair_k_anchor":
+        if k is None:
+            raise ValueError("bapr_repair_k_anchor requires an explicit k value")
+        return run_bapr_one(
+            method=method,
+            k=int(k),
+            config=config,
+            fold=fold,
+            seed=seed,
+            train=train,
+            val=val,
+            test=test,
+            instruction=instruction,
+            backend=backend,
+            root_out=root_out,
+            split_hashes=split_hashes,
+        )
+
     score_min = int(config["data"]["score_min"])
     score_max = int(config["data"]["score_max"])
     run_name = run_name_for(method, k)
@@ -1591,11 +1924,14 @@ def main() -> None:
     parser.add_argument("--output-root", default=None, help="Reuse an existing experiment root and resume incomplete runs.")
     parser.add_argument("--split_manifest", default=None, help="Use fixed train/val/test essay IDs from a split manifest JSON.")
     parser.add_argument("--no-resume-existing", action="store_true", help="Recompute runs even if required outputs already exist.")
+    parser.add_argument("--fake-scoring", action="store_true", help="Use deterministic fake scores and do not load the local LLM.")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
     config_path = Path(args.config)
     config = load_config(config_path)
+    if args.fake_scoring:
+        config["fake_scoring"] = True
     seed = int(config.get("debug", {}).get("seed", 42 + args.fold))
     random.seed(seed)
     np.random.seed(seed)
@@ -1631,12 +1967,16 @@ def main() -> None:
         print(json.dumps({"output_root": str(out_root), "plan": plan, "split": split_hashes}, ensure_ascii=False, indent=2))
         return
 
-    backend = LocalLlamaBackend(
-        config=config,
-        model_path=config.get("pace", {}).get("model_path", config.get("model", {}).get("name")),
-        dtype=config.get("pace", {}).get("dtype", "bfloat16"),
-        load_in_4bit=bool(config.get("pace", {}).get("load_in_4bit", False)),
-    )
+    if args.fake_scoring:
+        backend: Optional[LocalLlamaBackend] = None
+        print("[AnchorBudget] Fake scoring enabled; local LLM will not be loaded.")
+    else:
+        backend = LocalLlamaBackend(
+            config=config,
+            model_path=config.get("pace", {}).get("model_path", config.get("model", {}).get("name")),
+            dtype=config.get("pace", {}).get("dtype", "bfloat16"),
+            load_in_4bit=bool(config.get("pace", {}).get("load_in_4bit", False)),
+        )
     summaries = []
     for method, k in plan:
         run_dir = out_root / run_name_for(method, k)
@@ -1658,21 +1998,23 @@ def main() -> None:
                 instruction=instruction,
                 backend=backend,
                 root_out=out_root,
+                split_hashes=split_hashes,
             )
         )
     write_csv(out_root / "phase1_comparison_table.csv", summaries)
     write_curve_files(out_root, summaries)
-    decision = phase1_decision(summaries)
-    (out_root / "new_mainline_phase1_anchor_budget_summary.md").write_text(
-        render_phase1_summary(config, args.fold, out_root, summaries, decision),
-        encoding="utf-8",
-    )
     logs_dir = Path("logs")
     logs_dir.mkdir(exist_ok=True)
-    (logs_dir / "new_mainline_phase1_anchor_budget_summary.md").write_text(
-        render_phase1_summary(config, args.fold, out_root, summaries, decision),
-        encoding="utf-8",
-    )
+    if any(row["method"] == "bapr_repair_k_anchor" for row in summaries):
+        decision = bapr_decision(summaries)
+        summary_text = render_bapr_summary(config, args.fold, out_root, summaries, decision)
+        (out_root / "bapr_v1_summary.md").write_text(summary_text, encoding="utf-8")
+        (logs_dir / "bapr_v1_summary.md").write_text(summary_text, encoding="utf-8")
+    else:
+        decision = phase1_decision(summaries)
+        summary_text = render_phase1_summary(config, args.fold, out_root, summaries, decision)
+        (out_root / "new_mainline_phase1_anchor_budget_summary.md").write_text(summary_text, encoding="utf-8")
+        (logs_dir / "new_mainline_phase1_anchor_budget_summary.md").write_text(summary_text, encoding="utf-8")
     print(f"[AnchorBudget] Output root: {out_root}")
     print(f"[AnchorBudget] Decision: {decision['decision']} - {decision['reason']}")
 
@@ -1725,6 +2067,20 @@ def phase1_decision(rows: Sequence[Dict[str, Any]]) -> Dict[str, str]:
     return {"decision": "FAIL", "reason": "representation-guided anchors did not beat same-budget baselines"}
 
 
+def bapr_decision(rows: Sequence[Dict[str, Any]]) -> Dict[str, str]:
+    bapr_rows = [row for row in rows if row["method"] == "bapr_repair_k_anchor"]
+    if not bapr_rows:
+        return {"decision": "NO_BAPR_RUNS", "reason": "no BAPR method rows were found"}
+    reasons = []
+    for row in bapr_rows:
+        selected = row.get("bapr_selected_reason", "")
+        reasons.append(f"k={row.get('k')}: {selected or 'completed'}")
+    return {
+        "decision": "BAPR_RUN_COMPLETE",
+        "reason": "; ".join(reasons),
+    }
+
+
 def render_phase1_summary(config: Dict[str, Any], fold: int, out_root: Path, rows: Sequence[Dict[str, Any]], decision: Dict[str, str]) -> str:
     commit = os.environ.get("WISE_PACE_COMMIT", "")
     lines = [
@@ -1768,6 +2124,51 @@ def render_phase1_summary(config: Dict[str, Any], fold: int, out_root: Path, row
             "## Decision\n",
             f"- {decision['decision']}: {decision['reason']}\n",
             f"- Can proceed: {'yes' if decision['decision'] == 'PASS' else 'no'}\n",
+        ]
+    )
+    return "".join(lines)
+
+
+def render_bapr_summary(config: Dict[str, Any], fold: int, out_root: Path, rows: Sequence[Dict[str, Any]], decision: Dict[str, str]) -> str:
+    commit = os.environ.get("WISE_PACE_COMMIT", "")
+    lines = [
+        "# BAPR v1 Summary\n\n",
+        "## Goal\n",
+        "Run boundary-aware one-step anchor-bank repair under a fixed instruction and fixed raw scoring model. "
+        "This summary does not apply the old representation-guided Phase 1 pass/fail logic.\n\n",
+        "## Setup\n",
+        f"- commit: `{commit}`\n",
+        f"- model: `{config.get('model', {}).get('name')}`\n",
+        f"- prompt / essay set: {config['data']['essay_set']}\n",
+        f"- fold: {fold}\n",
+        f"- seed: {config.get('debug', {}).get('seed')}\n",
+        f"- methods: {config.get('anchor_budget', {}).get('methods')}\n",
+        f"- k values: {config.get('anchor_budget', {}).get('k_values')}\n",
+        f"- fake_scoring: {bool(config.get('fake_scoring', False))}\n",
+        "- anchor pool: train split only; V_sel and test are excluded from repair candidates\n",
+        "- final_pace_calibrated: false\n",
+        "- test-time calibration: none\n\n",
+        "## Results Table\n",
+        "| method | k | val_sel_qwk | test_qwk | mae | high_recall | max_recall | SCI | range_coverage | score_TV | selected_reason | tokens | runtime_sec |\n",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|\n",
+    ]
+    for r in rows:
+        lines.append(
+            f"| {r['method']} | {r['k']} | {r['val_qwk']:.4f} | {r['test_qwk']:.4f} | "
+            f"{r['mae']:.4f} | {r['high_recall']:.4f} | {r['max_recall']:.4f} | "
+            f"{r['SCI']:.4f} | {r['range_coverage']:.4f} | {r['score_TV']:.4f} | "
+            f"{r.get('bapr_selected_reason', '')} | {r['tokens']} | {r['runtime_sec']:.1f} |\n"
+        )
+    lines.extend(
+        [
+            "\n## Required Outputs\n",
+            f"- combined output root: `{out_root}`\n",
+            "- each BAPR run writes `bapr_parent_anchor_bank.json`, `bapr_parent_metrics.json`, "
+            "`bapr_failure_profile.json`, `bapr_repair_candidates.jsonl`, "
+            "`bapr_guarded_selection.csv`, `bapr_final_anchor_bank.json`, and `bapr_repair_trace.jsonl`.\n\n",
+            "## Decision\n",
+            f"- {decision['decision']}: {decision['reason']}\n",
+            "- This is a pipeline validity decision only; it is not a full-fold or main-claim decision.\n",
         ]
     )
     return "".join(lines)
