@@ -1,462 +1,253 @@
-# WISE-PACE
+# Edu / WISE-AES
 
-WISE-PACE 是一个面向 LLM 自动作文评分（Automated Essay Scoring, AES）的研究原型。项目从 WISE-AES 出发，把原本主要依赖 raw validation QWK 的 prompt / anchor 进化，推进为 hidden-evidence diagnostic guided protocol evolution。
-
-当前研究目标不是训练一个 test-time 后处理校准器，而是寻找更好的评分协议：
+当前仓库已经从早期的 **WISE-PACE hidden-evidence protocol evolution** 收敛到新的研究主线：
 
 ```text
-P* = <I*, E*>
-
-I: scoring instruction / evolved rubric
-E: reference anchors / static exemplars
-M: local target LLM, also used for hidden representation extraction
+Representation-Guided Budgeted Anchor Protocol Repair for LLM-Based Essay Scoring
+简称：BAPR
 ```
 
-最终成功指标始终是目标 LLM 在 `<I*, E*>` 下直接输出的 raw score。PACE 只作为 protocol evolution 过程中的 hidden-evidence diagnostic / mutation guidance，不作为最终 test score。
-
-## 当前状态
-
-主线已经推进到 Phase 4：
-
-- 主实验路径使用本地 Llama backend，不再依赖 OpenRouter。
-- `M_score = M_hidden = M_meta = local Llama`。
-- `final_pace_calibrated` 默认保持 `false`。
-- selection 是 raw-first guarded selection。
-- mutation acceptance guard 已加入主配置：child protocol 只有在 validation-only 的 raw QWK / adjusted QWK / MAE / score distribution TV / high recall 不明显劣化时，才允许在选择中继续竞争。
-- PACE calibrated QWK 不作为主 selection reward，不作为最终 test 结果。
-- high-score / max-score audit、parent-child mutation audit、training curve、candidate comparison 已经落盘。
-- 新增 neural hidden evidence、dual-view anchor encoding、diagnostic-only PACE、staged validation、PACE-on-demand 和 protocol cache 基础设施。
-
-## 方法逻辑链
-
-WISE-PACE 当前按以下逻辑工作：
+核心问题不再是“anchors 是否有用”。已有工作 *Anchor Is the Key* 已经说明 full anchors 对 LLM-based AES 很强。我们现在研究的是：
 
 ```text
-1. 构造候选评分协议 P = <I, E>
-2. 用本地 LLM M 在 P 下直接给 validation essays 打 raw score
-3. 计算 raw validation QWK、MAE、score distribution、high/max recall
-4. 对 top / triggered candidates 抽取 scoring-context hidden states
-5. 用 hidden-anchor geometry 和 raw error pattern 生成 PACE diagnostics
-6. 根据 dominant ErrorType 选择 mutation policy
-7. 对 I 或 E 做受控 mutation
-8. 用 validation-only signals 选择下一代 elite
-9. 最终 test 前固定 primary candidate
-10. 在 test set 上只报告 raw LLM scoring 结果
+If anchors are the key, which anchors matter?
 ```
 
-核心原则：
+也就是：在固定本地 LLM、固定评分任务、有限 anchor budget `k` 下，如何选择和修复 anchor bank，使同一个 LLM 在最终测试时直接输出更好的 raw score。
+
+## 当前主线
+
+BAPR 的研究对象是一个评分协议：
 
 ```text
-PACE 可以指导 protocol evolution。
-PACE 不能替代 raw scoring。
-```
-
-这样可以避免方法退化成“WISE-AES 后面接一个强 calibrator”。我们真正想证明的是：hidden evidence 能帮助找到更好的 `I*` 和 `E*`，从而让目标 LLM 本身在该协议下打出更合理的分数。
-
-## Scoring-Context Encoding
-
-为了让 target essay 和 anchor essay 的 hidden representations 可比较，当前使用统一的 scoring-context encoding。
-
-Target essay：
-
-```text
-Scoring Instruction:
-<I>
-
-Score Range:
-<score_min>-<score_max>
-
-Reference Anchors:
-Score: <anchor_score>
-Essay: <anchor_essay>
-
-Essay to Represent:
-<x>
-
-Representation Target:
-Encode the essay to be scored.
-```
-
-Anchor essay 有两种 view：
-
-- text-only view：不输入 known score，用于表示 anchor 文本本身。
-- score-conditioned view：输入 known score，用于表示 score-conditioned reference anchor。
-
-neural evidence 支持：
-
-```text
-anchor_view: none / text / score / dual
-```
-
-dual view 同时使用 text-only anchor hidden 和 score-conditioned anchor hidden。
-
-## Evidence 设计
-
-当前支持两种 evidence mode：
-
-```text
-compact_manual
-neural_hidden
-```
-
-### compact_manual
-
-保留早期 compact evidence，包含 raw score、anchor-relative hidden geometry、reasoning text、objective / uncertainty / stability 等手工特征块。该模式主要用于兼容旧实验和 z-block ablation。
-
-### neural_hidden
-
-主线新增 `pace/neural_evidence.py`：
-
-```text
-target_hidden
-anchor_hidden_text
-anchor_hidden_score
-anchor_scores
-reasoning_hidden
-y_raw embedding
-```
-
-这些输入经过 frozen neural projection、target-to-anchor attention、block-preserving heads，输出固定维度的 `z_neural`。neural_hidden 模式不把 word count、keyword count、hedge count 等手工特征作为模型输入。
-
-当前 neural evidence 仍属于轻量诊断模块，不是最终评分器。它的主要用途是帮助 mutation routing 和 hidden-error attribution。
-
-## Mutation Policy
-
-PACE diagnostics 会映射到 mutation type：
-
-```text
-under_score_high_hidden      -> high_tail_instruction_mutation
-over_score_low_hidden        -> negative_constraint_mutation
-anchor_confusion             -> anchor_slot_mutation
-reasoning_score_contradiction -> score_mapping_mutation
-raw_collapse                 -> score_distribution_mutation
-boundary_ambiguity           -> boundary_clarification_mutation
-true max underprediction     -> max_score_contrastive_mutation
-general_error                -> general_reflection_mutation
-```
-
-当前启用 mutation diversity quota，避免所有 child 都变成 high-tail mutation。parent-child audit 会记录：
-
-- parent / child signature
-- parent / child raw QWK
-- parent / child high/max recall
-- parent / child MAE 和 score_distribution_tv
-- mutation_acceptance_status / mutation_acceptance_reasons
-- mutation_type / requested_mutation_type / actual_mutation_type
-- instruction_changed / anchors_changed
-- dominant_error_type_used
-- validation_stage 和 delta_comparable
-
-## 成本控制
-
-当前成本优化包括：
-
-- `llm.max_new_tokens_scoring`
-- `llm.max_new_tokens_reflection`
-- `llm.max_new_tokens_induction`
-- staged validation：mini / mid / full validation
-- mutation acceptance guard：用 parent-child validation deltas 阻止局部 QWK 改善但 MAE / 分布 / high recall 明显变差的 child 进入下一轮
-- PACE-on-demand trigger
-- protocol score cache
-- PACE result cache
-- diagnostic-only PACE，可跳过 calibrator
-
-关键配置：
-
-```yaml
-pace:
-  selection_influence: "diagnostic_only"
-  diagnostic_only_skip_calibrator: true
-  diagnostic_sample_size: 32
-  final_pace_calibrated: false
-```
-
-`diagnostic_only_skip_calibrator: true` 时，PACE 只计算 raw hidden-error diagnostics、anchor geometry 和 ErrorType，不训练 Coral calibrator，也不计算 calibrated test result。
-
-## 最新实验记录
-
-### P1 fold0 cost-aware gate
-
-Raw-only cost-aware gate：
-
-```text
-exp_dir: logs/exp_20260508_152214_fold0
-validation QWK: 0.2405
-raw test QWK: 0.3207
-high recall: 0.4444
-max recall: 1.0000
-runtime: 50.4 min
-tokens: 1.11M
-```
-
-WISE-PACE diagnostic-only gate：
-
-```text
-exp_dir: logs/exp_20260508_174135_fold0
-validation QWK: 0.3684
-raw test QWK: 0.3565
-raw test MAE: 1.1875
-high recall: 0.6111
-max recall: 0.0000
-runtime: 66.2 min
-tokens all: 2.05M
-PACE tokens: 0.89M
-```
-
-主要观察：
-
-- WISE-PACE gate 在 val QWK、test QWK、MAE、high recall 上均好于 raw-only gate。
-- 有效 child 来自 `boundary_clarification_mutation`，full-val raw QWK 相比 parent 提升约 `+0.128`。
-- max-score recall 仍然不稳定；test 中 true max 样本很少，不能过度解读。
-- calibrator probe 不稳定且昂贵，因此后续主线改为 diagnostic-only skip calibrator。
-
-WISE-PACE no-calibrator diagnostic gate：
-
-```text
-exp_dir: logs/exp_20260508_192233_fold0
-validation QWK: 0.3536
-raw test QWK: 0.2637
-raw test MAE: 1.4688
-high recall: 0.4444
-max recall: 0.0000
-runtime: 56.7 min
-tokens all: 1.45M
-PACE tokens: 0.30M
-```
-
-主要观察：
-
-- no-calibrator diagnostic 把 PACE tokens 从约 0.89M 降到约 0.30M，成本下降明显。
-- boundary_clarification child 仍然在 validation 上击败 parent，raw QWK 约 `+0.113`。
-- 但 raw test QWK 低于 raw-only gate，说明当前小规模 validation signal 仍有过拟合 / 不稳定风险。
-- 因此目前还不建议进入完整 full fold。
-
-### neural diagnostic smoke
-
-```text
-exp_dir: logs/exp_20260508_190507_fold0
-config: configs/phase4_neural_smoke.yaml
-runtime: 7.7 min
-validation QWK: 0.2411
-raw test QWK: 0.2771
-PACE tokens: 84k
-diagnostic_only_skip_calibrator: true
-```
-
-该 smoke 的目的不是追求分数，而是验证 neural hidden diagnostic 路径能在真实本地 Llama 上端到端跑通。
-
-## 当前风险
-
-当前模型还不能直接认为已经达到 EMNLP main 级别的定型状态。主要风险：
-
-- high-score / max-score recall 仍是最大短板。
-- base 8B Llama 经常把分数压到 7/10 附近，存在 score range compression。
-- PACE calibrator probe 不稳定，已经从主路径降级为可选诊断。
-- neural evidence 仍需更多 ablation 证明 anchor-relative hidden evidence 的贡献。
-- 需要 raw-only、random mutation、no-anchor、anchor-only、OPRO-lite / APE-lite 等 baseline。
-- 需要 P1-P8 smoke 和更强模型对照，不能只凭 P1 fold0 下结论。
-
-## 推荐运行命令
-
-运行测试：
-
-```bash
-pytest tests/test_phase4_diagnostics.py tests/test_neural_evidence.py tests/test_prompt_profiler.py -q
-```
-
-raw-only cost-aware gate：
-
-```bash
-python wise_aes.py --config configs/phase4_raw_only_cost_aware_mid.yaml --fold 0
-```
-
-WISE-PACE cost-aware gate：
-
-```bash
-python wise_aes.py --config configs/phase4_cost_aware_mid.yaml --fold 0
-```
-
-neural hidden smoke：
-
-```bash
-python wise_aes.py --config configs/phase4_neural_smoke.yaml --fold 0
-```
-
-P1-P8 smoke dry-run：
-
-```bash
-python scripts/run_phase4_smoke_all_prompts.py --prompts 1 2 3 4 5 6 7 8 --fold 0 --dry-run
-```
-
-分析单个实验：
-
-```bash
-python scripts/analysis/summarize_phase4_run.py logs/<exp_dir>
-python scripts/analysis/export_candidate_table.py logs/<exp_dir>
-```
-
-对比 raw-only 和 WISE-PACE：
-
-```bash
-python scripts/analysis/compare_raw_vs_wisepace.py \
-  --raw-only-exp logs/<raw_exp_dir> \
-  --wisepace-exp logs/<wisepace_exp_dir>
-```
-
-Prompt profile：
-
-```bash
-python scripts/analysis/profile_asap_prompt.py --prompt 1 --fold 0 --config configs/phase4_smoke.yaml
-```
-
-## 下一步最小实验建议
-
-不要马上跑 5-fold。建议先跑：
-
-1. P1-P8 smoke 实跑，每个 prompt 只跑小规模，检查 score range 和 high-tail 风险是否泛化。
-2. raw-only vs WISE-PACE cost-aware gate 再做 2-3 个 seed，确认 `boundary_clarification_mutation` 的提升不是单次偶然。
-3. 在已加入 mutation acceptance guard 后，优先检查 rejected / accepted child 的 audit 是否能解释 test 分数波动，再决定是否收紧阈值。
-
-只有当这些最小实验稳定后，再启动单个完整 full fold。
-
-## WISE-PACE v2 结构性收敛
-
-2026-05-09 之后，主线从“继续堆 high-tail 补丁”收敛为更清晰的验证-进化结构：
-
-1. `mutation_val` 只用于错误发现、PACE diagnostics、reflection feedback 和 mutation policy。
-2. `selection_val` 只用于候选协议选择、training curve 和最终 primary candidate 固定。
-3. `test` 仍然只在最后使用，不能进入 selection、mutation 或 PACE probe。
-4. PACE 继续保持 diagnostic / mutation guidance，不作为最终 test-time calibrator。
-5. `best_pareto` 成为 Phase 4 主候选：它仍基于 raw validation signals，但同时考虑 raw QWK、raw-adjusted QWK、MAE、score distribution TV、high-score recall 和 max-score recall。
-
-对应配置项：
-
-```yaml
-evolution:
-  final_primary_candidate: "best_pareto"
-  dual_validation_enabled: true
-  mutation_val_ratio: 0.50
-  pareto_selection_enabled: true
-  pareto_qwk_weight: 1.0
-  pareto_raw_adjusted_weight: 0.35
-  pareto_mae_weight: 0.06
-  pareto_tv_weight: 0.12
-  pareto_high_recall_weight: 0.08
-  pareto_max_recall_weight: 0.02
-```
-
-mutation acceptance 也改为 Pareto-aware：如果 child 的 raw QWK 有小幅下降，但 MAE、分布 TV、high recall 或 raw-adjusted QWK 有足够改善，不再机械拒绝；如果出现明显 MAE/TV/high recall 恶化或 raw QWK 硬性大幅下降，仍然拒绝。这样可以避免把所有改进都压回“只优化 QWK 单点”的旧路径。
-
-```yaml
-evolution:
-  mutation_acceptance_mode: "pareto"
-  mutation_acceptance_allow_tradeoff: true
-  mutation_acceptance_min_tradeoff_improvements: 2
-  mutation_acceptance_qwk_hard_drop: -0.08
-  mutation_acceptance_raw_adjusted_hard_drop: -0.08
-```
-
-这版结构的目标是让 WISE-PACE 的论文主张更干净：hidden evidence 不是校准器，而是帮助生成更好的 `I*` 和 `E*`；候选协议必须在独立的 selection validation 上胜出，才有资格进入 final test。
-
-## 论文级核心定位
-
-当前主线进一步收敛为 hidden-evidence-guided protocol evolution，而不是一个带后处理校准器的 AES 系统：
-
-```text
-Fixed LLM M
-Protocol P = (I, A_abs, A_ctr)
+P = (I, A)
 
 I: scoring instruction / rubric
-A_abs: absolute score anchors
-A_ctr: contrastive boundary anchor pairs
-
-Final prediction:
-  y_hat = M_score(x | P)
-
-No test-time calibration.
-No learned final scorer.
-No extra deployment model.
+A: anchor bank
+M: fixed local LLM
 ```
 
-方法三层结构：
+最终预测始终是：
 
 ```text
-Layer 1: Protocol Scoring
-  用固定 LLM 在 P 下直接输出 raw score。
-
-Layer 2: Hidden Failure Diagnosis
-  在 scoring context 下提取 hidden evidence，离散化为 failure type。
-
-Layer 3: Diagnostic-Guided Protocol Evolution
-  根据 failure type 选择 mutation operator，生成 child protocol，并在 selection validation 上选择。
+y_hat = M_score(x | I, A)
 ```
 
-新增协议对象位于 `pace/protocol.py`：
+约束非常重要：
+
+- 不训练 final scorer。
+- 不做 test-time calibration。
+- 不把 hidden evidence 当最终评分器。
+- 不使用 test labels 选择 anchors、repair anchors 或调 parser。
+- `final_pace_calibrated=false`。
+- representation / diagnostics 只允许用于 validation-time anchor selection、repair 和 audit。
+- final test 只报告 selected anchor protocol 下的 raw LLM score。
+
+## 为什么切换主线
+
+早期 WISE-PACE 尝试过：
+
+- PACE hidden diagnostic
+- hidden-guided mutation priority
+- contrastive anchors
+- neural hidden evidence
+- instruction / anchor protocol evolution
+
+但 Gate 3 rescue 显示：hidden-guided mutation priority 虽然真实改变了决策路径，但没有带来稳定收益；contrastive anchors 也不稳定。因此当前结论是：
+
+- hidden evidence 保留为 audit / ablation。
+- contrastive anchors 暂停主线，最多作为 negative ablation。
+- PACE calibrator 不进入主线。
+- 主线转向 **coverage-constrained / retrieval-grounded / representation-aware anchor selection and repair**。
+
+## BAPR v1 逻辑链
+
+BAPR v1 是一个最小、可审计的一步 anchor-bank repair 框架：
 
 ```text
-ProtocolCandidate
-AnchorBank
-EssayAnchor
-ContrastivePair
-DiagnosticType
-MutationOperator
+1. 固定 instruction I 和本地 LLM M
+2. 将 validation split 成 V_diag 和 V_sel
+3. 只用 train + V_diag 初始化 parent anchor bank A0
+4. 用 A0 在 V_diag 上评分，得到 boundary failure profile
+5. 根据 failure profile 生成最多 3 个 child anchor banks
+6. 在 V_sel 上评估 parent 和 children
+7. 用 guarded selection 选择最终 A*
+8. 在 test 上只用 A* 做 raw LLM scoring
 ```
 
-`DiagnosticType` 目前统一为：
+数据边界：
 
 ```text
-HIGH_TAIL_UNDERSCORE
-LOW_TAIL_OVERSCORE
-SCORE_COMPRESSION
-BOUNDARY_AMBIGUITY
-ANCHOR_CONFUSION
-RUBRIC_UNDER_SPECIFICATION
-FORMAT_INSTABILITY
-NO_CLEAR_SIGNAL
+train: anchor candidate pool
+V_diag: 诊断 failure profile，允许影响 A0 和 child generation
+V_sel: 只用于 guarded selection，不允许影响 A0 或 child generation
+test: 只用于最终评估
 ```
 
-这些类型会映射到固定 mutation family，保证论文里的 causal chain 可追踪：
+## Repair Operators
+
+BAPR v1 当前支持 4 类 repair operator：
 
 ```text
-failure evidence
--> diagnostic type
--> mutation operator
--> protocol diff
--> validation behavior delta
--> final raw test behavior
+REBALANCE_SCORE_BANDS
+REPLACE_WORST_BAND_ANCHOR
+DECOMPRESS_EXTREME_ANCHORS
+REMOVE_CONFUSING_OR_REDUNDANT_ANCHOR
 ```
 
-## Contrastive Boundary Anchors
+每个 child 必须改善和其 operator trigger 相关的 boundary metric，不能靠无关指标偶然变好进入最终选择。
 
-普通 anchors 仍作为全局 score-scale references，新增 `A_ctr` 表示边界对：
+例如：
+
+- `DECOMPRESS_EXTREME_ANCHORS` 需要改善 high recall、max recall、range coverage、SCI 或 tail under-score 等相关指标。
+- `REBALANCE_SCORE_BANDS` 需要改善 coverage、score TV 或 worst-band MAE。
+- empty band metric 记为 `None`，不会触发 repair severity。
+
+如果所有 children 都被拒绝，BAPR 会返回 parent A0，并仍然写出完整输出文件。
+
+## Guarded Selection
+
+child 需要同时满足：
+
+- 不能超过允许的 QWK drop。
+- 不能超过允许的 MAE increase。
+- anchor band coverage 不能退化。
+- anchor score range 不能明显退化。
+- 必须改善 operator 相关 boundary metric。
+
+默认配置见：
+
+[configs/anchor_budget_bapr_v1.yaml](configs/anchor_budget_bapr_v1.yaml)
+
+## 关键输出文件
+
+每个 BAPR run 会写出：
 
 ```text
-A_k^-: lower-side anchor just below a score boundary
-A_k^+: upper-side anchor just above that boundary
+anchor_bank.json
+anchor_metrics.json
+anchor_selection_trace.jsonl
+predictions.csv
+prediction_distribution.csv
+score_boundary_metrics.json
+summary.md
+
+bapr_val_split.json
+bapr_parent_anchor_bank.json
+bapr_parent_metrics.json
+bapr_failure_profile.json
+bapr_repair_candidates.jsonl
+bapr_guarded_selection.csv
+bapr_final_anchor_bank.json
+bapr_repair_trace.jsonl
 ```
 
-prompt 中会出现独立的 `CONTRASTIVE BOUNDARY ANCHORS` section，用来帮助 LLM 判断目标作文应该落在边界哪一侧。这个设计直接针对 high-score recall、score compression 和 adjacent-boundary ambiguity。
+其中 `bapr_parent_anchor_bank.json` 和 `bapr_final_anchor_bank.json` 用来明确记录 parent A0 与最终 A* 是否不同。
 
-关键配置：
+## 当前代码入口
 
-```yaml
-evolution:
-  contrastive_anchors_enabled: true
-  n_contrastive_anchor_pairs: 2
-  evolve_contrastive_anchors: true
-```
+核心实现：
 
-## 同预算 Baseline
+- [scripts/bapr_repair.py](scripts/bapr_repair.py)
+  BAPR 纯逻辑模块。不得调用 LLM，不实例化 `LocalLlamaBackend`。
 
-为了证明 hidden evidence 不是复杂装饰，当前新增两个 smoke baseline：
+- [scripts/run_anchor_budget_experiment.py](scripts/run_anchor_budget_experiment.py)
+  anchor-budget / BAPR 实验入口。BAPR 只通过 clean integration function 接入，不把完整 repair pipeline 塞进 `build_anchor_bank()`。
+
+- [tests/test_bapr_repair.py](tests/test_bapr_repair.py)
+  BAPR toy/mock 单元测试，不调用真实 LLM。
+
+## 本地验证
+
+运行全部测试：
 
 ```bash
-python wise_aes.py --config configs/phase4_raw_error_pe_smoke.yaml --fold 0
-python wise_aes.py --config configs/phase4_reflection_pe_smoke.yaml --fold 0
+pytest -q
 ```
 
-它们复用相同的 validation split、candidate budget 和 Pareto selection objective：
+只跑 BAPR 测试：
 
-- `RawError-PE`: 只用 raw output errors 做 diagnostic routing。
-- `Reflection-PE`: 只做 visible-error LLM reflection，不使用 hidden evidence routing。
-- `WISE-PACE / hidden-evidence PE`: 使用 hidden diagnostics + contrastive anchors 做 targeted mutation。
+```bash
+pytest tests/test_bapr_repair.py -q
+```
+
+运行 fake-scoring smoke，不加载本地 LLM：
+
+```bash
+python scripts/run_anchor_budget_experiment.py \
+  --config configs/anchor_budget_bapr_v1.yaml \
+  --fold 0 \
+  --methods bapr_repair_k_anchor \
+  --ks 9 \
+  --fake-scoring \
+  --output-root logs/bapr_fake_smoke \
+  --no-resume-existing
+```
+
+fake smoke 的目的只是验证 split、repair、guard、输出文件和 summary 链路，不代表真实模型分数。
+
+## 真实 debug 实验
+
+P1 fold0 BAPR v1 debug：
+
+```bash
+WISE_PACE_COMMIT=$(git rev-parse HEAD) \
+PYTHONUNBUFFERED=1 python scripts/run_anchor_budget_experiment.py \
+  --config configs/anchor_budget_bapr_v1.yaml \
+  --fold 0 \
+  --methods bapr_repair_k_anchor \
+  --ks 9 \
+  --output-root logs/anchor_budget_bapr/bapr_v1_p1_fold0_real \
+  --no-resume-existing
+```
+
+当前不建议直接跑 full-fold。先看 P1 fold0 debug 是否说明：
+
+- child repair 是否真实产生；
+- guarded selection 是否合理；
+- A* 是否不同于 A0；
+- A* 是否改善 V_sel 上的目标 boundary metrics；
+- raw test QWK / MAE / high recall 是否没有明显崩溃；
+- token cost 是否可控。
+
+## Anchor-Budget 历史结论
+
+当前已经得到的研究判断：
+
+1. P8 是 ultra-wide score range stress-test。10-60 分制下，当前 compact anchor protocol 不稳定，`no_anchor` 反而强于多种 anchor 方法。P8 暂时作为 limitation，不进入主线 full-fold。
+2. P1/P2/P7 上，coverage-constrained representation-guided anchor selection 有过稳定信号，但 seed/split sensitivity 明显。
+3. `retrieval_grounded_stratified_rep_k_anchor_v21` 更稳，但 representation replacement 经常过少，独立贡献仍不足。
+4. `retrieval_grounded_no_rep_k_anchor` ablation 用来判断收益是否主要来自 coverage-constrained retrieval grounding。
+5. 因此当前 BAPR v1 的重点不是继续堆 representation，而是验证 anchor-bank repair 是否能在 validation-only 边界约束下稳定改善 anchor protocol。
+
+## 不应该做的事
+
+当前阶段不要：
+
+- 跑 5-fold。
+- 跑 P1-P8 full。
+- 为 P8 继续堆 prompt/anchor 补丁。
+- 恢复 hidden-evidence mutation 主线。
+- 把 PACE calibrated score 当 final result。
+- 用 test set 修改 anchor selection、repair、parser 或 guard。
+- 在没有 fake smoke 和单元测试通过前启动 GPU 实验。
+
+## 下一步最小实验
+
+建议顺序：
+
+1. BAPR v1 P1 fold0 real debug：确认 repair chain 是否真实运行。
+2. 若 P1 debug 有正信号，再做 same-split baseline 对照：`parent A0` vs `BAPR A*` vs `retrieval_grounded_no_rep`。
+3. 若 repair chain 和 baseline 对照都成立，再考虑 P1/P2/P7 小规模 sanity；仍不直接进入 full-fold。
+
+只有当 BAPR 能证明：
+
+```text
+failure profile
+→ repair operator
+→ child anchor bank
+→ V_sel boundary improvement
+→ final raw test not collapsing
+```
+
+才有资格进入更大规模实验。
