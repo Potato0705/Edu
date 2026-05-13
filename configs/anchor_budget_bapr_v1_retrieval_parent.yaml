@@ -1,6 +1,5 @@
-# BAPR-v1 smoke / pilot config.
-# This runs one-step boundary-aware anchor-bank repair without instruction
-# evolution, hidden-evidence mutation, contrastive anchors, or final calibration.
+# BAPR-v1 attribution config with retrieval-initialized parent A0.
+# This is an ablation mode only: repair operators and guard remain unchanged.
 
 model:
   name: models/Meta-Llama-3.1-8B-Instruct
@@ -38,7 +37,7 @@ anchor_budget:
     max_rep_replacements: 3
 
 bapr:
-  parent_init_method: retrieval_grounded_stratified_rep_k_anchor_v21
+  parent_init_method: retrieval_k_anchor
   val_diag_ratio: 0.5
   max_children: 3
   guard:

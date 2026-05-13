@@ -215,6 +215,20 @@ def test_guard_rejects_qwk_collapse_and_falls_back_to_parent_when_all_children_r
     assert guard["selection_rows"][0]["selected_as_final"] is True
 
 
+def test_guard_uses_named_parent_candidate_id_for_fallback():
+    parent = {
+        "candidate_id": "retrieval_diag_parent",
+        "anchor_bank_id": "parent",
+        "anchor_ids": [1, 2, 3],
+        "anchor_scores": [2, 7, 12],
+    }
+    guard = guarded_select_repaired_bank(_metrics(), [], parent, [])
+
+    assert guard["selected_anchor_bank"] is parent
+    assert guard["selection_rows"][0]["candidate_id"] == "retrieval_diag_parent"
+    assert guard["selection_rows"][0]["selected_as_final"] is True
+
+
 def test_score_compression_index_improvement_uses_closeness_to_one():
     assert boundary_improved_for_operator(
         _metrics(score_compression_index=0.40),
@@ -418,6 +432,49 @@ def test_run_bapr_one_passes_val_and_test_ids_as_forbidden(monkeypatch, tmp_path
     assert captured["forbidden_ids"].isdisjoint({int(x["essay_id"]) for x in train})
 
 
+def test_run_bapr_one_retrieval_parent_uses_v_diag_only(monkeypatch, tmp_path):
+    train = [_item(i, score) for i, score in enumerate([2, 3, 4, 7, 8, 9, 10, 11, 12], start=1)]
+    val = [_item(100 + i, score) for i, score in enumerate([2, 2, 7, 7, 12, 12])]
+    test = [_item(200 + i, score) for i, score in enumerate([2, 7, 12])]
+    expected_diag, expected_sel, _ = split_val_diag_sel(val, 2, 12, 0.5)
+    captured = {}
+    real_retrieval = runner.retrieval_anchors
+
+    def wrapped_retrieval(train_rows, val_rows, k, score_min, score_max):
+        captured["val_ids"] = [int(x["essay_id"]) for x in val_rows]
+        return real_retrieval(train_rows, val_rows, k, score_min, score_max)
+
+    monkeypatch.setattr(runner, "retrieval_anchors", wrapped_retrieval)
+    summary = runner.run_bapr_one(
+        method="bapr_repair_k_anchor",
+        k=3,
+        config={
+            "data": {"score_min": 2, "score_max": 12, "essay_set": 1},
+            "bapr": {"parent_init_method": "retrieval_k_anchor", "val_diag_ratio": 0.5, "max_children": 0},
+        },
+        fold=0,
+        seed=42,
+        train=train,
+        val=val,
+        test=test,
+        instruction="Rubric",
+        backend=None,
+        root_out=tmp_path,
+        split_hashes={},
+    )
+
+    assert captured["val_ids"] == [int(x["essay_id"]) for x in expected_diag]
+    assert set(captured["val_ids"]).isdisjoint({int(x["essay_id"]) for x in expected_sel})
+    run_dir = Path(summary["exp_dir"])
+    parent_bank = yaml.safe_load((run_dir / "bapr_parent_anchor_bank.json").read_text(encoding="utf-8"))
+    final_bank = yaml.safe_load((run_dir / "bapr_final_anchor_bank.json").read_text(encoding="utf-8"))
+    assert parent_bank["method"] == "retrieval_diag_parent"
+    assert parent_bank["candidate_id"] == "retrieval_diag_parent"
+    assert parent_bank["bapr_parent_init_method"] == "retrieval_k_anchor"
+    assert final_bank["method"] == "BAPR-retrieval-A*"
+    assert final_bank["bapr_parent_init_method"] == "retrieval_k_anchor"
+
+
 def test_bapr_fake_scoring_smoke_writes_required_outputs(monkeypatch, tmp_path):
     train = [_item(i, score) for i, score in enumerate([2, 3, 4, 7, 8, 9, 10, 11, 12], start=1)]
     val = [_item(100 + i, score) for i, score in enumerate([2, 2, 7, 7, 12, 12])]
@@ -484,3 +541,7 @@ def test_bapr_config_loads():
     assert "retrieval_weight" not in cfg["anchor_budget"]["representation"]
     assert cfg["anchor_budget"]["retrieval_grounded_rep_v21"]["retrieval_weight"] == 0.8
     assert cfg["anchor_budget"]["retrieval_grounded_rep_v21"]["representation_weight"] == 0.2
+    assert cfg["bapr"]["parent_init_method"] == "retrieval_grounded_stratified_rep_k_anchor_v21"
+    with open("configs/anchor_budget_bapr_v1_retrieval_parent.yaml", encoding="utf-8") as f:
+        retrieval_cfg = yaml.safe_load(f)
+    assert retrieval_cfg["bapr"]["parent_init_method"] == "retrieval_k_anchor"

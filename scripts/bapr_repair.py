@@ -525,8 +525,9 @@ def guarded_select_repaired_bank(
     qwk_drop = float(cfg.get("qwk_drop_tolerance", 0.02))
     mae_increase = float(cfg.get("mae_increase_tolerance", 0.10))
     rows: List[Dict[str, Any]] = []
+    parent_candidate_id = str(parent_anchor_bank.get("candidate_id", "BAPR-A0"))
     parent_row = {
-        "candidate_id": "BAPR-A0",
+        "candidate_id": parent_candidate_id,
         "parent_id": "",
         "operator": "PARENT",
         "parent_or_child": "parent",
@@ -591,7 +592,7 @@ def guarded_select_repaired_bank(
     else:
         selected_bank = parent_anchor_bank
         selected_metrics = parent_metrics
-        selected_id = "BAPR-A0"
+        selected_id = parent_candidate_id
         reason = "parent_fallback_all_children_rejected"
     for row in rows:
         if row["candidate_id"] == selected_id:

@@ -1551,6 +1551,31 @@ def bapr_anchor_bank_payload(
     return payload
 
 
+def build_bapr_parent_bank(
+    *,
+    parent_init_method: str,
+    train: Sequence[Dict],
+    val_diag: Sequence[Dict],
+    k: int,
+    score_min: int,
+    score_max: int,
+    config: Dict[str, Any],
+    instruction: str,
+    backend: Optional[LocalLlamaBackend],
+    out_dir: Path,
+) -> Tuple[List[AnchorRecord], List[Dict[str, Any]], str, str]:
+    if parent_init_method in {"retrieval_grounded_stratified_rep_k_anchor_v21", "v21"}:
+        records, trace = retrieval_grounded_stratified_rep_anchors_v21(
+            train, val_diag, int(k), score_min, score_max, config, instruction, backend, out_dir
+        )
+        return records, trace, "BAPR-A0", "BAPR-A*"
+    if parent_init_method == "retrieval_k_anchor":
+        records = retrieval_anchors(train, val_diag, int(k), score_min, score_max)
+        trace = [asdict(record) for record in records]
+        return records, trace, "retrieval_diag_parent", "BAPR-retrieval-A*"
+    raise ValueError(f"Unsupported BAPR parent_init_method: {parent_init_method}")
+
+
 def run_bapr_one(
     *,
     method: str,
@@ -1584,14 +1609,24 @@ def run_bapr_one(
     write_json(out_dir / "bapr_val_split.json", split_meta)
     forbidden_ids = {int(x["essay_id"]) for x in val_diag} | {int(x["essay_id"]) for x in val_sel} | {int(x["essay_id"]) for x in test}
 
-    parent_records, parent_trace = retrieval_grounded_stratified_rep_anchors_v21(
-        train, val_diag, int(k), score_min, score_max, config, instruction, backend, out_dir
+    parent_init_method = str(config.get("bapr", {}).get("parent_init_method", "retrieval_grounded_stratified_rep_k_anchor_v21"))
+    parent_records, parent_trace, parent_candidate_id, final_method_name = build_bapr_parent_bank(
+        parent_init_method=parent_init_method,
+        train=train,
+        val_diag=val_diag,
+        k=int(k),
+        score_min=score_min,
+        score_max=score_max,
+        config=config,
+        instruction=instruction,
+        backend=backend,
+        out_dir=out_dir,
     )
     parent_anchors = [anchor_record_to_bapr(a) for a in parent_records]
     parent_trace_path = out_dir / "anchor_selection_trace.jsonl"
     write_jsonl(parent_trace_path, parent_trace)
     parent_bank = bapr_anchor_bank_payload(
-        method="BAPR-A0",
+        method=parent_candidate_id,
         k=int(k),
         anchors=parent_anchors,
         score_min=score_min,
@@ -1602,6 +1637,8 @@ def run_bapr_one(
         parent_anchor_bank_id="",
         trace_path=parent_trace_path,
     )
+    parent_bank["candidate_id"] = parent_candidate_id
+    parent_bank["bapr_parent_init_method"] = parent_init_method
     write_json(out_dir / "bapr_parent_anchor_bank.json", parent_bank)
 
     diag_rows, diag_usage = score_items(backend, val_diag, instruction, parent_records, score_min, score_max)
@@ -1627,6 +1664,9 @@ def run_bapr_one(
         forbidden_ids=forbidden_ids,
         max_children=int(config.get("bapr", {}).get("max_children", 3)),
     )
+    for child in children:
+        child["parent_id"] = parent_candidate_id
+        child["bapr_parent_init_method"] = parent_init_method
     write_jsonl(out_dir / "bapr_repair_trace.jsonl", repair_trace)
     write_jsonl(out_dir / "bapr_repair_candidates.jsonl", children)
 
@@ -1661,7 +1701,7 @@ def run_bapr_one(
     final_records = [bapr_to_anchor_record(a) for a in final_anchors]
     final_trace_path = out_dir / "bapr_repair_trace.jsonl"
     final_bank = bapr_anchor_bank_payload(
-        method="BAPR-A*",
+        method=final_method_name,
         k=int(k),
         anchors=final_anchors,
         score_min=score_min,
@@ -1673,6 +1713,8 @@ def run_bapr_one(
         trace_path=final_trace_path,
     )
     final_bank["selected_reason"] = guard["selected_reason"]
+    final_bank["bapr_parent_init_method"] = parent_init_method
+    final_bank["parent_candidate_id"] = parent_candidate_id
     write_json(out_dir / "bapr_final_anchor_bank.json", final_bank)
 
     write_json(out_dir / "anchor_bank.json", final_bank)
@@ -1747,6 +1789,8 @@ def run_bapr_one(
         "representation_changed_anchor_choice": final_bank["anchor_ids"] != parent_bank["anchor_ids"],
         "representation_features_used": ["bapr_repair", "score_boundary_diagnostics"],
         "bapr_selected_reason": guard["selected_reason"],
+        "bapr_parent_init_method": parent_init_method,
+        "bapr_parent_candidate_id": parent_candidate_id,
         "resumed_from_existing_outputs": False,
     }
     write_json(out_dir / "run_summary.json", summary)

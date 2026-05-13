@@ -184,9 +184,10 @@ def render_markdown(
     parent_test_scored: bool,
     baseline_note: str,
 ) -> str:
-    by_method = {row["method"]: row for row in rows}
-    parent = by_method.get("BAPR-A0", {})
-    final = by_method.get("BAPR-A*", {})
+    parent = rows[0] if rows else {}
+    final = rows[1] if len(rows) > 1 else {}
+    parent_label = str(parent.get("method", "parent"))
+    final_label = str(final.get("method", "final"))
 
     def delta(metric: str) -> str:
         p = parent.get(metric)
@@ -206,8 +207,8 @@ def render_markdown(
         "- This is post-selection analysis only. Test metrics are not used to modify A*, guard decisions, parser, or config.\n",
         f"- parent_test_scored_posthoc: {parent_test_scored}\n",
         f"- baseline note: {baseline_note}\n\n",
-        "## BAPR-A0 vs BAPR-A*\n",
-        "| metric | BAPR-A0 | BAPR-A* | delta A*-A0 |\n",
+        f"## {parent_label} vs {final_label}\n",
+        f"| metric | {parent_label} | {final_label} | delta final-parent |\n",
         "|---|---:|---:|---:|\n",
     ]
     for metric in [
@@ -227,9 +228,9 @@ def render_markdown(
     lines.extend(
         [
             "\n## Anchor Banks\n",
-            f"- BAPR-A0 anchors: `{parent.get('anchor_ids', '')}`\n",
-            f"- BAPR-A* anchors: `{final.get('anchor_ids', '')}`\n",
-            f"- BAPR-A* selected_reason: `{final.get('selected_reason', '')}`\n\n",
+            f"- parent anchors: `{parent.get('anchor_ids', '')}`\n",
+            f"- final anchors: `{final.get('anchor_ids', '')}`\n",
+            f"- final selected_reason: `{final.get('selected_reason', '')}`\n\n",
             "## Interpretation Guardrails\n",
             "- If A* improves V_sel but not test, this remains MECHANISM_CHAIN_PASS_ONLY.\n",
             "- If A* improves test without V_sel support, do not treat it as method evidence.\n",
@@ -284,7 +285,7 @@ def main() -> None:
 
     rows = [
         metric_row(
-            method="BAPR-A0",
+            method=str(parent_bank.get("method", "BAPR-A0")),
             anchor_source="parent",
             val_diag_qwk=failure_profile.get("qwk"),
             val_sel_qwk=parent_metrics.get("qwk"),
@@ -293,7 +294,7 @@ def main() -> None:
             selected_reason="parent_anchor_bank",
         ),
         metric_row(
-            method="BAPR-A*",
+            method=str(final_bank.get("method", "BAPR-A*")),
             anchor_source="final",
             val_diag_qwk=None,
             val_sel_qwk=final_val.get("qwk"),
