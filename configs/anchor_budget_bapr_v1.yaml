@@ -29,6 +29,9 @@ anchor_budget:
     max_candidates_per_score: 8
     max_val_representations: 32
     token_cost_penalty: 0.02
+
+  retrieval_grounded_rep_v21:
+    per_band_top_n: 5
     retrieval_weight: 0.8
     representation_weight: 0.2
     fallback_margin: 0.08

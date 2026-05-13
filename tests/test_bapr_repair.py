@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import csv
 import sys
 from pathlib import Path
 
 import pytest
+import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -12,6 +14,7 @@ from scripts.bapr_repair import (  # noqa: E402
     DECOMPRESS_EXTREME_ANCHORS,
     REBALANCE_SCORE_BANDS,
     REPLACE_WORST_BAND_ANCHOR,
+    band_for as bapr_band_for,
     boundary_improved_for_operator,
     compute_failure_profile,
     generate_repaired_children,
@@ -59,6 +62,7 @@ def _metrics(**overrides):
         "anchor_band_coverage": 3,
         "anchor_unique_score_count": 3,
         "anchor_score_range_span": 10,
+        "anchor_score_range_coverage": 1.0,
         "token_cost": 100,
     }
     base.update(overrides)
@@ -166,6 +170,30 @@ def test_guard_requires_operator_related_boundary_metric_improvement():
     assert guard["selected_anchor_bank"]["candidate_id"] == "child_high"
 
 
+def test_rebalance_accepts_anchor_coverage_improvement():
+    parent = {
+        "anchor_bank_id": "parent",
+        "anchor_ids": [1, 2, 3],
+        "anchor_scores": [4, 5, 6],
+    }
+    child = _bank(
+        "child_rebalance",
+        REBALANCE_SCORE_BANDS,
+        ["anchor_band_coverage", "anchor_unique_score_count", "anchor_score_range_span", "anchor_score_range_coverage"],
+    )
+    guard = guarded_select_repaired_bank(
+        _metrics(qwk=0.50, mae=1.00, anchor_band_coverage=2, anchor_unique_score_count=3, anchor_score_range_span=4),
+        [_metrics(qwk=0.50, mae=1.00, anchor_band_coverage=3, anchor_unique_score_count=3, anchor_score_range_span=4)],
+        parent,
+        [child],
+    )
+
+    row = {r["candidate_id"]: r for r in guard["selection_rows"]}["child_rebalance"]
+    assert row["accepted_by_guard"] is True
+    assert row["target_boundary_metric_improved"] is True
+    assert guard["selected_anchor_bank"]["candidate_id"] == "child_rebalance"
+
+
 def test_guard_rejects_qwk_collapse_and_falls_back_to_parent_when_all_children_rejected():
     parent = {
         "anchor_bank_id": "parent",
@@ -218,6 +246,17 @@ def test_guard_tie_break_is_deterministic_by_candidate_id():
     assert guard["selected_anchor_bank"]["candidate_id"] == "child_1"
 
 
+def test_bapr_band_for_matches_runner_score_band_label():
+    ranges = [(2, 12)]
+    for path in ["configs/anchor_budget_phase2_p2.yaml", "configs/anchor_budget_phase2_p7.yaml"]:
+        with open(path, encoding="utf-8") as f:
+            cfg = yaml.safe_load(f)
+        ranges.append((int(cfg["data"]["score_min"]), int(cfg["data"]["score_max"])))
+    for score_min, score_max in ranges:
+        for score in range(score_min, score_max + 1):
+            assert bapr_band_for(score, score_min, score_max) == runner.band_for(score, score_min, score_max)
+
+
 def test_bapr_run_complete_requires_bapr_specific_outputs(tmp_path):
     for name in runner.REQUIRED_RUN_FILES:
         (tmp_path / name).write_text("{}", encoding="utf-8")
@@ -237,6 +276,39 @@ def test_bapr_run_complete_requires_bapr_specific_outputs(tmp_path):
         (tmp_path / name).write_text("{}", encoding="utf-8")
 
     assert is_run_complete(tmp_path, "bapr_repair_k_anchor")
+
+
+def test_bapr_v1_config_v21_params_are_used_by_selector(tmp_path):
+    with open("configs/anchor_budget_bapr_v1.yaml", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f)
+    items = []
+    essay_id = 1
+    for score in range(2, 13):
+        for j in range(3):
+            items.append(
+                _item(
+                    essay_id,
+                    score,
+                    f"score {score} sample {j} evidence organization language " + ("excellent " * max(0, score - 7)),
+                )
+            )
+            essay_id += 1
+    val = [
+        _item(1001, 2, "weak limited low"),
+        _item(1002, 7, "middle evidence organized"),
+        _item(1003, 12, "excellent high evidence sophisticated"),
+    ]
+
+    anchors, trace = runner.retrieval_grounded_stratified_rep_anchors_v21(
+        items, val, 9, 2, 12, cfg, "Rubric", backend=None, out_dir=tmp_path
+    )
+
+    assert len(anchors) == 9
+    assert trace
+    assert all(row["retrieval_weight"] == 0.8 for row in trace)
+    assert all(row["representation_weight"] == 0.2 for row in trace)
+    assert all(row["fallback_margin"] == 0.08 for row in trace)
+    assert all(row["max_rep_replacements"] == 3 for row in trace)
 
 
 def test_run_bapr_one_uses_v_diag_not_v_sel_for_parent_a0(monkeypatch, tmp_path):
@@ -290,10 +362,125 @@ def test_run_bapr_one_uses_v_diag_not_v_sel_for_parent_a0(monkeypatch, tmp_path)
     assert (out_dir / "bapr_final_anchor_bank.json").exists()
 
 
-def test_bapr_config_loads():
-    import yaml
+def test_run_bapr_one_passes_val_and_test_ids_as_forbidden(monkeypatch, tmp_path):
+    train = [_item(i, score) for i, score in enumerate([2, 3, 7, 8, 11, 12], start=1)]
+    val = [_item(100 + i, score) for i, score in enumerate([2, 2, 7, 7, 12, 12])]
+    test = [_item(200 + i, score) for i, score in enumerate([2, 7, 12])]
+    expected_diag, expected_sel, _ = split_val_diag_sel(val, 2, 12, 0.5)
+    captured = {}
 
+    def fake_parent_builder(train_rows, val_rows, k, score_min, score_max, config, instruction, backend, out_dir):
+        anchors = [
+            runner.AnchorRecord(
+                essay_id=int(x["essay_id"]),
+                gold_score=int(x["domain1_score"]),
+                prompt_id=1,
+                token_length=8,
+                source_split="train",
+                selection_score=1.0,
+                selection_reason="fake_a0",
+                essay_text=x["essay_text"],
+            )
+            for x in train_rows[:k]
+        ]
+        return anchors, [{"essay_id": a.essay_id, "gold_score": a.gold_score} for a in anchors]
+
+    def fake_generate(parent_anchors, train_pool, val_diag, failure_profile, ranked_operators, score_min, score_max, k, forbidden_ids=(), max_children=3):
+        captured["forbidden_ids"] = set(int(x) for x in forbidden_ids)
+        return [], []
+
+    monkeypatch.setattr(runner, "retrieval_grounded_stratified_rep_anchors_v21", fake_parent_builder)
+    monkeypatch.setattr(runner, "generate_repaired_children", fake_generate)
+    runner.run_bapr_one(
+        method="bapr_repair_k_anchor",
+        k=3,
+        config={
+            "data": {"score_min": 2, "score_max": 12, "essay_set": 1},
+            "bapr": {"val_diag_ratio": 0.5, "max_children": 1},
+        },
+        fold=0,
+        seed=42,
+        train=train,
+        val=val,
+        test=test,
+        instruction="Rubric",
+        backend=None,
+        root_out=tmp_path,
+        split_hashes={},
+    )
+
+    expected_forbidden = (
+        {int(x["essay_id"]) for x in expected_diag}
+        | {int(x["essay_id"]) for x in expected_sel}
+        | {int(x["essay_id"]) for x in test}
+    )
+    assert captured["forbidden_ids"] == expected_forbidden
+    assert captured["forbidden_ids"].isdisjoint({int(x["essay_id"]) for x in train})
+
+
+def test_bapr_fake_scoring_smoke_writes_required_outputs(monkeypatch, tmp_path):
+    train = [_item(i, score) for i, score in enumerate([2, 3, 4, 7, 8, 9, 10, 11, 12], start=1)]
+    val = [_item(100 + i, score) for i, score in enumerate([2, 2, 7, 7, 12, 12])]
+    test = [_item(200 + i, score) for i, score in enumerate([2, 7, 12])]
+
+    def fake_parent_builder(train_rows, val_rows, k, score_min, score_max, config, instruction, backend, out_dir):
+        anchors = [
+            runner.AnchorRecord(
+                essay_id=int(x["essay_id"]),
+                gold_score=int(x["domain1_score"]),
+                prompt_id=1,
+                token_length=8,
+                source_split="train",
+                selection_score=1.0,
+                selection_reason="fake_a0",
+                essay_text=x["essay_text"],
+            )
+            for x in train_rows[:k]
+        ]
+        return anchors, [{"essay_id": a.essay_id, "gold_score": a.gold_score} for a in anchors]
+
+    monkeypatch.setattr(runner, "retrieval_grounded_stratified_rep_anchors_v21", fake_parent_builder)
+    summary = runner.run_bapr_one(
+        method="bapr_repair_k_anchor",
+        k=3,
+        config={
+            "data": {"score_min": 2, "score_max": 12, "essay_set": 1},
+            "bapr": {"val_diag_ratio": 0.5, "max_children": 0},
+        },
+        fold=0,
+        seed=42,
+        train=train,
+        val=val,
+        test=test,
+        instruction="Rubric",
+        backend=None,
+        root_out=tmp_path,
+        split_hashes={},
+    )
+
+    run_dir = Path(summary["exp_dir"])
+    for name in [
+        "bapr_val_split.json",
+        "bapr_parent_anchor_bank.json",
+        "bapr_parent_metrics.json",
+        "bapr_failure_profile.json",
+        "bapr_repair_candidates.jsonl",
+        "bapr_guarded_selection.csv",
+        "bapr_final_anchor_bank.json",
+        "bapr_repair_trace.jsonl",
+    ]:
+        assert (run_dir / name).exists()
+    with open(run_dir / "predictions.csv", encoding="utf-8", newline="") as f:
+        rows = list(csv.DictReader(f))
+    assert rows
+    assert all("fake_scoring" in row["raw_text"] for row in rows)
+
+
+def test_bapr_config_loads():
     with open("configs/anchor_budget_bapr_v1.yaml", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
     assert cfg["anchor_budget"]["methods"] == ["bapr_repair_k_anchor"]
     assert cfg["pace"]["final_pace_calibrated"] is False
+    assert "retrieval_weight" not in cfg["anchor_budget"]["representation"]
+    assert cfg["anchor_budget"]["retrieval_grounded_rep_v21"]["retrieval_weight"] == 0.8
+    assert cfg["anchor_budget"]["retrieval_grounded_rep_v21"]["representation_weight"] == 0.2

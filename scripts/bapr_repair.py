@@ -18,7 +18,15 @@ REMOVE_CONFUSING_OR_REDUNDANT_ANCHOR = "REMOVE_CONFUSING_OR_REDUNDANT_ANCHOR"
 
 
 OPERATOR_TARGET_METRICS = {
-    REBALANCE_SCORE_BANDS: ["range_coverage", "score_tv", "worst_band_mae"],
+    REBALANCE_SCORE_BANDS: [
+        "anchor_band_coverage",
+        "anchor_unique_score_count",
+        "anchor_score_range_span",
+        "anchor_score_range_coverage",
+        "range_coverage",
+        "score_tv",
+        "worst_band_mae",
+    ],
     REPLACE_WORST_BAND_ANCHOR: ["worst_band_mae", "score_tv"],
     DECOMPRESS_EXTREME_ANCHORS: [
         "high_recall",
@@ -50,12 +58,11 @@ def tokenize_simple(text: str) -> set[str]:
 
 
 def band_for(score: int, score_min: int, score_max: int) -> str:
-    span = max(1, score_max - score_min)
-    low_cut = score_min + span / 3.0
-    high_cut = score_min + 2.0 * span / 3.0
-    if score <= low_cut:
+    low_max = math.floor(score_min + (score_max - score_min) / 3.0)
+    high_min = math.ceil(score_min + 2.0 * (score_max - score_min) / 3.0)
+    if score <= low_max:
         return "low"
-    if score >= high_cut:
+    if score >= high_min:
         return "high"
     return "mid"
 
@@ -486,7 +493,15 @@ def _metric_improved(parent: Dict[str, Any], child: Dict[str, Any], metric: str)
     c = child.get(metric)
     if p is None or c is None:
         return False
-    if metric in {"high_recall", "max_recall", "range_coverage"}:
+    if metric in {
+        "high_recall",
+        "max_recall",
+        "range_coverage",
+        "anchor_band_coverage",
+        "anchor_unique_score_count",
+        "anchor_score_range_span",
+        "anchor_score_range_coverage",
+    }:
         return float(c) > float(p)
     if metric in {"high_tail_under_score_rate", "max_score_under_score_rate", "score_tv", "worst_band_mae"}:
         return float(c) < float(p)
@@ -605,6 +620,7 @@ def _selection_metric_fields(metrics: Dict[str, Any]) -> Dict[str, Any]:
         "anchor_band_coverage": metrics.get("anchor_band_coverage"),
         "anchor_unique_score_count": metrics.get("anchor_unique_score_count"),
         "anchor_score_range_span": metrics.get("anchor_score_range_span"),
+        "anchor_score_range_coverage": metrics.get("anchor_score_range_coverage"),
         "token_cost": metrics.get("token_cost"),
     }
 
