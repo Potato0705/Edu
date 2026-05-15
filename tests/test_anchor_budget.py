@@ -20,9 +20,11 @@ from scripts.run_anchor_budget_experiment import (  # noqa: E402
     retrieval_grounded_stratified_rep_anchors,
     retrieval_grounded_stratified_rep_anchors_v21,
     score_boundary_metrics,
+    stability_retrieval_anchors,
     stratified_rep_guided_anchors,
     stratified_anchors,
 )
+from scripts.anchor_stability import estimate_anchor_stability, select_stable_anchor_rows  # noqa: E402
 
 
 def _toy_items():
@@ -503,6 +505,75 @@ def test_retrieval_grounded_no_rep_preserves_band_quota_and_logging(tmp_path):
     assert required <= set(trace[0])
 
 
+def test_anchor_stability_estimator_outputs_frequency_and_rank_variance():
+    items = _toy_items()
+    val = [
+        {"essay_id": 1001, "essay_text": "excellent evidence organization language", "domain1_score": 12},
+        {"essay_id": 1002, "essay_text": "weak vague limited", "domain1_score": 2},
+        {"essay_id": 1003, "essay_text": "middle evidence organized", "domain1_score": 7},
+    ]
+    rows, trace = estimate_anchor_stability(
+        items,
+        val,
+        k=9,
+        score_min=2,
+        score_max=12,
+        n_bootstrap=4,
+        sample_ratio=0.75,
+        seed=7,
+        per_band_top_n=3,
+    )
+
+    assert rows
+    assert trace
+    assert {"selection_frequency", "mean_rank", "rank_variance", "stability_score"} <= set(rows[0])
+    assert all(0.0 <= row["selection_frequency"] <= 1.0 for row in rows)
+
+
+def test_stability_retrieval_selector_satisfies_band_quota_and_no_test_leakage(tmp_path):
+    items = _toy_items()
+    val = [
+        {"essay_id": 1001, "essay_text": "excellent evidence organization language sophisticated", "domain1_score": 12},
+        {"essay_id": 1002, "essay_text": "middle organized evidence", "domain1_score": 7},
+        {"essay_id": 1003, "essay_text": "weak vague limited", "domain1_score": 2},
+    ]
+    cfg = {"anchor_budget": {"stability_retrieval": {"n_bootstrap": 4, "per_band_top_n": 3}}}
+    anchors, trace = stability_retrieval_anchors(
+        items, val, 9, 2, 12, cfg, "Rubric", backend=None, out_dir=tmp_path
+    )
+
+    assert len(anchors) == 9
+    bands = [row["requested_band"] for row in trace]
+    assert bands.count("low") == 3
+    assert bands.count("mid") == 3
+    assert bands.count("high") == 3
+    assert not ({a.essay_id for a in anchors} & {1001, 1002, 1003})
+    assert (tmp_path / "anchor_stability_scores.csv").exists()
+    assert (tmp_path / "stability_trace.jsonl").exists()
+
+
+def test_select_stable_anchor_rows_prefers_stability_with_coverage():
+    items = _toy_items()
+    rows, _ = estimate_anchor_stability(
+        items,
+        [
+            {"essay_id": 1001, "essay_text": "excellent evidence organization language", "domain1_score": 12},
+            {"essay_id": 1002, "essay_text": "weak vague limited", "domain1_score": 2},
+            {"essay_id": 1003, "essay_text": "middle evidence organized", "domain1_score": 7},
+        ],
+        k=6,
+        score_min=2,
+        score_max=12,
+        n_bootstrap=3,
+        seed=42,
+    )
+    selected, trace = select_stable_anchor_rows(items, rows, k=6, score_min=2, score_max=12)
+
+    assert len(selected) == 6
+    assert len(trace) == 6
+    assert {"low", "mid", "high"} <= {row["band"] for row in trace}
+
+
 def test_phase1_decision_requires_representation_change():
     rows = [
         {"method": "static_k_anchor", "k": 3, "val_qwk": 0.2, "high_recall": 0.1, "SCI": 0.5, "range_coverage": 0.4},
@@ -544,6 +615,31 @@ def test_anchor_budget_config_loads_and_dry_run_lists_phase1_plan():
     assert ["no_anchor", None] in payload["plan"]
     assert ["representation_guided_k_anchor", 3] in payload["plan"]
     assert ["full_static_anchor", None] in payload["plan"]
+
+
+def test_bapr_si_config_loads_and_dry_run_lists_plan():
+    path = Path("configs/anchor_budget_bapr_si.yaml")
+    cfg = yaml.safe_load(path.read_text(encoding="utf-8"))
+    assert cfg["pace"]["final_pace_calibrated"] is False
+    assert cfg["anchor_budget"]["methods"] == ["bapr_si_k_anchor"]
+    assert cfg["bapr"]["parent_init_method"] == "stability_retrieval_k_anchor"
+    assert cfg["bapr"]["influence"]["loo_attribution_enabled"] is True
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "scripts/run_anchor_budget_experiment.py",
+            "--config",
+            str(path),
+            "--fold",
+            "0",
+            "--dry-run",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    payload = json.loads(proc.stdout)
+    assert ["bapr_si_k_anchor", 9] in payload["plan"]
 
 
 def test_phase2_dry_run_uses_only_k9_and_expected_prompts():

@@ -1,0 +1,85 @@
+# BAPR-SI smoke / pilot config.
+# Stability and influence are used only for validation-time anchor protocol
+# selection and repair. Final scoring remains raw LLM output under selected
+# anchors; no test-time calibration or trained scorer is used.
+
+model:
+  name: models/Meta-Llama-3.1-8B-Instruct
+
+data:
+  asap_path: data/raw/training_set_rel3.tsv
+  essay_set: 1
+  score_min: 2
+  score_max: 12
+
+induction:
+  enabled: false
+  official_criteria: >
+    Evaluate the essay holistically based on content, organization, and language
+    use. Reward clear position, relevant development, coherent organization,
+    sentence control, and effective language. Penalize thin development,
+    weak organization, severe language problems, and off-topic responses.
+
+anchor_budget:
+  methods:
+    - bapr_si_k_anchor
+  k_values: [9]
+  full_static_per_score: 3
+  stability_retrieval:
+    n_bootstrap: 8
+    sample_ratio: 0.75
+    per_band_top_n: 8
+    rank_variance_weight: 0.10
+    redundancy_weight: 0.15
+    selection_redundancy_weight: 0.20
+    token_weight: 0.02
+
+bapr:
+  repair_mode: stability_influence
+  parent_init_method: stability_retrieval_k_anchor
+  val_diag_ratio: 0.5
+  max_children: 3
+  influence:
+    mode: proxy_with_loo_attribution
+    loo_attribution_enabled: true
+    loo_max_anchors: 9
+    loo_max_items: 24
+  guard:
+    qwk_drop_tolerance: 0.02
+    mae_increase_tolerance: 0.10
+    stability_drop_tolerance: 0.05
+
+llm:
+  local_backend_enabled: true
+  temperature_scoring: 0.0
+  max_new_tokens_scoring: 192
+  max_new_tokens_reflection: 512
+  max_new_tokens_induction: 512
+  protocol_cache_enabled: true
+
+output:
+  root: logs/anchor_budget_bapr_si
+  verbose: false
+
+debug:
+  enabled: true
+  stratified: true
+  seed: 42
+  n_train: 240
+  n_val: 96
+  n_test: 64
+
+pace:
+  enabled: false
+  model_path: models/Meta-Llama-3.1-8B-Instruct
+  load_in_4bit: false
+  dtype: bfloat16
+  final_pace_calibrated: false
+
+evolution:
+  max_score_contract_enabled: true
+  max_score_contract_text: |
+    The maximum score is attainable. Do not reserve the maximum score only for flawless essays. If the essay is comparable to or stronger than the high-score anchor in content, organization, and language use, assign a score near the top of the range, including the maximum score when appropriate.
+
+rag:
+  enabled: false

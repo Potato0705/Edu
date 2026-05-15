@@ -501,9 +501,19 @@ def _metric_improved(parent: Dict[str, Any], child: Dict[str, Any], metric: str)
         "anchor_unique_score_count",
         "anchor_score_range_span",
         "anchor_score_range_coverage",
+        "anchor_stability_score",
+        "anchor_stability_min",
+        "anchor_selection_frequency_mean",
     }:
         return float(c) > float(p)
-    if metric in {"high_tail_under_score_rate", "max_score_under_score_rate", "score_tv", "worst_band_mae"}:
+    if metric in {
+        "high_tail_under_score_rate",
+        "max_score_under_score_rate",
+        "score_tv",
+        "worst_band_mae",
+        "anchor_redundancy_mean",
+        "anchor_redundancy_max",
+    }:
         return float(c) < float(p)
     if metric == "score_compression_index":
         return abs(float(c) - 1.0) < abs(float(p) - 1.0)
@@ -524,6 +534,7 @@ def guarded_select_repaired_bank(
     cfg = (config or {}).get("bapr", {}).get("guard", config or {})
     qwk_drop = float(cfg.get("qwk_drop_tolerance", 0.02))
     mae_increase = float(cfg.get("mae_increase_tolerance", 0.10))
+    stability_drop = float(cfg.get("stability_drop_tolerance", 0.05))
     rows: List[Dict[str, Any]] = []
     parent_candidate_id = str(parent_anchor_bank.get("candidate_id", "BAPR-A0"))
     parent_row = {
@@ -554,6 +565,9 @@ def guarded_select_repaired_bank(
                 reasons.append(metric)
         if int(metrics.get("anchor_score_range_span", 0) or 0) < int(parent_metrics.get("anchor_score_range_span", 0) or 0) - 1:
             reasons.append("anchor_score_range_span")
+        if "anchor_stability_score" in parent_metrics and "anchor_stability_score" in metrics:
+            if float(metrics.get("anchor_stability_score", 0.0) or 0.0) < float(parent_metrics.get("anchor_stability_score", 0.0) or 0.0) - stability_drop:
+                reasons.append("anchor_stability_score")
         target_metrics = bank.get("target_boundary_metrics", OPERATOR_TARGET_METRICS.get(str(bank.get("operator")), []))
         improved = boundary_improved_for_operator(parent_metrics, metrics, target_metrics)
         if not improved:
@@ -622,6 +636,11 @@ def _selection_metric_fields(metrics: Dict[str, Any]) -> Dict[str, Any]:
         "anchor_unique_score_count": metrics.get("anchor_unique_score_count"),
         "anchor_score_range_span": metrics.get("anchor_score_range_span"),
         "anchor_score_range_coverage": metrics.get("anchor_score_range_coverage"),
+        "anchor_stability_score": metrics.get("anchor_stability_score"),
+        "anchor_stability_min": metrics.get("anchor_stability_min"),
+        "anchor_selection_frequency_mean": metrics.get("anchor_selection_frequency_mean"),
+        "anchor_redundancy_mean": metrics.get("anchor_redundancy_mean"),
+        "anchor_redundancy_max": metrics.get("anchor_redundancy_max"),
         "token_cost": metrics.get("token_cost"),
     }
 

@@ -23,6 +23,10 @@ from scripts.bapr_repair import (  # noqa: E402
     rank_repair_operators,
     split_val_diag_sel,
 )
+from scripts.anchor_influence import (  # noqa: E402
+    estimate_proxy_influence,
+    generate_influence_repair_children,
+)
 from scripts.run_anchor_budget_experiment import AnchorRecord, is_run_complete  # noqa: E402
 
 
@@ -242,6 +246,19 @@ def test_score_compression_index_improvement_uses_closeness_to_one():
     )
 
 
+def test_anchor_redundancy_metrics_improve_when_lower():
+    assert boundary_improved_for_operator(
+        _metrics(anchor_redundancy_mean=0.60, anchor_redundancy_max=0.80),
+        _metrics(anchor_redundancy_mean=0.30, anchor_redundancy_max=0.70),
+        ["anchor_redundancy_mean"],
+    )
+    assert boundary_improved_for_operator(
+        _metrics(anchor_redundancy_mean=0.60, anchor_redundancy_max=0.80),
+        _metrics(anchor_redundancy_mean=0.70, anchor_redundancy_max=0.50),
+        ["anchor_redundancy_max"],
+    )
+
+
 def test_guard_tie_break_is_deterministic_by_candidate_id():
     parent = {
         "anchor_bank_id": "parent",
@@ -290,6 +307,134 @@ def test_bapr_run_complete_requires_bapr_specific_outputs(tmp_path):
         (tmp_path / name).write_text("{}", encoding="utf-8")
 
     assert is_run_complete(tmp_path, "bapr_repair_k_anchor")
+
+
+def test_bapr_si_run_complete_requires_stability_and_influence_outputs(tmp_path):
+    for name in runner.REQUIRED_RUN_FILES:
+        (tmp_path / name).write_text("{}", encoding="utf-8")
+    for name in [
+        "bapr_failure_profile.json",
+        "bapr_repair_candidates.jsonl",
+        "bapr_guarded_selection.csv",
+        "bapr_parent_anchor_bank.json",
+        "bapr_parent_metrics.json",
+        "bapr_final_anchor_bank.json",
+        "bapr_repair_trace.jsonl",
+    ]:
+        (tmp_path / name).write_text("{}", encoding="utf-8")
+
+    assert not is_run_complete(tmp_path, "bapr_si_k_anchor")
+    for name in [
+        "anchor_stability_scores.csv",
+        "stability_trace.jsonl",
+        "anchor_influence_scores.csv",
+        "anchor_influence_trace.jsonl",
+        "anchor_loo_influence_scores.csv",
+        "anchor_influence_child_alignment.csv",
+        "bapr_si_repair_trace.jsonl",
+    ]:
+        (tmp_path / name).write_text("{}", encoding="utf-8")
+    assert is_run_complete(tmp_path, "bapr_si_k_anchor")
+
+
+def test_proxy_influence_identifies_non_stable_harmful_anchor():
+    parent = [
+        _anchor(1, 2, "low weak vague"),
+        _anchor(2, 7, "middle repeated repeated"),
+        _anchor(3, 8, "middle repeated repeated"),
+        _anchor(4, 12, "high excellent"),
+    ]
+    stability_rows = [
+        {"essay_id": 1, "stability_score": 0.8, "selection_frequency": 1.0},
+        {"essay_id": 2, "stability_score": 0.1, "selection_frequency": 0.2},
+        {"essay_id": 3, "stability_score": 0.1, "selection_frequency": 0.2},
+        {"essay_id": 4, "stability_score": 0.7, "selection_frequency": 0.9},
+    ]
+    rows, trace = estimate_proxy_influence(
+        parent,
+        [],
+        [],
+        {"score_compression_index": 0.45, "range_coverage": 0.20, "high_tail_under_score_rate": 0.0},
+        stability_rows,
+        score_min=2,
+        score_max=12,
+    )
+
+    assert rows
+    assert trace
+    assert rows[0]["anchor_failure_type"] in {"harmful_compression_anchor", "redundant_low_influence_anchor"}
+    assert rows[0]["negative_influence_score"] > 0
+
+
+def test_proxy_influence_does_not_create_boundary_confuser_without_band_error():
+    parent = [
+        _anchor(1, 2, "alpha banana cedar"),
+        _anchor(2, 7, "delta ember frost"),
+        _anchor(3, 12, "gamma harbor ivory"),
+    ]
+    stability_rows = [
+        {"essay_id": 1, "stability_score": 0.8, "selection_frequency": 1.0},
+        {"essay_id": 2, "stability_score": 0.8, "selection_frequency": 1.0},
+        {"essay_id": 3, "stability_score": 0.8, "selection_frequency": 1.0},
+    ]
+    rows, _ = estimate_proxy_influence(
+        parent,
+        [],
+        [],
+        {
+            "worst_band": "mid",
+            "band_mae_mid": 0.0,
+            "score_compression_index": 1.0,
+            "range_coverage": 1.0,
+            "high_tail_under_score_rate": 0.0,
+            "max_score_under_score_rate": 0.0,
+        },
+        stability_rows,
+        score_min=2,
+        score_max=12,
+    )
+
+    by_id = {row["anchor_id"]: row for row in rows}
+    assert by_id[2]["anchor_failure_type"] == "useful_stabilizing_anchor"
+
+
+def test_influence_repair_children_replace_negative_anchor_with_stable_candidate():
+    parent = [_anchor(1, 2), _anchor(2, 7), _anchor(3, 12)]
+    train = [_item(1, 2), _item(2, 7), _item(3, 12), _item(4, 7, "stable mid candidate"), _item(5, 12)]
+    stability_rows = [
+        {"essay_id": 4, "gold_score": 7, "band": "mid", "stability_score": 0.95, "selection_frequency": 1.0},
+        {"essay_id": 5, "gold_score": 12, "band": "high", "stability_score": 0.50, "selection_frequency": 0.5},
+    ]
+    influence_rows = [
+        {
+            "anchor_id": 2,
+            "anchor_failure_type": "boundary_confuser",
+            "negative_influence_score": 0.8,
+            "target_band": "mid",
+            "target_boundary_metrics": ["worst_band_mae"],
+            "expected_repair_metric": "worst_band_mae",
+        }
+    ]
+
+    children, trace = generate_influence_repair_children(
+        parent,
+        train,
+        [],
+        stability_rows,
+        influence_rows,
+        score_min=2,
+        score_max=12,
+        k=3,
+        forbidden_ids={100, 101},
+        max_children=1,
+    )
+
+    assert children
+    assert trace
+    assert 2 not in children[0]["anchor_ids"]
+    assert 4 in children[0]["anchor_ids"]
+    assert children[0]["removed_anchor_failure_type"] == "boundary_confuser"
+    assert children[0]["added_anchor_stability"] == pytest.approx(0.95)
 
 
 def test_bapr_v1_config_v21_params_are_used_by_selector(tmp_path):
@@ -531,6 +676,124 @@ def test_bapr_fake_scoring_smoke_writes_required_outputs(monkeypatch, tmp_path):
         rows = list(csv.DictReader(f))
     assert rows
     assert all("fake_scoring" in row["raw_text"] for row in rows)
+
+
+def test_bapr_si_fake_scoring_smoke_writes_stability_influence_outputs(tmp_path):
+    train = [_item(i, score) for i, score in enumerate([2, 3, 4, 6, 7, 8, 10, 11, 12], start=1)]
+    val = [_item(100 + i, score) for i, score in enumerate([2, 2, 7, 7, 12, 12])]
+    test = [_item(200 + i, score) for i, score in enumerate([2, 7, 12])]
+    summary = runner.run_bapr_one(
+        method="bapr_si_k_anchor",
+        k=3,
+        config={
+            "data": {"score_min": 2, "score_max": 12, "essay_set": 1},
+            "anchor_budget": {"stability_retrieval": {"n_bootstrap": 3, "per_band_top_n": 3}},
+            "bapr": {
+                "repair_mode": "stability_influence",
+                "parent_init_method": "stability_retrieval_k_anchor",
+                "val_diag_ratio": 0.5,
+                "max_children": 1,
+                "influence": {
+                    "loo_attribution_enabled": True,
+                    "loo_max_anchors": 3,
+                    "loo_max_items": 3,
+                },
+            },
+        },
+        fold=0,
+        seed=42,
+        train=train,
+        val=val,
+        test=test,
+        instruction="Rubric",
+        backend=None,
+        root_out=tmp_path,
+        split_hashes={},
+    )
+
+    run_dir = Path(summary["exp_dir"])
+    for name in [
+        "bapr_val_split.json",
+        "bapr_parent_anchor_bank.json",
+        "bapr_parent_metrics.json",
+        "bapr_failure_profile.json",
+        "bapr_repair_candidates.jsonl",
+        "bapr_guarded_selection.csv",
+        "bapr_final_anchor_bank.json",
+        "bapr_repair_trace.jsonl",
+        "anchor_stability_scores.csv",
+        "stability_trace.jsonl",
+        "anchor_influence_scores.csv",
+        "anchor_influence_trace.jsonl",
+        "anchor_loo_influence_scores.csv",
+        "anchor_influence_child_alignment.csv",
+        "bapr_si_repair_trace.jsonl",
+    ]:
+        assert (run_dir / name).exists()
+    with open(run_dir / "anchor_loo_influence_scores.csv", encoding="utf-8", newline="") as f:
+        loo_rows = list(csv.DictReader(f))
+    assert loo_rows
+    assert {"delta_qwk_without_anchor", "loo_harm_score", "proxy_failure_type"} <= set(loo_rows[0])
+    final_bank = yaml.safe_load((run_dir / "bapr_final_anchor_bank.json").read_text(encoding="utf-8"))
+    assert final_bank["bapr_repair_mode"] == "stability_influence"
+
+
+def test_bapr_si_reuses_parent_stability_artifacts(monkeypatch, tmp_path):
+    train = [_item(i, score) for i, score in enumerate([2, 3, 4, 6, 7, 8, 10, 11, 12], start=1)]
+    val = [_item(100 + i, score) for i, score in enumerate([2, 2, 7, 7, 12, 12])]
+    test = [_item(200 + i, score) for i, score in enumerate([2, 7, 12])]
+    calls = {"n": 0}
+
+    def fake_estimate(train_pool, val_diag, *, k, score_min, score_max, **kwargs):
+        calls["n"] += 1
+        rows = []
+        for idx, item in enumerate(train_pool):
+            score = int(item["domain1_score"])
+            rows.append(
+                {
+                    "essay_id": int(item["essay_id"]),
+                    "gold_score": score,
+                    "band": runner.band_for(score, score_min, score_max),
+                    "selection_frequency": 1.0,
+                    "mean_rank": idx + 1,
+                    "rank_variance": 0.0,
+                    "mean_retrieval_score": float(len(train_pool) - idx),
+                    "redundancy_score": 0.0,
+                    "stability_score": float(len(train_pool) - idx),
+                    "selected_count": 1,
+                    "bootstrap_count": 1,
+                    "token_length": 8,
+                }
+            )
+        return rows, [{"bootstrap_index": 0, "essay_id": int(train_pool[0]["essay_id"])}]
+
+    monkeypatch.setattr(runner, "estimate_anchor_stability", fake_estimate)
+    runner.run_bapr_one(
+        method="bapr_si_k_anchor",
+        k=3,
+        config={
+            "data": {"score_min": 2, "score_max": 12, "essay_set": 1},
+            "anchor_budget": {"stability_retrieval": {"n_bootstrap": 3, "per_band_top_n": 3}},
+            "bapr": {
+                "repair_mode": "stability_influence",
+                "parent_init_method": "stability_retrieval_k_anchor",
+                "val_diag_ratio": 0.5,
+                "max_children": 0,
+                "influence": {"loo_attribution_enabled": False},
+            },
+        },
+        fold=0,
+        seed=42,
+        train=train,
+        val=val,
+        test=test,
+        instruction="Rubric",
+        backend=None,
+        root_out=tmp_path,
+        split_hashes={},
+    )
+
+    assert calls["n"] == 1
 
 
 def test_bapr_config_loads():
