@@ -20,6 +20,7 @@ REMOVE_CONFUSING_OR_REDUNDANT_ANCHOR = "REMOVE_CONFUSING_OR_REDUNDANT_ANCHOR"
 OPERATOR_TARGET_METRICS = {
     REBALANCE_SCORE_BANDS: [
         "anchor_band_coverage",
+        "anchor_slot_coverage",
         "anchor_unique_score_count",
         "anchor_score_range_span",
         "anchor_score_range_coverage",
@@ -65,6 +66,67 @@ def band_for(score: int, score_min: int, score_max: int) -> str:
     if score >= high_min:
         return "high"
     return "mid"
+
+
+SCORE_SLOT_ORDER = ["low_tail", "lower_mid", "median", "upper_mid", "high_tail", "max_or_top"]
+
+
+def score_slot_for(score: int, score_min: int, score_max: int) -> str:
+    """Fine-grained, score-range-aware anchor slot.
+
+    Macro bands remain useful for reporting, but anchor quota should ground the
+    full scoring scale. The last slot explicitly protects maximum/top-tail
+    anchors, which low/mid/high coverage can miss.
+    """
+
+    score = int(score)
+    if score_max <= score_min:
+        return "median"
+    span = max(1, int(score_max) - int(score_min))
+    top_margin = max(1, int(round(0.10 * span)))
+    if score >= int(score_max) - top_margin:
+        return "max_or_top"
+    ratio = (score - int(score_min)) / float(span)
+    if ratio < 0.20:
+        return "low_tail"
+    if ratio < 0.40:
+        return "lower_mid"
+    if ratio < 0.55:
+        return "median"
+    if ratio < 0.75:
+        return "upper_mid"
+    return "high_tail"
+
+
+def score_slot_labels(score_min: int, score_max: int) -> List[str]:
+    present = {score_slot_for(score, score_min, score_max) for score in range(int(score_min), int(score_max) + 1)}
+    return [slot for slot in SCORE_SLOT_ORDER if slot in present]
+
+
+def score_slot_quota(k: int, available_slots: Iterable[str]) -> Dict[str, int]:
+    slots = [slot for slot in SCORE_SLOT_ORDER if slot in set(available_slots)]
+    if k <= 0 or not slots:
+        return {}
+    if k < len(slots):
+        priority = ["low_tail", "median", "max_or_top", "upper_mid", "high_tail", "lower_mid"]
+        chosen = [slot for slot in priority if slot in slots][:k]
+        return {slot: 1 for slot in chosen}
+    quotas = {slot: 1 for slot in slots}
+    remaining = k - len(slots)
+    extra_order = ["median", "upper_mid", "high_tail", "lower_mid", "low_tail", "max_or_top"]
+    while remaining > 0:
+        progressed = False
+        for slot in extra_order:
+            if slot not in quotas:
+                continue
+            quotas[slot] += 1
+            remaining -= 1
+            progressed = True
+            if remaining <= 0:
+                break
+        if not progressed:
+            break
+    return quotas
 
 
 def score_distribution(values: Sequence[int], score_min: int, score_max: int) -> Dict[str, int]:
@@ -136,13 +198,20 @@ def split_val_diag_sel(
     score_max: int,
     diag_ratio: float = 0.5,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
-    by_band: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
-    for item in sorted(val, key=lambda x: (band_for(int(x["domain1_score"]), score_min, score_max), int(x["domain1_score"]), int(x["essay_id"]))):
-        by_band[band_for(int(item["domain1_score"]), score_min, score_max)].append(item)
+    by_slot: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for item in sorted(
+        val,
+        key=lambda x: (
+            score_slot_for(int(x["domain1_score"]), score_min, score_max),
+            int(x["domain1_score"]),
+            int(x["essay_id"]),
+        ),
+    ):
+        by_slot[score_slot_for(int(item["domain1_score"]), score_min, score_max)].append(item)
     diag: List[Dict[str, Any]] = []
     sel: List[Dict[str, Any]] = []
-    for band in ["low", "mid", "high"]:
-        rows = by_band.get(band, [])
+    for slot in score_slot_labels(score_min, score_max):
+        rows = by_slot.get(slot, [])
         n_diag = int(round(len(rows) * diag_ratio))
         if len(rows) > 1:
             n_diag = min(max(1, n_diag), len(rows) - 1)
@@ -157,6 +226,9 @@ def split_val_diag_sel(
         "val_sel_n": len(sel),
         "val_diag_score_distribution": score_distribution([int(x["domain1_score"]) for x in diag], score_min, score_max),
         "val_sel_score_distribution": score_distribution([int(x["domain1_score"]) for x in sel], score_min, score_max),
+        "val_split_strategy": "score_slot",
+        "val_diag_slot_distribution": dict(Counter(score_slot_for(int(x["domain1_score"]), score_min, score_max) for x in diag)),
+        "val_sel_slot_distribution": dict(Counter(score_slot_for(int(x["domain1_score"]), score_min, score_max) for x in sel)),
     }
     return diag, sel, meta
 
@@ -177,6 +249,9 @@ def anchor_metrics(anchors: Sequence[Dict[str, Any]], score_min: int, score_max:
     scores = [int(x["gold_score"]) for x in anchors]
     bands = [band_for(score, score_min, score_max) for score in scores]
     band_counts = {band: bands.count(band) for band in ["low", "mid", "high"]}
+    slots = [score_slot_for(score, score_min, score_max) for score in scores]
+    available_slots = score_slot_labels(score_min, score_max)
+    slot_counts = {slot: slots.count(slot) for slot in available_slots}
     pair_scores = []
     pair_rows = []
     for i, left in enumerate(anchors):
@@ -190,10 +265,14 @@ def anchor_metrics(anchors: Sequence[Dict[str, Any]], score_min: int, score_max:
     return {
         "anchor_band_counts": band_counts,
         "anchor_band_coverage": sum(1 for band in ["low", "mid", "high"] if band_counts.get(band, 0) > 0),
+        "anchor_slot_counts": slot_counts,
+        "anchor_slot_coverage": sum(1 for slot in available_slots if slot_counts.get(slot, 0) > 0),
+        "anchor_required_slot_count": len(available_slots),
         "anchor_unique_score_count": len(set(scores)),
         "anchor_score_range_span": span,
         "anchor_score_range_coverage": float(span / max(1, score_max - score_min)),
         "missing_anchor_bands": [band for band in ["low", "mid", "high"] if band_counts.get(band, 0) == 0],
+        "missing_anchor_slots": [slot for slot in available_slots if slot_counts.get(slot, 0) == 0],
         "anchor_redundancy_mean": float(np.mean(pair_scores)) if pair_scores else 0.0,
         "anchor_redundancy_max": float(max(pair_scores)) if pair_scores else 0.0,
         "most_redundant_anchor_pair": [most_pair[1], most_pair[2]] if most_pair[1] is not None else [],
@@ -243,20 +322,25 @@ def compute_failure_profile(
 def rank_repair_operators(failure_profile: Dict[str, Any]) -> List[Dict[str, Any]]:
     ranked: List[Dict[str, Any]] = []
     missing = list(failure_profile.get("missing_anchor_bands") or [])
-    if missing or int(failure_profile.get("anchor_band_coverage", 0) or 0) < 3:
+    missing_slots = list(failure_profile.get("missing_anchor_slots") or [])
+    if missing or missing_slots or int(failure_profile.get("anchor_band_coverage", 0) or 0) < 3:
         ranked.append(
             {
                 "operator": REBALANCE_SCORE_BANDS,
-                "severity": float(2.0 + len(missing)),
+                "severity": float(2.0 + len(missing) + 0.5 * len(missing_slots)),
                 "trigger_metrics": {
                     "missing_anchor_bands": missing,
+                    "missing_anchor_slots": missing_slots,
                     "anchor_band_coverage": failure_profile.get("anchor_band_coverage"),
+                    "anchor_slot_coverage": failure_profile.get("anchor_slot_coverage"),
+                    "anchor_required_slot_count": failure_profile.get("anchor_required_slot_count"),
                     "anchor_score_range_coverage": failure_profile.get("anchor_score_range_coverage"),
                 },
                 "target_band": missing[0] if missing else None,
+                "target_slot": missing_slots[0] if missing_slots else None,
                 "target_score_region": "coverage",
                 "target_boundary_metrics": OPERATOR_TARGET_METRICS[REBALANCE_SCORE_BANDS],
-                "rationale": "Anchor bank is missing score-band coverage.",
+                "rationale": "Anchor bank is missing score-band or score-slot coverage.",
             }
         )
     worst_band = failure_profile.get("worst_band")
@@ -355,6 +439,7 @@ def _candidate_rows(
     score_max: int,
     forbidden_ids: Iterable[int],
     target_band: Optional[str] = None,
+    target_slot: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     used = {int(x["essay_id"]) for x in anchors} | {int(x) for x in forbidden_ids}
     scores = retrieval_scores(train_pool, val_diag)
@@ -363,7 +448,8 @@ def _candidate_rows(
         essay_id = int(item["essay_id"])
         score = int(item.get("domain1_score", item.get("gold_score")))
         band = band_for(score, score_min, score_max)
-        if essay_id in used or (target_band is not None and band != target_band):
+        slot = score_slot_for(score, score_min, score_max)
+        if essay_id in used or (target_band is not None and band != target_band) or (target_slot is not None and slot != target_slot):
             continue
         anchor = _as_anchor(item, "bapr_candidate", scores.get(essay_id, 0.0))
         redundancy = max((text_jaccard(anchor["essay_text"], existing["essay_text"]) for existing in anchors), default=0.0)
@@ -371,6 +457,7 @@ def _candidate_rows(
             {
                 "anchor": anchor,
                 "band": band,
+                "score_slot": slot,
                 "retrieval_score": scores.get(essay_id, 0.0),
                 "redundancy": redundancy,
                 "token_length": anchor["token_length"],
@@ -432,12 +519,17 @@ def generate_repaired_children(
             break
         operator = str(op["operator"])
         target_band = op.get("target_band")
+        target_slot = op.get("target_slot")
         if operator == REBALANCE_SCORE_BANDS and failure_profile.get("missing_anchor_bands"):
             target_band = failure_profile["missing_anchor_bands"][0]
+        if operator == REBALANCE_SCORE_BANDS and failure_profile.get("missing_anchor_slots"):
+            target_slot = failure_profile["missing_anchor_slots"][0]
         if operator == DECOMPRESS_EXTREME_ANCHORS and not target_band:
             target_band = "high"
         remove = _choose_anchor_to_remove(parent, operator, target_band, score_min, score_max, failure_profile)
-        candidates = _candidate_rows(train_pool, val_diag, parent, score_min, score_max, forbidden, target_band)
+        candidates = _candidate_rows(train_pool, val_diag, parent, score_min, score_max, forbidden, target_band, target_slot)
+        if not candidates and target_slot is not None:
+            candidates = _candidate_rows(train_pool, val_diag, parent, score_min, score_max, forbidden, target_band)
         if not candidates and target_band is not None:
             candidates = _candidate_rows(train_pool, val_diag, parent, score_min, score_max, forbidden, None)
         if not candidates:
@@ -461,6 +553,7 @@ def generate_repaired_children(
             "operator": operator,
             "severity": float(op.get("severity", 0.0) or 0.0),
             "target_band": target_band,
+            "target_slot": target_slot,
             "target_boundary_metrics": list(op.get("target_boundary_metrics", OPERATOR_TARGET_METRICS.get(operator, []))),
             "anchors": child,
             "anchor_ids": [int(a["essay_id"]) for a in child],
@@ -478,6 +571,7 @@ def generate_repaired_children(
                 "added_anchor_id": int(added["essay_id"]),
                 "added_anchor_score": int(added["gold_score"]),
                 "target_band": target_band,
+                "target_slot": target_slot,
                 "candidate_pool_size": len(candidates),
                 "replacement_reason": op.get("rationale", ""),
                 "parent_anchor_ids": [int(a["essay_id"]) for a in parent],
@@ -498,6 +592,7 @@ def _metric_improved(parent: Dict[str, Any], child: Dict[str, Any], metric: str)
         "max_recall",
         "range_coverage",
         "anchor_band_coverage",
+        "anchor_slot_coverage",
         "anchor_unique_score_count",
         "anchor_score_range_span",
         "anchor_score_range_coverage",
@@ -524,17 +619,125 @@ def boundary_improved_for_operator(parent_metrics: Dict[str, Any], child_metrics
     return any(_metric_improved(parent_metrics, child_metrics, metric) for metric in target_metrics)
 
 
+def _metric_delta(parent: Dict[str, Any], child: Dict[str, Any], metric: str) -> Optional[float]:
+    p = parent.get(metric)
+    c = child.get(metric)
+    if p is None or c is None:
+        return None
+    if metric in {
+        "high_recall",
+        "max_recall",
+        "range_coverage",
+        "anchor_band_coverage",
+        "anchor_slot_coverage",
+        "anchor_unique_score_count",
+        "anchor_score_range_span",
+        "anchor_score_range_coverage",
+        "anchor_stability_score",
+        "anchor_stability_min",
+        "anchor_selection_frequency_mean",
+    }:
+        return float(c) - float(p)
+    if metric in {
+        "high_tail_under_score_rate",
+        "max_score_under_score_rate",
+        "score_tv",
+        "worst_band_mae",
+        "anchor_redundancy_mean",
+        "anchor_redundancy_max",
+    }:
+        return float(p) - float(c)
+    if metric == "score_compression_index":
+        return abs(float(p) - 1.0) - abs(float(c) - 1.0)
+    return None
+
+
+def _paired_eval_rows(
+    parent_rows: Sequence[Dict[str, Any]],
+    child_rows: Sequence[Dict[str, Any]],
+) -> List[Tuple[Dict[str, Any], Dict[str, Any]]]:
+    child_by_id = {int(row["essay_id"]): row for row in child_rows if "essay_id" in row}
+    pairs = []
+    for parent_row in parent_rows:
+        essay_id = int(parent_row.get("essay_id", -1))
+        child_row = child_by_id.get(essay_id)
+        if child_row is not None:
+            pairs.append((parent_row, child_row))
+    pairs.sort(key=lambda pair: int(pair[0].get("essay_id", 0)))
+    return pairs
+
+
+def bootstrap_guard_summary(
+    parent_rows: Sequence[Dict[str, Any]],
+    child_rows: Sequence[Dict[str, Any]],
+    *,
+    score_min: int,
+    score_max: int,
+    target_metrics: Sequence[str],
+    n_bootstrap: int = 5,
+    sample_ratio: float = 0.80,
+    seed: int = 42,
+) -> Dict[str, Any]:
+    pairs = _paired_eval_rows(parent_rows, child_rows)
+    if len(pairs) < 2 or n_bootstrap <= 0:
+        return {}
+    sample_size = max(2, min(len(pairs), int(round(len(pairs) * sample_ratio))))
+    qwk_deltas: List[float] = []
+    mae_deltas: List[float] = []
+    target_improved: List[float] = []
+    for i in range(n_bootstrap):
+        rng = np.random.default_rng(int(seed) + i)
+        idx = [int(x) for x in rng.integers(0, len(pairs), size=sample_size)]
+        parent_true = [int(pairs[j][0]["gold_score"]) for j in idx]
+        parent_pred = [int(pairs[j][0]["pred_score"]) for j in idx]
+        child_pred = [int(pairs[j][1]["pred_score"]) for j in idx]
+        parent_metrics = score_metrics(parent_true, parent_pred, score_min, score_max)
+        child_metrics = score_metrics(parent_true, child_pred, score_min, score_max)
+        qwk_deltas.append(float(child_metrics["qwk"] - parent_metrics["qwk"]))
+        mae_deltas.append(float(child_metrics["mae"] - parent_metrics["mae"]))
+        target_improved.append(1.0 if boundary_improved_for_operator(parent_metrics, child_metrics, target_metrics) else 0.0)
+    qwk_mean = float(np.mean(qwk_deltas))
+    qwk_std = float(np.std(qwk_deltas))
+    mae_mean = float(np.mean(mae_deltas))
+    mae_std = float(np.std(mae_deltas))
+    return {
+        "bootstrap_n": int(n_bootstrap),
+        "bootstrap_sample_size": int(sample_size),
+        "bootstrap_qwk_delta_mean": qwk_mean,
+        "bootstrap_qwk_delta_std": qwk_std,
+        "bootstrap_qwk_delta_lower": qwk_mean - qwk_std,
+        "bootstrap_mae_delta_mean": mae_mean,
+        "bootstrap_mae_delta_std": mae_std,
+        "bootstrap_mae_delta_upper": mae_mean + mae_std,
+        "bootstrap_target_metric_improved_rate": float(np.mean(target_improved)),
+    }
+
+
 def guarded_select_repaired_bank(
     parent_metrics: Dict[str, Any],
     child_metrics_list: Sequence[Dict[str, Any]],
     parent_anchor_bank: Dict[str, Any],
     child_anchor_banks: Sequence[Dict[str, Any]],
     config: Dict[str, Any] | None = None,
+    parent_eval_rows: Sequence[Dict[str, Any]] | None = None,
+    child_eval_rows_list: Sequence[Sequence[Dict[str, Any]]] | None = None,
+    score_min: Optional[int] = None,
+    score_max: Optional[int] = None,
 ) -> Dict[str, Any]:
     cfg = (config or {}).get("bapr", {}).get("guard", config or {})
     qwk_drop = float(cfg.get("qwk_drop_tolerance", 0.02))
     mae_increase = float(cfg.get("mae_increase_tolerance", 0.10))
     stability_drop = float(cfg.get("stability_drop_tolerance", 0.05))
+    stability_soft_override_enabled = bool(cfg.get("stability_soft_override_enabled", False))
+    stability_soft_override_min_child_stability = float(cfg.get("stability_soft_override_min_child_stability", 0.70))
+    stability_soft_override_min_qwk_gain = float(cfg.get("stability_soft_override_min_qwk_gain", 0.03))
+    bootstrap_enabled = bool(cfg.get("bootstrap_guard_enabled", False))
+    bootstrap_n = int(cfg.get("bootstrap_n", 5))
+    bootstrap_sample_ratio = float(cfg.get("bootstrap_sample_ratio", 0.80))
+    bootstrap_seed = int(cfg.get("bootstrap_seed", 42))
+    bootstrap_qwk_lower_tolerance = float(cfg.get("bootstrap_qwk_lower_tolerance", -qwk_drop))
+    bootstrap_mae_upper_tolerance = float(cfg.get("bootstrap_mae_upper_tolerance", mae_increase))
+    bootstrap_target_min_rate = float(cfg.get("bootstrap_target_improvement_min_rate", 0.50))
     rows: List[Dict[str, Any]] = []
     parent_candidate_id = str(parent_anchor_bank.get("candidate_id", "BAPR-A0"))
     parent_row = {
@@ -554,24 +757,70 @@ def guarded_select_repaired_bank(
     }
     rows.append(parent_row)
     accepted: List[Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]] = []
-    for bank, metrics in zip(child_anchor_banks, child_metrics_list):
+    for idx, (bank, metrics) in enumerate(zip(child_anchor_banks, child_metrics_list)):
         reasons = []
-        if float(metrics.get("qwk", 0.0) or 0.0) < float(parent_metrics.get("qwk", 0.0) or 0.0) - qwk_drop:
+        parent_qwk = float(parent_metrics.get("qwk", 0.0) or 0.0)
+        child_qwk = float(metrics.get("qwk", 0.0) or 0.0)
+        parent_mae = float(parent_metrics.get("mae", 0.0) or 0.0)
+        child_mae = float(metrics.get("mae", 0.0) or 0.0)
+        qwk_delta = child_qwk - parent_qwk
+        mae_delta = child_mae - parent_mae
+        target_metrics = bank.get("target_boundary_metrics", OPERATOR_TARGET_METRICS.get(str(bank.get("operator")), []))
+        improved = boundary_improved_for_operator(parent_metrics, metrics, target_metrics)
+        bootstrap_stats: Dict[str, Any] = {}
+        if child_qwk < parent_qwk - qwk_drop:
             reasons.append("qwk_guard")
-        if float(metrics.get("mae", 0.0) or 0.0) > float(parent_metrics.get("mae", 0.0) or 0.0) + mae_increase:
+        if child_mae > parent_mae + mae_increase:
             reasons.append("mae_guard")
         for metric in ["anchor_band_coverage", "anchor_unique_score_count"]:
             if int(metrics.get(metric, 0) or 0) < int(parent_metrics.get(metric, 0) or 0):
                 reasons.append(metric)
+        if int(metrics.get("anchor_slot_coverage", 0) or 0) < int(parent_metrics.get("anchor_slot_coverage", 0) or 0):
+            reasons.append("anchor_slot_coverage")
         if int(metrics.get("anchor_score_range_span", 0) or 0) < int(parent_metrics.get("anchor_score_range_span", 0) or 0) - 1:
             reasons.append("anchor_score_range_span")
+        stability_soft_override_used = False
         if "anchor_stability_score" in parent_metrics and "anchor_stability_score" in metrics:
-            if float(metrics.get("anchor_stability_score", 0.0) or 0.0) < float(parent_metrics.get("anchor_stability_score", 0.0) or 0.0) - stability_drop:
+            child_stability = float(metrics.get("anchor_stability_score", 0.0) or 0.0)
+            parent_stability = float(parent_metrics.get("anchor_stability_score", 0.0) or 0.0)
+            stability_failed = child_stability < parent_stability - stability_drop
+            stability_override_allowed = (
+                stability_soft_override_enabled
+                and stability_failed
+                and improved
+                and qwk_delta >= stability_soft_override_min_qwk_gain
+                and mae_delta <= 0.0
+                and child_stability >= stability_soft_override_min_child_stability
+            )
+            if stability_override_allowed:
+                stability_soft_override_used = True
+            elif stability_failed:
                 reasons.append("anchor_stability_score")
-        target_metrics = bank.get("target_boundary_metrics", OPERATOR_TARGET_METRICS.get(str(bank.get("operator")), []))
-        improved = boundary_improved_for_operator(parent_metrics, metrics, target_metrics)
         if not improved:
             reasons.append("target_boundary_metric_not_improved")
+        if bootstrap_enabled and parent_eval_rows is not None and child_eval_rows_list is not None and score_min is not None and score_max is not None:
+            child_eval_rows = child_eval_rows_list[idx] if idx < len(child_eval_rows_list) else []
+            bootstrap_stats = bootstrap_guard_summary(
+                parent_eval_rows,
+                child_eval_rows,
+                score_min=int(score_min),
+                score_max=int(score_max),
+                target_metrics=target_metrics,
+                n_bootstrap=bootstrap_n,
+                sample_ratio=bootstrap_sample_ratio,
+                seed=bootstrap_seed,
+            )
+            if bootstrap_stats:
+                if float(bootstrap_stats["bootstrap_qwk_delta_mean"]) < -qwk_drop:
+                    reasons.append("bootstrap_qwk_mean")
+                if float(bootstrap_stats["bootstrap_qwk_delta_lower"]) < bootstrap_qwk_lower_tolerance:
+                    reasons.append("bootstrap_qwk_lower")
+                if float(bootstrap_stats["bootstrap_mae_delta_mean"]) > mae_increase:
+                    reasons.append("bootstrap_mae_mean")
+                if float(bootstrap_stats["bootstrap_mae_delta_upper"]) > bootstrap_mae_upper_tolerance:
+                    reasons.append("bootstrap_mae_upper")
+                if float(bootstrap_stats["bootstrap_target_metric_improved_rate"]) < bootstrap_target_min_rate:
+                    reasons.append("bootstrap_target_metric_not_stable")
         accepted_by_guard = not reasons
         row = {
             "candidate_id": bank["candidate_id"],
@@ -584,8 +833,12 @@ def guarded_select_repaired_bank(
             "accepted_by_guard": accepted_by_guard,
             "guard_reject_reasons": ";".join(reasons),
             "target_boundary_metric_improved": improved,
+            "stability_soft_override_used": stability_soft_override_used,
+            "delta_val_sel_qwk": qwk_delta,
+            "delta_val_sel_mae": mae_delta,
             "selected_as_final": False,
             "selected_reason": "",
+            **bootstrap_stats,
             **_selection_metric_fields(metrics),
         }
         rows.append(row)
@@ -633,6 +886,9 @@ def _selection_metric_fields(metrics: Dict[str, Any]) -> Dict[str, Any]:
         "val_sel_score_tv": metrics.get("score_tv"),
         "val_sel_worst_band_mae": metrics.get("worst_band_mae"),
         "anchor_band_coverage": metrics.get("anchor_band_coverage"),
+        "anchor_slot_coverage": metrics.get("anchor_slot_coverage"),
+        "anchor_required_slot_count": metrics.get("anchor_required_slot_count"),
+        "missing_anchor_slots": metrics.get("missing_anchor_slots"),
         "anchor_unique_score_count": metrics.get("anchor_unique_score_count"),
         "anchor_score_range_span": metrics.get("anchor_score_range_span"),
         "anchor_score_range_coverage": metrics.get("anchor_score_range_coverage"),

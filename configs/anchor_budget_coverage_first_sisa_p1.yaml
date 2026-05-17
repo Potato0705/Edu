@@ -1,7 +1,6 @@
-# BAPR-SI smoke / pilot config.
-# Stability and influence are used only for validation-time anchor protocol
-# selection and repair. Final scoring remains raw LLM output under selected
-# anchors; no test-time calibration or trained scorer is used.
+# Coverage-first SISA pilot config.
+# The main method first fixes a prompt-specific target score ladder, then uses
+# stability and LOO influence only as local tie-breakers within each score.
 
 model:
   name: models/Meta-Llama-3.1-8B-Instruct
@@ -22,7 +21,11 @@ induction:
 
 anchor_budget:
   methods:
-    - bapr_si_k_anchor
+    - static_k_anchor
+    - retrieval_k_anchor
+    - sisa_k_anchor
+    - coverage_first_sisa_k_anchor
+    - full_static_anchor
   k_values: [9]
   full_static_per_score: 3
   stability_retrieval:
@@ -31,36 +34,32 @@ anchor_budget:
     per_slot_top_n: 8
     rank_variance_weight: 0.10
     redundancy_weight: 0.15
-    selection_redundancy_weight: 0.20
+  coverage_first_sisa:
+    target_ladder_strategy: auto
+    candidate_pool_per_score: 8
+    retrieval_weight: 0.45
+    stability_weight: 0.25
+    influence_weight: 0.20
+    diversity_weight: 0.08
+    token_weight: 0.02
+    loo_enabled: true
+    loo_max_anchors: 9
+    loo_max_items: 24
+  sisa:
+    loo_parent_selection_enabled: true
+    loo_max_anchors: 9
+    loo_max_items: 24
+    stability_weight: 0.45
+    retrieval_weight: 0.25
+    influence_weight: 0.20
+    redundancy_weight: 0.20
     token_weight: 0.02
     tail_coverage_enabled: true
     min_top_score_anchors: 1
     top_score_margin: 1
 
 bapr:
-  repair_mode: stability_influence
-  parent_init_method: stability_retrieval_k_anchor
   val_diag_ratio: 0.5
-  max_children: 3
-  influence:
-    mode: proxy_with_loo_attribution
-    loo_attribution_enabled: true
-    loo_veto_enabled: true
-    loo_max_anchors: 9
-    loo_max_items: 24
-  guard:
-    qwk_drop_tolerance: 0.02
-    mae_increase_tolerance: 0.10
-    stability_drop_tolerance: 0.05
-    stability_soft_override_enabled: true
-    stability_soft_override_min_child_stability: 0.70
-    stability_soft_override_min_qwk_gain: 0.03
-    bootstrap_guard_enabled: true
-    bootstrap_n: 5
-    bootstrap_sample_ratio: 0.80
-    bootstrap_qwk_lower_tolerance: -0.02
-    bootstrap_mae_upper_tolerance: 0.10
-    bootstrap_target_improvement_min_rate: 0.50
 
 llm:
   local_backend_enabled: true
@@ -71,7 +70,7 @@ llm:
   protocol_cache_enabled: true
 
 output:
-  root: logs/anchor_budget_bapr_si
+  root: logs/anchor_budget_coverage_first_sisa
   verbose: false
 
 debug:

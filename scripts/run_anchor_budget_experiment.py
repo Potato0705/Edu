@@ -32,16 +32,21 @@ from scripts.bapr_repair import (  # noqa: E402
     guarded_select_repaired_bank,
     metrics_with_anchor_stats,
     rank_repair_operators,
+    score_slot_for as bapr_score_slot_for,
+    score_slot_quota,
     split_val_diag_sel,
     stable_hash as bapr_stable_hash,
 )
 from scripts.anchor_influence import (  # noqa: E402
-    generate_influence_repair_children,
-    estimate_proxy_influence,
+    apply_loo_veto_to_proxy_influence,
     estimate_leave_one_anchor_out_influence,
+    estimate_proxy_influence,
+    generate_influence_repair_children,
 )
 from scripts.anchor_stability import (  # noqa: E402
     estimate_anchor_stability,
+    select_coverage_first_sisa_anchor_rows,
+    select_sisa_anchor_rows,
     select_stable_anchor_rows,
     stability_by_id,
 )
@@ -326,6 +331,10 @@ def band_for(score: int, score_min: int, score_max: int) -> str:
     return _score_band_label(score, score_min, score_max)
 
 
+def score_slot_for(score: int, score_min: int, score_max: int) -> str:
+    return bapr_score_slot_for(score, score_min, score_max)
+
+
 def deterministic_score_covered(
     train: Sequence[Dict],
     k: int,
@@ -430,19 +439,22 @@ def retrieval_anchors(train: Sequence[Dict], val: Sequence[Dict], k: int, score_
         length_pen = 0.0005 * token_len(item["essay_text"])
         scored.append((overlap - length_pen, item))
     scored.sort(key=lambda x: (-x[0], int(x[1]["domain1_score"]), int(x[1]["essay_id"])))
-    selected: List[Dict] = []
-    used_scores = set()
+    by_slot: Dict[str, List[Tuple[float, Dict]]] = defaultdict(list)
     for score, item in scored:
-        if int(item["domain1_score"]) not in used_scores or len(selected) + (score_max - score_min + 1 - len(used_scores)) <= k:
+        by_slot[score_slot_for(int(item["domain1_score"]), score_min, score_max)].append((score, item))
+    quotas = score_slot_quota(k, [slot for slot, rows in by_slot.items() if rows])
+    selected: List[Dict] = []
+    used_ids: set[int] = set()
+    for slot in ["low_tail", "lower_mid", "median", "upper_mid", "high_tail", "max_or_top"]:
+        for score, item in by_slot.get(slot, [])[: quotas.get(slot, 0)]:
             selected.append(item)
-            used_scores.add(int(item["domain1_score"]))
-        if len(selected) >= k:
-            break
+            used_ids.add(int(item["essay_id"]))
     for _, item in scored:
         if len(selected) >= k:
             break
-        if item["essay_id"] not in {x["essay_id"] for x in selected}:
+        if int(item["essay_id"]) not in used_ids:
             selected.append(item)
+            used_ids.add(int(item["essay_id"]))
     return [
         AnchorRecord(
             essay_id=int(x["essay_id"]),
@@ -825,7 +837,7 @@ def retrieval_grounded_stratified_rep_anchors(
         method_has_representation = True
     rep_cfg = config.get("anchor_budget", {}).get("representation", {})
     mode = str(rep_cfg.get("mode", "tfidf"))
-    per_band_top_n = max(1, int(rg_cfg.get("per_band_top_n", 5)))
+    per_slot_top_n = max(1, int(rg_cfg.get("per_slot_top_n", rg_cfg.get("per_band_top_n", 5))))
     retrieval_weight = float(rg_cfg.get("retrieval_weight", default_retrieval_weight))
     representation_weight = float(rg_cfg.get("representation_weight", default_representation_weight))
     coverage_bonus = float(rg_cfg.get("coverage_bonus", 0.1))
@@ -838,17 +850,19 @@ def retrieval_grounded_stratified_rep_anchors(
         return [], []
 
     retrieval_rows = _lexical_retrieval_rows(train, val)
-    by_band: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    by_slot: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     for global_rank, row in enumerate(retrieval_rows, start=1):
         band = band_for(int(row["gold_score"]), score_min, score_max)
+        slot = score_slot_for(int(row["gold_score"]), score_min, score_max)
         row = dict(row)
         row["band"] = band
+        row["score_slot"] = slot
         row["retrieval_global_rank"] = global_rank
-        by_band[band].append(row)
+        by_slot[slot].append(row)
 
     retrieval_candidates: List[Dict[str, Any]] = []
-    for band in ["low", "mid", "high"]:
-        for rank, row in enumerate(by_band.get(band, [])[:per_band_top_n], start=1):
+    for slot in ["low_tail", "lower_mid", "median", "upper_mid", "high_tail", "max_or_top"]:
+        for rank, row in enumerate(by_slot.get(slot, [])[:per_slot_top_n], start=1):
             row = dict(row)
             row["retrieval_rank"] = rank
             retrieval_candidates.append(row)
@@ -897,12 +911,13 @@ def retrieval_grounded_stratified_rep_anchors(
     for idx, row in enumerate(retrieval_candidates):
         row["candidate_index"] = idx
         row["representation_score"] = rep_scores[idx]
-        row["retrieval_candidate_ids_in_band"] = [
-            int(x["essay_id"]) for x in by_band.get(str(row["band"]), [])[:per_band_top_n]
+        row["retrieval_candidate_ids_in_slot"] = [
+            int(x["essay_id"]) for x in by_slot.get(str(row["score_slot"]), [])[:per_slot_top_n]
         ]
+        row["retrieval_candidate_ids_in_band"] = row["retrieval_candidate_ids_in_slot"]
 
-    for band in ["low", "mid", "high"]:
-        rows = [row for row in retrieval_candidates if row["band"] == band]
+    for slot in ["low_tail", "lower_mid", "median", "upper_mid", "high_tail", "max_or_top"]:
+        rows = [row for row in retrieval_candidates if row["score_slot"] == slot]
         retrieval_norms = _minmax_normalize([float(row["retrieval_score"]) for row in rows])
         rep_norms = (
             _minmax_normalize([float(row["representation_score"]) for row in rows])
@@ -913,18 +928,18 @@ def retrieval_grounded_stratified_rep_anchors(
             row["normalized_retrieval_score"] = float(retrieval_norm)
             row["normalized_representation_score"] = float(rep_norm)
 
-    quotas = _band_quota(k, [band for band, rows in by_band.items() if rows])
+    quotas = score_slot_quota(k, [slot for slot, rows in by_slot.items() if rows])
     selected: List[Dict[str, Any]] = []
     used_ids: set[int] = set()
     trace: List[Dict[str, Any]] = []
     rep_replacements_used = 0
 
-    for band in ["low", "mid", "high"]:
-        quota = quotas.get(band, 0)
+    for slot in ["low_tail", "lower_mid", "median", "upper_mid", "high_tail", "max_or_top"]:
+        quota = quotas.get(slot, 0)
         for _ in range(quota):
             pool = [
                 row for row in retrieval_candidates
-                if row["band"] == band and int(row["essay_id"]) not in used_ids
+                if row["score_slot"] == slot and int(row["essay_id"]) not in used_ids
             ]
             if not pool:
                 break
@@ -942,7 +957,7 @@ def retrieval_grounded_stratified_rep_anchors(
                         for prev in selected
                     )
                 token_penalty = token_weight * (token_len(row["item"]["essay_text"]) / 400.0)
-                band_coverage_bonus = coverage_bonus if not any(x["band"] == band for x in selected) else 0.0
+                band_coverage_bonus = coverage_bonus if not any(x["score_slot"] == slot for x in selected) else 0.0
                 combined = (
                     retrieval_weight * float(row.get("normalized_retrieval_score", 0.0))
                     + representation_weight * float(row.get("normalized_representation_score", 0.0))
@@ -997,10 +1012,13 @@ def retrieval_grounded_stratified_rep_anchors(
                     "essay_id": int(best_combined["essay_id"]),
                     "score": int(best_combined["gold_score"]),
                     "gold_score": int(best_combined["gold_score"]),
-                    "band": band,
-                    "score_band": band,
-                    "requested_band": band,
+                    "band": best_combined["band"],
+                    "score_band": best_combined["band"],
+                    "score_slot": best_combined["score_slot"],
+                    "requested_band": best_combined["band"],
+                    "requested_slot": slot,
                     "band_quota": quota,
+                    "slot_quota": quota,
                     "retrieval_rank": int(best_combined["retrieval_rank"]),
                     "retrieval_score": float(best_combined["retrieval_score"]),
                     "representation_score": float(best_combined["representation_score"]),
@@ -1022,6 +1040,7 @@ def retrieval_grounded_stratified_rep_anchors(
                     "representation_weight": representation_weight,
                     "method_has_representation": method_has_representation,
                     "retrieval_candidate_ids_in_band": best_combined["retrieval_candidate_ids_in_band"],
+                    "retrieval_candidate_ids_in_slot": best_combined["retrieval_candidate_ids_in_slot"],
                     "selection_parts": {
                         "normalized_retrieval_score": float(best_combined.get("normalized_retrieval_score", 0.0)),
                         "normalized_representation_score": float(best_combined.get("normalized_representation_score", 0.0)),
@@ -1052,8 +1071,11 @@ def retrieval_grounded_stratified_rep_anchors(
                     "gold_score": int(row["gold_score"]),
                     "band": row["band"],
                     "score_band": row["band"],
+                    "score_slot": row["score_slot"],
                     "requested_band": "fallback_any_band",
+                    "requested_slot": "fallback_any_slot",
                     "band_quota": quotas,
+                    "slot_quota": quotas,
                     "retrieval_rank": int(row["retrieval_rank"]),
                     "retrieval_score": float(row["retrieval_score"]),
                     "representation_score": float(row["representation_score"]),
@@ -1074,6 +1096,7 @@ def retrieval_grounded_stratified_rep_anchors(
                     "representation_weight": representation_weight,
                     "method_has_representation": method_has_representation,
                     "retrieval_candidate_ids_in_band": row["retrieval_candidate_ids_in_band"],
+                    "retrieval_candidate_ids_in_slot": row["retrieval_candidate_ids_in_slot"],
                     "selection_parts": {},
                     "representation_mode": mode,
                     "fallback_reason": "quota underfilled because one or more score bands lacked retrieval candidates",
@@ -1152,7 +1175,7 @@ def stability_retrieval_artifacts(
         n_bootstrap=int(cfg.get("n_bootstrap", 8)),
         sample_ratio=float(cfg.get("sample_ratio", 0.75)),
         seed=int(cfg.get("seed", config.get("debug", {}).get("seed", 42))),
-        per_band_top_n=int(cfg.get("per_band_top_n", 8)),
+        per_band_top_n=int(cfg.get("per_slot_top_n", cfg.get("per_band_top_n", 8))),
         rank_variance_weight=float(cfg.get("rank_variance_weight", 0.10)),
         redundancy_weight=float(cfg.get("redundancy_weight", 0.15)),
     )
@@ -1164,6 +1187,9 @@ def stability_retrieval_artifacts(
         score_max=score_max,
         token_weight=float(cfg.get("token_weight", config.get("anchor_budget", {}).get("representation", {}).get("token_cost_penalty", 0.02))),
         redundancy_weight=float(cfg.get("selection_redundancy_weight", 0.20)),
+        tail_coverage_enabled=bool(cfg.get("tail_coverage_enabled", False)),
+        min_top_score_anchors=int(cfg.get("min_top_score_anchors", 0)),
+        top_score_margin=int(cfg.get("top_score_margin", 0)),
     )
     by_id = {int(item["essay_id"]): item for item in train}
     anchors: List[AnchorRecord] = []
@@ -1201,6 +1227,260 @@ def stability_retrieval_anchors(
     write_csv(out_dir / "anchor_stability_scores.csv", stability_rows)
     write_jsonl(out_dir / "stability_trace.jsonl", stability_trace)
     return anchors, selection_trace
+
+
+def sisa_anchors(
+    train: Sequence[Dict],
+    val_diag: Sequence[Dict],
+    k: int,
+    score_min: int,
+    score_max: int,
+    config: Dict[str, Any],
+    instruction: str,
+    backend: Optional[LocalLlamaBackend],
+    out_dir: Path,
+) -> Tuple[List[AnchorRecord], List[Dict[str, Any]]]:
+    cfg = config.get("anchor_budget", {}).get("sisa", {})
+    stability_cfg = config.get("anchor_budget", {}).get("stability_retrieval", {})
+    stability_rows, stability_trace = estimate_anchor_stability(
+        train,
+        val_diag,
+        k=int(k),
+        score_min=score_min,
+        score_max=score_max,
+        n_bootstrap=int(stability_cfg.get("n_bootstrap", 8)),
+        sample_ratio=float(stability_cfg.get("sample_ratio", 0.75)),
+        seed=int(stability_cfg.get("seed", config.get("debug", {}).get("seed", 42))),
+        per_band_top_n=int(stability_cfg.get("per_slot_top_n", stability_cfg.get("per_band_top_n", 8))),
+        rank_variance_weight=float(stability_cfg.get("rank_variance_weight", 0.10)),
+        redundancy_weight=float(stability_cfg.get("redundancy_weight", 0.15)),
+    )
+    write_csv(out_dir / "anchor_stability_scores.csv", stability_rows)
+    write_jsonl(out_dir / "stability_trace.jsonl", stability_trace)
+    initial_rows, initial_trace = select_stable_anchor_rows(
+        train,
+        stability_rows,
+        k=int(k),
+        score_min=score_min,
+        score_max=score_max,
+        token_weight=float(stability_cfg.get("token_weight", config.get("anchor_budget", {}).get("representation", {}).get("token_cost_penalty", 0.02))),
+        redundancy_weight=float(stability_cfg.get("selection_redundancy_weight", 0.20)),
+        tail_coverage_enabled=bool(stability_cfg.get("tail_coverage_enabled", True)),
+        min_top_score_anchors=int(stability_cfg.get("min_top_score_anchors", 1)),
+        top_score_margin=int(stability_cfg.get("top_score_margin", 1)),
+    )
+    by_id = {int(item["essay_id"]): item for item in train}
+
+    def rows_to_records(rows: Sequence[Dict[str, Any]], reason: str) -> List[AnchorRecord]:
+        records = []
+        for row in rows:
+            item = by_id[int(row["essay_id"])]
+            records.append(
+                AnchorRecord(
+                    essay_id=int(item["essay_id"]),
+                    gold_score=int(item["domain1_score"]),
+                    prompt_id=0,
+                    token_length=token_len(item["essay_text"]),
+                    source_split="train",
+                    selection_score=float(row.get("combined_score", row.get("stability_score", 0.0)) or 0.0),
+                    selection_reason=reason,
+                    essay_text=item["essay_text"],
+                )
+            )
+        return records
+
+    initial_records = rows_to_records(initial_rows, "sisa:initial_stability_parent")
+    initial_anchor_dicts = [anchor_record_to_bapr(record) for record in initial_records]
+    write_json(
+        out_dir / "sisa_initial_anchor_bank.json",
+        {
+            "method": "sisa_initial_stability_parent",
+            "anchor_ids": [record.essay_id for record in initial_records],
+            "anchor_scores": [record.gold_score for record in initial_records],
+            "selection_trace_path": str(out_dir / "sisa_initial_selection_trace.jsonl"),
+        },
+    )
+    write_jsonl(out_dir / "sisa_initial_selection_trace.jsonl", initial_trace)
+
+    loo_rows: List[Dict[str, Any]] = []
+    if bool(cfg.get("loo_parent_selection_enabled", True)) and initial_records:
+        diag_rows, _ = score_items(backend, val_diag, instruction, initial_records, score_min, score_max)
+        loo_rows, _ = compute_bapr_si_loo_attribution(
+            backend=backend,
+            val_diag=val_diag,
+            diag_rows=diag_rows,
+            instruction=instruction,
+            parent_records=initial_records,
+            parent_anchors=initial_anchor_dicts,
+            proxy_influence_rows=[],
+            score_min=score_min,
+            score_max=score_max,
+            config={
+                **config,
+                "bapr": {
+                    **config.get("bapr", {}),
+                    "influence": {
+                        **config.get("bapr", {}).get("influence", {}),
+                        "loo_attribution_enabled": True,
+                        "loo_max_anchors": int(cfg.get("loo_max_anchors", len(initial_records))),
+                        "loo_max_items": int(cfg.get("loo_max_items", len(val_diag))),
+                    },
+                },
+            },
+        )
+    write_csv(out_dir / "sisa_loo_influence_scores.csv", loo_rows)
+
+    selected_rows, trace = select_sisa_anchor_rows(
+        train,
+        stability_rows,
+        loo_rows,
+        k=int(k),
+        score_min=score_min,
+        score_max=score_max,
+        stability_weight=float(cfg.get("stability_weight", 0.45)),
+        retrieval_weight=float(cfg.get("retrieval_weight", 0.25)),
+        influence_weight=float(cfg.get("influence_weight", 0.20)),
+        redundancy_weight=float(cfg.get("redundancy_weight", 0.20)),
+        token_weight=float(cfg.get("token_weight", stability_cfg.get("token_weight", 0.02))),
+        tail_coverage_enabled=bool(cfg.get("tail_coverage_enabled", True)),
+        min_top_score_anchors=int(cfg.get("min_top_score_anchors", stability_cfg.get("min_top_score_anchors", 1))),
+        top_score_margin=int(cfg.get("top_score_margin", stability_cfg.get("top_score_margin", 1))),
+    )
+    anchors = rows_to_records(selected_rows, "sisa:stability_influence_scale_aware")
+    return anchors, trace
+
+
+def coverage_first_sisa_anchors(
+    train: Sequence[Dict],
+    val_diag: Sequence[Dict],
+    k: int,
+    score_min: int,
+    score_max: int,
+    config: Dict[str, Any],
+    instruction: str,
+    backend: Optional[LocalLlamaBackend],
+    out_dir: Path,
+) -> Tuple[List[AnchorRecord], List[Dict[str, Any]]]:
+    cfg = config.get("anchor_budget", {}).get("coverage_first_sisa", {})
+    stability_cfg = config.get("anchor_budget", {}).get("stability_retrieval", {})
+    stability_rows, stability_trace = estimate_anchor_stability(
+        train,
+        val_diag,
+        k=int(k),
+        score_min=score_min,
+        score_max=score_max,
+        n_bootstrap=int(stability_cfg.get("n_bootstrap", 8)),
+        sample_ratio=float(stability_cfg.get("sample_ratio", 0.75)),
+        seed=int(stability_cfg.get("seed", config.get("debug", {}).get("seed", 42))),
+        per_band_top_n=int(stability_cfg.get("per_slot_top_n", stability_cfg.get("per_band_top_n", 8))),
+        rank_variance_weight=float(stability_cfg.get("rank_variance_weight", 0.10)),
+        redundancy_weight=float(stability_cfg.get("redundancy_weight", 0.15)),
+    )
+    write_csv(out_dir / "anchor_stability_scores.csv", stability_rows)
+    write_jsonl(out_dir / "stability_trace.jsonl", stability_trace)
+    supported_scores = sorted(
+        {
+            int(item["domain1_score"])
+            for item in list(train) + list(val_diag)
+            if score_min <= int(item["domain1_score"]) <= score_max
+        }
+    )
+    by_id = {int(item["essay_id"]): item for item in train}
+
+    def rows_to_records(rows: Sequence[Dict[str, Any]], reason: str) -> List[AnchorRecord]:
+        records: List[AnchorRecord] = []
+        for row in rows:
+            item = by_id[int(row["essay_id"])]
+            records.append(
+                AnchorRecord(
+                    essay_id=int(item["essay_id"]),
+                    gold_score=int(item["domain1_score"]),
+                    prompt_id=0,
+                    token_length=token_len(item["essay_text"]),
+                    source_split="train",
+                    selection_score=float(row.get("combined_score", row.get("stability_score", 0.0)) or 0.0),
+                    selection_reason=reason,
+                    essay_text=item["essay_text"],
+                )
+            )
+        return records
+
+    initial_rows, initial_trace = select_coverage_first_sisa_anchor_rows(
+        train,
+        stability_rows,
+        [],
+        k=int(k),
+        score_min=score_min,
+        score_max=score_max,
+        supported_scores=supported_scores,
+        ladder_strategy=str(cfg.get("target_ladder_strategy", "auto")),
+        candidate_pool_per_score=int(cfg.get("candidate_pool_per_score", 8)),
+        retrieval_weight=float(cfg.get("retrieval_weight", 0.45)),
+        stability_weight=float(cfg.get("stability_weight", 0.25)),
+        influence_weight=0.0,
+        diversity_weight=float(cfg.get("diversity_weight", 0.08)),
+        token_weight=float(cfg.get("token_weight", 0.02)),
+    )
+    initial_records = rows_to_records(initial_rows, "coverage_first_sisa:initial_no_loo_parent")
+    write_json(
+        out_dir / "coverage_first_sisa_initial_anchor_bank.json",
+        {
+            "method": "coverage_first_sisa_initial_no_loo_parent",
+            "anchor_ids": [record.essay_id for record in initial_records],
+            "anchor_scores": [record.gold_score for record in initial_records],
+            "target_score_ladder": initial_trace[0].get("target_score_ladder", []) if initial_trace else [],
+            "selection_trace_path": str(out_dir / "coverage_first_sisa_initial_selection_trace.jsonl"),
+        },
+    )
+    write_jsonl(out_dir / "coverage_first_sisa_initial_selection_trace.jsonl", initial_trace)
+
+    loo_rows: List[Dict[str, Any]] = []
+    if bool(cfg.get("loo_enabled", True)) and initial_records:
+        initial_anchor_dicts = [anchor_record_to_bapr(record) for record in initial_records]
+        diag_rows, _ = score_items(backend, val_diag, instruction, initial_records, score_min, score_max)
+        loo_rows, _ = compute_bapr_si_loo_attribution(
+            backend=backend,
+            val_diag=val_diag,
+            diag_rows=diag_rows,
+            instruction=instruction,
+            parent_records=initial_records,
+            parent_anchors=initial_anchor_dicts,
+            proxy_influence_rows=[],
+            score_min=score_min,
+            score_max=score_max,
+            config={
+                **config,
+                "bapr": {
+                    **config.get("bapr", {}),
+                    "influence": {
+                        **config.get("bapr", {}).get("influence", {}),
+                        "loo_attribution_enabled": True,
+                        "loo_max_anchors": int(cfg.get("loo_max_anchors", len(initial_records))),
+                        "loo_max_items": int(cfg.get("loo_max_items", len(val_diag))),
+                    },
+                },
+            },
+        )
+    write_csv(out_dir / "coverage_first_sisa_loo_influence_scores.csv", loo_rows)
+
+    selected_rows, trace = select_coverage_first_sisa_anchor_rows(
+        train,
+        stability_rows,
+        loo_rows,
+        k=int(k),
+        score_min=score_min,
+        score_max=score_max,
+        supported_scores=supported_scores,
+        ladder_strategy=str(cfg.get("target_ladder_strategy", "auto")),
+        candidate_pool_per_score=int(cfg.get("candidate_pool_per_score", 8)),
+        retrieval_weight=float(cfg.get("retrieval_weight", 0.45)),
+        stability_weight=float(cfg.get("stability_weight", 0.25)),
+        influence_weight=float(cfg.get("influence_weight", 0.20)),
+        diversity_weight=float(cfg.get("diversity_weight", 0.08)),
+        token_weight=float(cfg.get("token_weight", 0.02)),
+    )
+    anchors = rows_to_records(selected_rows, "coverage_first_sisa:scale_ladder_local_stability_influence")
+    return anchors, trace
 
 
 def stratified_rep_guided_anchors(
@@ -1408,6 +1688,35 @@ def build_anchor_bank(
             "score_band_quota",
             "redundancy_penalty",
         ]
+    if method == "sisa_k_anchor":
+        anchors, trace = sisa_anchors(
+            train, val, int(k or 0), score_min, score_max, config, instruction, backend, out_dir
+        )
+        retrieval_ids = [x.essay_id for x in retrieval_anchors(train, val, int(k or 0), score_min, score_max)]
+        sisa_ids = [x.essay_id for x in anchors]
+        return anchors, trace, sisa_ids != retrieval_ids, [
+            "score_slot_ladder",
+            "retrieval_relevance",
+            "anchor_stability_estimator",
+            "loo_influence_parent_selection",
+            "diversity_penalty",
+            "token_cost_penalty",
+        ]
+    if method == "coverage_first_sisa_k_anchor":
+        anchors, trace = coverage_first_sisa_anchors(
+            train, val, int(k or 0), score_min, score_max, config, instruction, backend, out_dir
+        )
+        retrieval_ids = [x.essay_id for x in retrieval_anchors(train, val, int(k or 0), score_min, score_max)]
+        coverage_ids = [x.essay_id for x in anchors]
+        return anchors, trace, coverage_ids != retrieval_ids, [
+            "target_score_ladder",
+            "exact_score_coverage_first",
+            "local_retrieval_relevance",
+            "anchor_stability_estimator",
+            "loo_influence_local_tiebreak",
+            "diversity_penalty",
+            "token_cost_penalty",
+        ]
     if method == "full_static_anchor":
         per_score = int(config.get("anchor_budget", {}).get("full_static_per_score", 3))
         anchors = full_static_anchors(train, score_min, score_max, per_score)
@@ -1498,6 +1807,23 @@ def is_run_complete(run_dir: Path, method: str) -> bool:
         required.extend(["representation_anchor_scores.csv", "representation_selection_trace.jsonl"])
     if method == "stability_retrieval_k_anchor":
         required.extend(["anchor_stability_scores.csv", "stability_trace.jsonl"])
+    if method in {"sisa_k_anchor", "coverage_first_sisa_k_anchor"}:
+        required.extend(
+            [
+                "anchor_stability_scores.csv",
+                "stability_trace.jsonl",
+            ]
+        )
+    if method == "sisa_k_anchor":
+        required.extend(["sisa_initial_anchor_bank.json", "sisa_initial_selection_trace.jsonl", "sisa_loo_influence_scores.csv"])
+    if method == "coverage_first_sisa_k_anchor":
+        required.extend(
+            [
+                "coverage_first_sisa_initial_anchor_bank.json",
+                "coverage_first_sisa_initial_selection_trace.jsonl",
+                "coverage_first_sisa_loo_influence_scores.csv",
+            ]
+        )
     return all((run_dir / name).exists() for name in required)
 
 
@@ -1643,6 +1969,8 @@ def bapr_anchor_bank_payload(
     trace_path: Path,
 ) -> Dict[str, Any]:
     anchor_ids = [int(a["essay_id"]) for a in anchors]
+    slots = [score_slot_for(int(a["gold_score"]), score_min, score_max) for a in anchors]
+    slot_labels = sorted(set(slots), key=lambda slot: ["low_tail", "lower_mid", "median", "upper_mid", "high_tail", "max_or_top"].index(slot))
     payload = {
         "anchor_bank_id": bapr_stable_hash(
             {
@@ -1659,6 +1987,8 @@ def bapr_anchor_bank_payload(
         "k": int(k),
         "anchor_ids": anchor_ids,
         "anchor_scores": [int(a["gold_score"]) for a in anchors],
+        "anchor_score_slots": slots,
+        "anchor_slot_coverage": {slot: slots.count(slot) for slot in slot_labels},
         "score_coverage": score_coverage([bapr_to_anchor_record(a) for a in anchors], score_min, score_max),
         "token_cost": sum(int(a.get("token_length", token_len(a.get("essay_text", "")))) for a in anchors),
         "score_range": [score_min, score_max],
@@ -1779,6 +2109,9 @@ def compute_bapr_si_loo_attribution(
                 "anchor_band": band_for(int(parent_anchor.get("gold_score", score_min)), score_min, score_max)
                 if parent_anchor
                 else "",
+                "anchor_slot": score_slot_for(int(parent_anchor.get("gold_score", score_min)), score_min, score_max)
+                if parent_anchor
+                else "",
                 "loo_eval_n": len(loo_items),
                 "loo_eval_ids_hash": id_list_hash(sorted(loo_ids)),
                 "parent_qwk": parent_metrics.get("qwk"),
@@ -1831,9 +2164,12 @@ def build_influence_child_alignment_rows(
                 "operator": child.get("operator"),
                 "removed_anchor_id": removed_id_int,
                 "added_anchor_id": child.get("added_anchor_id"),
+                "target_slot": child.get("target_slot"),
                 "proxy_failure_type": proxy.get("anchor_failure_type"),
                 "proxy_negative_influence_score": proxy.get("negative_influence_score"),
                 "loo_harm_score": loo.get("loo_harm_score"),
+                "loo_vetoed": child.get("loo_vetoed", proxy.get("loo_vetoed")),
+                "proxy_disagrees_with_loo": child.get("proxy_disagrees_with_loo", proxy.get("proxy_disagrees_with_loo")),
                 "delta_qwk_without_anchor": loo.get("delta_qwk_without_anchor"),
                 "child_delta_qwk": float(metrics.get("qwk", 0.0) or 0.0) - float(parent_metrics.get("qwk", 0.0) or 0.0),
                 "child_delta_mae": float(metrics.get("mae", 0.0) or 0.0) - float(parent_metrics.get("mae", 0.0) or 0.0),
@@ -1967,7 +2303,7 @@ def run_bapr_one(
                 n_bootstrap=int(stability_cfg.get("n_bootstrap", 8)),
                 sample_ratio=float(stability_cfg.get("sample_ratio", 0.75)),
                 seed=int(stability_cfg.get("seed", config.get("debug", {}).get("seed", 42))),
-                per_band_top_n=int(stability_cfg.get("per_band_top_n", 8)),
+                per_band_top_n=int(stability_cfg.get("per_slot_top_n", stability_cfg.get("per_band_top_n", 8))),
                 rank_variance_weight=float(stability_cfg.get("rank_variance_weight", 0.10)),
                 redundancy_weight=float(stability_cfg.get("redundancy_weight", 0.15)),
             )
@@ -2003,6 +2339,7 @@ def run_bapr_one(
                 "anchor_id",
                 "anchor_score",
                 "anchor_band",
+                "anchor_slot",
                 "loo_eval_n",
                 "loo_eval_ids_hash",
                 "parent_qwk",
@@ -2023,6 +2360,12 @@ def run_bapr_one(
                 "proxy_stability_score",
             ],
         )
+        influence_rows = apply_loo_veto_to_proxy_influence(
+            influence_rows,
+            loo_influence_rows,
+            enabled=bool(config.get("bapr", {}).get("influence", {}).get("loo_veto_enabled", True)),
+        )
+        write_csv(out_dir / "anchor_influence_scores.csv", influence_rows)
         children, repair_trace = generate_influence_repair_children(
             parent_anchors,
             train,
@@ -2084,9 +2427,11 @@ def run_bapr_one(
     parent_metrics = add_anchor_stability_metrics(parent_metrics, parent_anchors)
     write_json(out_dir / "bapr_parent_metrics.json", parent_metrics)
     child_metrics_list = []
+    child_sel_rows_list = []
     for child in children:
         child_records = [bapr_to_anchor_record(a) for a in child["anchors"]]
         rows, _ = score_items(backend, val_sel, instruction, child_records, score_min, score_max)
+        child_sel_rows_list.append(rows)
         metrics = metrics_with_anchor_stats(
             [r["gold_score"] for r in rows],
             [r["pred_score"] for r in rows],
@@ -2097,7 +2442,17 @@ def run_bapr_one(
         metrics = add_anchor_stability_metrics(metrics, child["anchors"])
         child_metrics_list.append(metrics)
 
-    guard = guarded_select_repaired_bank(parent_metrics, child_metrics_list, parent_bank, children, config)
+    guard = guarded_select_repaired_bank(
+        parent_metrics,
+        child_metrics_list,
+        parent_bank,
+        children,
+        config,
+        parent_eval_rows=parent_sel_rows,
+        child_eval_rows_list=child_sel_rows_list,
+        score_min=score_min,
+        score_max=score_max,
+    )
     write_csv(out_dir / "bapr_guarded_selection.csv", guard["selection_rows"])
     if is_bapr_si:
         write_csv_with_fields(
@@ -2115,9 +2470,12 @@ def run_bapr_one(
                 "operator",
                 "removed_anchor_id",
                 "added_anchor_id",
+                "target_slot",
                 "proxy_failure_type",
                 "proxy_negative_influence_score",
                 "loo_harm_score",
+                "loo_vetoed",
+                "proxy_disagrees_with_loo",
                 "delta_qwk_without_anchor",
                 "child_delta_qwk",
                 "child_delta_mae",
@@ -2227,6 +2585,9 @@ def run_bapr_one(
         "runtime_sec": runtime,
         "anchor_count": len(final_records),
         "anchor_token_cost": final_bank["token_cost"],
+        "anchor_slot_coverage": val_metrics.get("anchor_slot_coverage"),
+        "anchor_required_slot_count": val_metrics.get("anchor_required_slot_count"),
+        "missing_anchor_slots": val_metrics.get("missing_anchor_slots"),
         "representation_changed_anchor_choice": final_bank["anchor_ids"] != parent_bank["anchor_ids"],
         "representation_features_used": [
             "bapr_repair",
@@ -2291,8 +2652,18 @@ def run_one(
     out_dir.mkdir(parents=True, exist_ok=True)
     with open(out_dir / "config.yaml", "w", encoding="utf-8") as f:
         yaml.safe_dump(config, f, sort_keys=False, allow_unicode=True)
+    selection_val = val
+    if method in {"sisa_k_anchor", "coverage_first_sisa_k_anchor"}:
+        val_diag, val_sel, split_meta = split_val_diag_sel(
+            val,
+            score_min,
+            score_max,
+            float(config.get("sisa", config.get("bapr", {})).get("val_diag_ratio", config.get("bapr", {}).get("val_diag_ratio", 0.5))),
+        )
+        selection_val = val_diag
+        write_json(out_dir / ("coverage_first_sisa_val_split.json" if method == "coverage_first_sisa_k_anchor" else "sisa_val_split.json"), split_meta)
     anchors, trace, rep_changed, features = build_anchor_bank(
-        method, k, train, val, score_min, score_max, seed, config, instruction, backend, out_dir
+        method, k, train, selection_val, score_min, score_max, seed, config, instruction, backend, out_dir
     )
     trace_path = out_dir / "anchor_selection_trace.jsonl"
     write_jsonl(trace_path, trace)
@@ -2302,6 +2673,8 @@ def run_one(
         "retrieval_grounded_stratified_rep_k_anchor",
         "retrieval_grounded_stratified_rep_k_anchor_v21",
         "retrieval_grounded_no_rep_k_anchor",
+        "sisa_k_anchor",
+        "coverage_first_sisa_k_anchor",
     }:
         write_jsonl(out_dir / "representation_selection_trace.jsonl", trace)
         write_csv(out_dir / "representation_anchor_scores.csv", trace)
@@ -2319,11 +2692,24 @@ def run_one(
         representation_changed_anchor_choice=rep_changed,
         representation_features_used=features,
     )
-    write_json(out_dir / "anchor_bank.json", asdict(bank))
+    bank_payload = asdict(bank)
+    if method == "coverage_first_sisa_k_anchor":
+        bank_payload["target_score_ladder"] = trace[0].get("target_score_ladder", []) if trace else []
+        bank_payload["exact_score_coverage"] = {
+            str(row.get("target_score")): bool(row.get("exact_score_match"))
+            for row in trace
+            if row.get("selected_reason") != "coverage_first_sisa: no candidate available"
+        }
+        bank_payload["coverage_gaps"] = {
+            str(row.get("target_score")): int(row.get("coverage_gap", 0) or 0)
+            for row in trace
+            if row.get("target_score") is not None
+        }
+    write_json(out_dir / "anchor_bank.json", bank_payload)
     write_json(
         out_dir / "anchor_metrics.json",
         {
-            **asdict(bank),
+            **bank_payload,
             "anchor_count": len(anchors),
             "average_anchor_length": float(np.mean([a.token_length for a in anchors])) if anchors else 0.0,
             "selected_anchors": [asdict(a) for a in anchors],

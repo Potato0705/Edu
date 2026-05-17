@@ -21,9 +21,12 @@ from scripts.bapr_repair import (  # noqa: E402
     guarded_select_repaired_bank,
     metrics_with_anchor_stats,
     rank_repair_operators,
+    score_slot_for,
+    score_slot_quota,
     split_val_diag_sel,
 )
 from scripts.anchor_influence import (  # noqa: E402
+    apply_loo_veto_to_proxy_influence,
     estimate_proxy_influence,
     generate_influence_repair_children,
 )
@@ -67,6 +70,8 @@ def _metrics(**overrides):
         "anchor_unique_score_count": 3,
         "anchor_score_range_span": 10,
         "anchor_score_range_coverage": 1.0,
+        "anchor_slot_coverage": 3,
+        "anchor_required_slot_count": 3,
         "token_cost": 100,
     }
     base.update(overrides)
@@ -97,6 +102,19 @@ def test_split_val_diag_sel_is_deterministic_and_disjoint():
     assert {x["essay_id"] for x in diag1}.isdisjoint({x["essay_id"] for x in sel1})
     assert meta1["val_diag_ids_hash"] == meta2["val_diag_ids_hash"]
     assert meta1["val_sel_ids_hash"] == meta2["val_sel_ids_hash"]
+    assert meta1["val_split_strategy"] == "score_slot"
+    assert "val_diag_slot_distribution" in meta1
+    assert "val_sel_slot_distribution" in meta1
+
+
+def test_split_val_diag_sel_keeps_top_tail_in_both_sides_when_possible():
+    val = [_item(100 + i, score) for i, score in enumerate([2, 3, 4, 6, 7, 8, 10, 11, 12, 12])]
+    diag, sel, meta = split_val_diag_sel(val, 2, 12, diag_ratio=0.5)
+
+    assert any(int(x["domain1_score"]) >= 11 for x in diag)
+    assert any(int(x["domain1_score"]) >= 11 for x in sel)
+    assert meta["val_diag_slot_distribution"].get("max_or_top", 0) > 0
+    assert meta["val_sel_slot_distribution"].get("max_or_top", 0) > 0
 
 
 def test_empty_band_metrics_are_none_and_do_not_trigger_worst_band_repair():
@@ -288,6 +306,36 @@ def test_bapr_band_for_matches_runner_score_band_label():
             assert bapr_band_for(score, score_min, score_max) == runner.band_for(score, score_min, score_max)
 
 
+def test_score_slot_quota_protects_median_and_top_tail_for_k9():
+    slots = [score_slot_for(score, 2, 12) for score in range(2, 13)]
+    quotas = score_slot_quota(9, set(slots))
+
+    assert quotas == {
+        "low_tail": 1,
+        "lower_mid": 1,
+        "median": 2,
+        "upper_mid": 2,
+        "high_tail": 2,
+        "max_or_top": 1,
+    }
+
+
+def test_anchor_metrics_include_score_slot_coverage():
+    anchors = [
+        _anchor(1, 2),
+        _anchor(2, 4),
+        _anchor(3, 6),
+        _anchor(4, 8),
+        _anchor(5, 10),
+        _anchor(6, 12),
+    ]
+    metrics = metrics_with_anchor_stats([2, 6, 12], [2, 6, 10], anchors, 2, 12)
+
+    assert metrics["anchor_slot_coverage"] == metrics["anchor_required_slot_count"]
+    assert metrics["missing_anchor_slots"] == []
+    assert metrics["anchor_slot_counts"]["max_or_top"] >= 1
+
+
 def test_bapr_run_complete_requires_bapr_specific_outputs(tmp_path):
     for name in runner.REQUIRED_RUN_FILES:
         (tmp_path / name).write_text("{}", encoding="utf-8")
@@ -398,6 +446,72 @@ def test_proxy_influence_does_not_create_boundary_confuser_without_band_error():
     assert by_id[2]["anchor_failure_type"] == "useful_stabilizing_anchor"
 
 
+def test_guard_soft_overrides_stability_drop_for_strong_targeted_repair():
+    parent_metrics = _metrics(
+        qwk=0.28,
+        mae=1.67,
+        worst_band_mae=2.36,
+        anchor_stability_score=0.80,
+    )
+    child_metrics = _metrics(
+        qwk=0.36,
+        mae=1.60,
+        worst_band_mae=2.13,
+        anchor_stability_score=0.72,
+    )
+    parent_bank = _bank("BAPR-SI-A0", "PARENT", [])
+    child_bank = _bank("bapr_si_child_2", "INFLUENCE_REPAIR", ["worst_band_mae"])
+    guard = guarded_select_repaired_bank(
+        parent_metrics,
+        [child_metrics],
+        parent_bank,
+        [child_bank],
+        {
+            "bapr": {
+                "guard": {
+                    "stability_drop_tolerance": 0.05,
+                    "stability_soft_override_enabled": True,
+                    "stability_soft_override_min_child_stability": 0.70,
+                    "stability_soft_override_min_qwk_gain": 0.03,
+                }
+            }
+        },
+    )
+
+    child_row = next(row for row in guard["selection_rows"] if row["candidate_id"] == "bapr_si_child_2")
+    assert child_row["accepted_by_guard"] is True
+    assert child_row["stability_soft_override_used"] is True
+    assert guard["selected_anchor_bank"]["candidate_id"] == "bapr_si_child_2"
+
+
+def test_guard_does_not_override_stability_drop_without_targeted_repair():
+    parent_metrics = _metrics(qwk=0.28, mae=1.67, worst_band_mae=2.36, anchor_stability_score=0.80)
+    child_metrics = _metrics(qwk=0.36, mae=1.60, worst_band_mae=2.50, anchor_stability_score=0.72)
+    parent_bank = _bank("BAPR-SI-A0", "PARENT", [])
+    child_bank = _bank("bapr_si_child_bad", "INFLUENCE_REPAIR", ["worst_band_mae"])
+    guard = guarded_select_repaired_bank(
+        parent_metrics,
+        [child_metrics],
+        parent_bank,
+        [child_bank],
+        {
+            "bapr": {
+                "guard": {
+                    "stability_drop_tolerance": 0.05,
+                    "stability_soft_override_enabled": True,
+                    "stability_soft_override_min_child_stability": 0.70,
+                    "stability_soft_override_min_qwk_gain": 0.03,
+                }
+            }
+        },
+    )
+
+    child_row = next(row for row in guard["selection_rows"] if row["candidate_id"] == "bapr_si_child_bad")
+    assert child_row["accepted_by_guard"] is False
+    assert child_row["stability_soft_override_used"] is False
+    assert "anchor_stability_score" in child_row["guard_reject_reasons"]
+
+
 def test_influence_repair_children_replace_negative_anchor_with_stable_candidate():
     parent = [_anchor(1, 2), _anchor(2, 7), _anchor(3, 12)]
     train = [_item(1, 2), _item(2, 7), _item(3, 12), _item(4, 7, "stable mid candidate"), _item(5, 12)]
@@ -435,6 +549,155 @@ def test_influence_repair_children_replace_negative_anchor_with_stable_candidate
     assert 4 in children[0]["anchor_ids"]
     assert children[0]["removed_anchor_failure_type"] == "boundary_confuser"
     assert children[0]["added_anchor_stability"] == pytest.approx(0.95)
+
+
+def test_loo_beneficial_anchor_vetoes_proxy_repair():
+    proxy_rows = [
+        {
+            "anchor_id": 2,
+            "anchor_failure_type": "boundary_confuser",
+            "negative_influence_score": 0.9,
+            "target_band": "mid",
+            "target_slot": "median",
+            "target_boundary_metrics": ["worst_band_mae"],
+            "expected_repair_metric": "worst_band_mae",
+        }
+    ]
+    loo_rows = [
+        {
+            "anchor_id": 2,
+            "delta_qwk_without_anchor": -0.05,
+            "delta_mae_without_anchor": 0.10,
+            "loo_harm_score": -0.20,
+        }
+    ]
+
+    merged = apply_loo_veto_to_proxy_influence(proxy_rows, loo_rows)
+
+    assert merged[0]["loo_vetoed"] is True
+    assert merged[0]["proxy_disagrees_with_loo"] is True
+    assert merged[0]["anchor_failure_type"] == "useful_stabilizing_anchor"
+
+
+def test_loo_vetoed_anchor_cannot_be_repaired_even_if_proxy_is_high():
+    parent = [_anchor(1, 2), _anchor(2, 7), _anchor(3, 12)]
+    train = [_item(1, 2), _item(2, 7), _item(3, 12), _item(4, 7, "stable mid candidate")]
+    stability_rows = [
+        {"essay_id": 4, "gold_score": 7, "band": "mid", "stability_score": 0.95, "selection_frequency": 1.0}
+    ]
+    influence_rows = [
+        {
+            "anchor_id": 2,
+            "anchor_failure_type": "boundary_confuser",
+            "negative_influence_score": 0.8,
+            "target_band": "mid",
+            "target_slot": "median",
+            "target_boundary_metrics": ["worst_band_mae"],
+            "expected_repair_metric": "worst_band_mae",
+            "loo_vetoed": True,
+            "loo_harm_score": -0.2,
+            "proxy_disagrees_with_loo": True,
+        }
+    ]
+
+    children, trace = generate_influence_repair_children(
+        parent,
+        train,
+        [],
+        stability_rows,
+        influence_rows,
+        score_min=2,
+        score_max=12,
+        k=3,
+        max_children=1,
+    )
+
+    assert children == []
+    assert trace[0]["skipped_reason"] == "loo_veto_beneficial_anchor"
+
+
+def test_singleton_max_or_top_anchor_is_protected_from_non_top_replacement():
+    parent = [_anchor(1, 2), _anchor(2, 7), _anchor(3, 12)]
+    train = [_item(1, 2), _item(2, 7), _item(3, 12), _item(4, 10, "stable high candidate")]
+    stability_rows = [
+        {"essay_id": 4, "gold_score": 10, "band": "high", "stability_score": 0.95, "selection_frequency": 1.0}
+    ]
+    influence_rows = [
+        {
+            "anchor_id": 3,
+            "anchor_failure_type": "high_tail_suppressor",
+            "negative_influence_score": 0.8,
+            "target_band": "high",
+            "target_slot": "high_tail",
+            "target_boundary_metrics": ["high_recall"],
+            "expected_repair_metric": "high_recall",
+        }
+    ]
+
+    children, trace = generate_influence_repair_children(
+        parent,
+        train,
+        [],
+        stability_rows,
+        influence_rows,
+        score_min=2,
+        score_max=12,
+        k=3,
+        max_children=1,
+    )
+
+    assert children == []
+    assert trace[0]["skipped_reason"] == "protected_singleton_max_or_top_anchor"
+
+
+def test_bootstrap_guard_rejects_unstable_single_split_gain():
+    parent_metrics = _metrics(qwk=0.50, mae=1.0, high_recall=0.20)
+    child_metrics = _metrics(qwk=0.58, mae=0.9, high_recall=0.40)
+    parent_bank = _bank("BAPR-SI-A0", "PARENT", [])
+    child_bank = _bank("bapr_si_child_unstable", "INFLUENCE_REPAIR", ["high_recall"])
+    parent_rows = [
+        {"essay_id": 1, "gold_score": 10, "pred_score": 10},
+        {"essay_id": 2, "gold_score": 10, "pred_score": 10},
+        {"essay_id": 3, "gold_score": 2, "pred_score": 2},
+        {"essay_id": 4, "gold_score": 2, "pred_score": 2},
+        {"essay_id": 5, "gold_score": 7, "pred_score": 7},
+        {"essay_id": 6, "gold_score": 7, "pred_score": 7},
+    ]
+    child_rows = [
+        {"essay_id": 1, "gold_score": 10, "pred_score": 10},
+        {"essay_id": 2, "gold_score": 10, "pred_score": 10},
+        {"essay_id": 3, "gold_score": 2, "pred_score": 7},
+        {"essay_id": 4, "gold_score": 2, "pred_score": 7},
+        {"essay_id": 5, "gold_score": 7, "pred_score": 7},
+        {"essay_id": 6, "gold_score": 7, "pred_score": 7},
+    ]
+
+    guard = guarded_select_repaired_bank(
+        parent_metrics,
+        [child_metrics],
+        parent_bank,
+        [child_bank],
+        {
+            "bapr": {
+                "guard": {
+                    "bootstrap_guard_enabled": True,
+                    "bootstrap_n": 5,
+                    "bootstrap_sample_ratio": 0.8,
+                    "bootstrap_qwk_lower_tolerance": -0.02,
+                    "bootstrap_mae_upper_tolerance": 0.10,
+                    "bootstrap_target_improvement_min_rate": 0.50,
+                }
+            }
+        },
+        parent_eval_rows=parent_rows,
+        child_eval_rows_list=[child_rows],
+        score_min=2,
+        score_max=12,
+    )
+
+    child_row = next(row for row in guard["selection_rows"] if row["candidate_id"] == "bapr_si_child_unstable")
+    assert child_row["accepted_by_guard"] is False
+    assert "bootstrap_" in child_row["guard_reject_reasons"]
 
 
 def test_bapr_v1_config_v21_params_are_used_by_selector(tmp_path):

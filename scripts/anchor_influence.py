@@ -4,7 +4,7 @@ from collections import Counter
 from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
 from scripts.anchor_stability import stability_by_id
-from scripts.bapr_repair import band_for, stable_hash, text_jaccard, token_len
+from scripts.bapr_repair import band_for, score_slot_for, stable_hash, text_jaccard, token_len
 
 
 INFLUENCE_REPAIR = "INFLUENCE_REPAIR"
@@ -85,6 +85,7 @@ def estimate_proxy_influence(
         essay_id = int(anchor["essay_id"])
         score = int(anchor["gold_score"])
         band = band_for(score, score_min, score_max)
+        slot = score_slot_for(score, score_min, score_max)
         same_band_count = int(band_counts.get(band, 0))
         other_anchors = [a for a in parent_anchors if int(a["essay_id"]) != essay_id]
         redundancy = max(
@@ -131,6 +132,7 @@ def estimate_proxy_influence(
             "essay_id": essay_id,
             "gold_score": score,
             "band": band,
+            "score_slot": slot,
             "anchor_failure_type": failure_type,
             "negative_influence_score": float(negative_influence_score),
             "stability_score": stability_score,
@@ -139,6 +141,7 @@ def estimate_proxy_influence(
             "same_band_count": same_band_count,
             "trigger_pressure": float(pressure),
             "target_band": band,
+            "target_slot": "max_or_top" if failure_type == "high_tail_suppressor" else slot,
             "target_boundary_metrics": _target_metrics_for_failure(failure_type),
             "expected_repair_metric": _target_metrics_for_failure(failure_type)[0],
             "token_length": int(anchor.get("token_length", token_len(str(anchor.get("essay_text", ""))))),
@@ -183,6 +186,58 @@ def estimate_leave_one_anchor_out_influence(
     return rows
 
 
+def apply_loo_veto_to_proxy_influence(
+    proxy_rows: Sequence[Dict[str, Any]],
+    loo_rows: Sequence[Dict[str, Any]],
+    *,
+    enabled: bool = True,
+) -> List[Dict[str, Any]]:
+    """Merge LOO attribution into proxy influence rows.
+
+    Positive proxy evidence can be misleading when removing the anchor already
+    hurts diagnostic scoring. In that case LOO acts as a veto: the anchor is
+    treated as useful for repair generation and can still be reported for audit.
+    """
+
+    loo_by_id = {int(row["anchor_id"]): row for row in loo_rows if "anchor_id" in row}
+    merged: List[Dict[str, Any]] = []
+    for proxy in proxy_rows:
+        row = dict(proxy)
+        anchor_id = int(row["anchor_id"])
+        loo = loo_by_id.get(anchor_id, {})
+        delta_qwk = float(loo.get("delta_qwk_without_anchor", 0.0) or 0.0) if loo else None
+        delta_mae = float(loo.get("delta_mae_without_anchor", 0.0) or 0.0) if loo else None
+        loo_harm_score = float(loo.get("loo_harm_score", 0.0) or 0.0) if loo else None
+        # If A \\ a has lower QWK or higher MAE, a is beneficial under LOO.
+        loo_vetoed = bool(enabled and loo and ((delta_qwk is not None and delta_qwk < 0.0) or (delta_mae is not None and delta_mae > 0.0)))
+        proxy_failure_type = str(row.get("anchor_failure_type", ""))
+        row.update(
+            {
+                "loo_available": bool(loo),
+                "loo_vetoed": loo_vetoed,
+                "loo_harm_score": loo_harm_score,
+                "loo_delta_qwk_without_anchor": delta_qwk,
+                "loo_delta_mae_without_anchor": delta_mae,
+                "proxy_disagrees_with_loo": bool(loo_vetoed and proxy_failure_type != "useful_stabilizing_anchor"),
+            }
+        )
+        if loo_vetoed:
+            row["anchor_failure_type_before_loo"] = proxy_failure_type
+            row["anchor_failure_type"] = "useful_stabilizing_anchor"
+            row["negative_influence_score_before_loo"] = row.get("negative_influence_score")
+            row["negative_influence_score"] = min(float(row.get("negative_influence_score", 0.0) or 0.0), -0.01)
+        merged.append(row)
+    merged.sort(
+        key=lambda row: (
+            bool(row.get("loo_vetoed", False)),
+            -float(row.get("loo_harm_score", row.get("negative_influence_score", 0.0)) or 0.0),
+            -float(row.get("negative_influence_score", 0.0) or 0.0),
+            int(row["anchor_id"]),
+        )
+    )
+    return merged
+
+
 def _candidate_rows(
     train_pool: Sequence[Dict[str, Any]],
     parent_anchors: Sequence[Dict[str, Any]],
@@ -192,6 +247,7 @@ def _candidate_rows(
     score_max: int,
     forbidden_ids: Iterable[int],
     target_band: str,
+    target_slot: str | None = None,
 ) -> List[Dict[str, Any]]:
     used = {int(anchor["essay_id"]) for anchor in parent_anchors} | {int(x) for x in forbidden_ids}
     stability = stability_by_id(stability_rows)
@@ -202,7 +258,10 @@ def _candidate_rows(
             continue
         score = _score_of(item)
         band = band_for(score, score_min, score_max)
+        slot = score_slot_for(score, score_min, score_max)
         if band != target_band:
+            continue
+        if target_slot and slot != target_slot:
             continue
         stab = stability.get(essay_id, {})
         stability_score = float(stab.get("stability_score", 0.0) or 0.0)
@@ -215,6 +274,7 @@ def _candidate_rows(
             {
                 "anchor": _as_anchor(item, "bapr_si:stable_candidate", stability_score),
                 "band": band,
+                "score_slot": slot,
                 "stability_score": stability_score,
                 "selection_frequency": float(stab.get("selection_frequency", 0.0) or 0.0),
                 "redundancy_score": float(redundancy),
@@ -249,6 +309,7 @@ def generate_influence_repair_children(
     parent = [dict(anchor) for anchor in parent_anchors]
     parent_ids = [int(anchor["essay_id"]) for anchor in parent]
     parent_sig = stable_hash(parent_ids)
+    parent_slot_counts = Counter(score_slot_for(int(anchor["gold_score"]), score_min, score_max) for anchor in parent)
     children: List[Dict[str, Any]] = []
     trace: List[Dict[str, Any]] = []
     seen = {parent_sig}
@@ -256,6 +317,20 @@ def generate_influence_repair_children(
     for influence in influence_rows:
         if len(children) >= max_children:
             break
+        if bool(influence.get("loo_vetoed", False)):
+            trace.append(
+                {
+                    "candidate_id": "",
+                    "operator": INFLUENCE_REPAIR,
+                    "removed_anchor_id": int(influence["anchor_id"]),
+                    "removed_anchor_failure_type": influence.get("anchor_failure_type_before_loo", influence.get("anchor_failure_type")),
+                    "loo_vetoed": True,
+                    "loo_harm_score": influence.get("loo_harm_score"),
+                    "proxy_disagrees_with_loo": influence.get("proxy_disagrees_with_loo"),
+                    "skipped_reason": "loo_veto_beneficial_anchor",
+                }
+            )
+            continue
         if str(influence.get("anchor_failure_type")) == "useful_stabilizing_anchor":
             continue
         remove_id = int(influence["anchor_id"])
@@ -263,6 +338,25 @@ def generate_influence_repair_children(
         if remove is None:
             continue
         target_band = str(influence.get("target_band") or band_for(int(remove["gold_score"]), score_min, score_max))
+        target_slot = str(influence.get("target_slot") or score_slot_for(int(remove["gold_score"]), score_min, score_max))
+        remove_slot = score_slot_for(int(remove["gold_score"]), score_min, score_max)
+        protect_singleton_top = remove_slot == "max_or_top" and int(parent_slot_counts.get("max_or_top", 0)) <= 1
+        if protect_singleton_top and target_slot != "max_or_top":
+            trace.append(
+                {
+                    "candidate_id": "",
+                    "operator": INFLUENCE_REPAIR,
+                    "removed_anchor_id": remove_id,
+                    "removed_anchor_score": int(remove["gold_score"]),
+                    "removed_anchor_failure_type": influence.get("anchor_failure_type"),
+                    "target_slot": target_slot,
+                    "loo_vetoed": influence.get("loo_vetoed", False),
+                    "loo_harm_score": influence.get("loo_harm_score"),
+                    "proxy_disagrees_with_loo": influence.get("proxy_disagrees_with_loo"),
+                    "skipped_reason": "protected_singleton_max_or_top_anchor",
+                }
+            )
+            continue
         candidates = _candidate_rows(
             train_pool,
             parent,
@@ -271,7 +365,19 @@ def generate_influence_repair_children(
             score_max=score_max,
             forbidden_ids=forbidden_ids,
             target_band=target_band,
+            target_slot=target_slot,
         )
+        if not candidates and not protect_singleton_top:
+            candidates = _candidate_rows(
+                train_pool,
+                parent,
+                stability_rows,
+                score_min=score_min,
+                score_max=score_max,
+                forbidden_ids=forbidden_ids,
+                target_band=target_band,
+                target_slot=None,
+            )
         if not candidates:
             continue
         added = dict(candidates[0]["anchor"])
@@ -294,6 +400,7 @@ def generate_influence_repair_children(
             "operator": INFLUENCE_REPAIR,
             "severity": float(influence.get("negative_influence_score", 0.0) or 0.0),
             "target_band": target_band,
+            "target_slot": target_slot,
             "target_boundary_metrics": target_metrics,
             "anchors": child,
             "anchor_ids": [int(anchor["essay_id"]) for anchor in child],
@@ -305,6 +412,9 @@ def generate_influence_repair_children(
             "added_anchor_id": int(added["essay_id"]),
             "added_anchor_stability": float(candidates[0]["stability_score"]),
             "expected_repair_metric": influence.get("expected_repair_metric"),
+            "loo_vetoed": bool(influence.get("loo_vetoed", False)),
+            "loo_harm_score": influence.get("loo_harm_score"),
+            "proxy_disagrees_with_loo": bool(influence.get("proxy_disagrees_with_loo", False)),
         }
         children.append(bank)
         trace.append(
@@ -322,6 +432,10 @@ def generate_influence_repair_children(
                 "expected_repair_metric": influence.get("expected_repair_metric"),
                 "target_boundary_metrics": target_metrics,
                 "target_band": target_band,
+                "target_slot": target_slot,
+                "loo_vetoed": bool(influence.get("loo_vetoed", False)),
+                "loo_harm_score": influence.get("loo_harm_score"),
+                "proxy_disagrees_with_loo": bool(influence.get("proxy_disagrees_with_loo", False)),
                 "candidate_pool_size": len(candidates),
                 "parent_anchor_ids": parent_ids,
                 "child_anchor_ids": [int(anchor["essay_id"]) for anchor in child],

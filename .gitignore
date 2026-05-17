@@ -36,6 +36,7 @@ result/
 result_final/
 full_logs/
 full_logs_classified/
+run_logs/
 
 # Generated reports and temporary artifacts
 reports/
